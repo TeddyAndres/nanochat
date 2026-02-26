@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
+from nanochat.sparse_vocab import compute_batch_token_set
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
@@ -74,7 +75,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000,
+    return_sparse_context=False,
+    vocab_size=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -157,7 +160,22 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        yield inputs, targets, state_dict
+        if return_sparse_context:
+            assert vocab_size is not None, "vocab_size is required when return_sparse_context=True"
+            U_cpu, _, local_idx_cpu, local_targets_cpu = compute_batch_token_set(
+                cpu_inputs,
+                cpu_targets,
+                vocab_size=vocab_size,
+                use_ddp_union=False,
+            )
+            sparse_context = {
+                "U": U_cpu.to(device, non_blocking=use_cuda),
+                "local_idx": local_idx_cpu.to(device, non_blocking=use_cuda),
+                "local_targets": local_targets_cpu.to(device, non_blocking=use_cuda),
+            }
+            yield inputs, targets, state_dict, sparse_context
+        else:
+            yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""

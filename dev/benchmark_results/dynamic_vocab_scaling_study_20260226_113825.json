@@ -1,0 +1,593 @@
+{
+  "timestamp_utc": "20260226_113825",
+  "device": "cuda",
+  "torch_version": "2.9.1+rocm7.2.0.git7e1940d4",
+  "args": {
+    "vstd": 32768,
+    "vocab_mult": 10,
+    "widths": "512,768",
+    "dense_depths": "8,12",
+    "sparse_depths": "4,6,8,12",
+    "batch_size": 2,
+    "seq_len": 128,
+    "steps": 8,
+    "active_vocab_frac": 0.1,
+    "lr": 0.002,
+    "loss_match_eps": 0.02,
+    "max_search_batch": 16,
+    "device": "",
+    "output": ""
+  },
+  "results": [
+    {
+      "width": 512,
+      "dense": {
+        "config": {
+          "vocab_size": 32768,
+          "n_embd": 512,
+          "depth": 8,
+          "batch_size": 2,
+          "seq_len": 128
+        },
+        "metrics": {
+          "losses": [
+            10.676928520202637,
+            10.516395568847656,
+            10.504364013671875,
+            10.649413108825684,
+            10.712242126464844,
+            10.633893013000488,
+            10.633709907531738,
+            10.43747329711914
+          ],
+          "loss_final": 10.43747329711914,
+          "loss_mean": 10.595552444458008,
+          "step_ms_mean": 2052.6719637418864,
+          "tokens_per_sec": 124.71549498504807,
+          "peak_vram_mb": 1168.3642578125,
+          "steps_completed": 8,
+          "steps_requested": 8,
+          "is_finite": true
+        }
+      },
+      "sparse": {
+        "vocab_size": 327680,
+        "trials": [
+          {
+            "sparse_depth": 4,
+            "matched_batch_size": 8,
+            "run": {
+              "losses": [
+                12.868607521057129,
+                13.100849151611328,
+                13.096611022949219,
+                13.52935791015625,
+                12.878227233886719,
+                13.547672271728516,
+                12.852652549743652,
+                12.872308731079102
+              ],
+              "loss_final": 12.872308731079102,
+              "loss_mean": 13.09328579902649,
+              "step_ms_mean": 40.53647212276701,
+              "tokens_per_sec": 25261.20173701248,
+              "peak_vram_mb": 1151.15283203125,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 6,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                14.566192626953125,
+                12.829771995544434,
+                12.802661895751953,
+                12.795608520507812,
+                12.816506385803223,
+                12.787199974060059,
+                12.800437927246094,
+                12.784235000610352
+              ],
+              "loss_final": 12.784235000610352,
+              "loss_mean": 13.022826790809631,
+              "step_ms_mean": 49.28847814153414,
+              "tokens_per_sec": 5193.911633158649,
+              "peak_vram_mb": 1212.9853515625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 8,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                12.824716567993164,
+                12.804655075073242,
+                12.792543411254883,
+                12.78693962097168,
+                12.792573928833008,
+                12.847530364990234,
+                12.788888931274414,
+                12.784004211425781
+              ],
+              "loss_final": 12.784004211425781,
+              "loss_mean": 12.80273151397705,
+              "step_ms_mean": 61.64849636843428,
+              "tokens_per_sec": 4152.574922023224,
+              "peak_vram_mb": 1329.03515625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 12,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                15.23324203491211,
+                12.81759262084961,
+                12.864885330200195,
+                12.879440307617188,
+                12.77073860168457,
+                12.771949768066406,
+                12.885451316833496,
+                12.81638240814209
+              ],
+              "loss_final": 12.81638240814209,
+              "loss_mean": 13.129960298538208,
+              "step_ms_mean": 88.5696966361138,
+              "tokens_per_sec": 2890.379099431367,
+              "peak_vram_mb": 1560.63525390625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          }
+        ],
+        "min_depth_meeting_loss": null,
+        "depth_reduction": null
+      }
+    },
+    {
+      "width": 512,
+      "dense": {
+        "config": {
+          "vocab_size": 32768,
+          "n_embd": 512,
+          "depth": 12,
+          "batch_size": 2,
+          "seq_len": 128
+        },
+        "metrics": {
+          "losses": [
+            10.67529296875,
+            10.622325897216797,
+            10.636382102966309,
+            10.646206855773926,
+            10.59182071685791,
+            10.662673950195312,
+            10.571671485900879,
+            10.572434425354004
+          ],
+          "loss_final": 10.572434425354004,
+          "loss_mean": 10.622351050376892,
+          "step_ms_mean": 31.401088017446455,
+          "tokens_per_sec": 8152.583753077802,
+          "peak_vram_mb": 1656.46435546875,
+          "steps_completed": 8,
+          "steps_requested": 8,
+          "is_finite": true
+        }
+      },
+      "sparse": {
+        "vocab_size": 327680,
+        "trials": [
+          {
+            "sparse_depth": 4,
+            "matched_batch_size": 15,
+            "run": {
+              "losses": [
+                12.891555786132812,
+                12.7947416305542,
+                12.79288101196289,
+                12.793392181396484,
+                12.797855377197266,
+                12.796783447265625,
+                12.792520523071289,
+                12.809213638305664
+              ],
+              "loss_final": 12.809213638305664,
+              "loss_mean": 12.808617949485779,
+              "step_ms_mean": 47.58973487332696,
+              "tokens_per_sec": 40344.83497566445,
+              "peak_vram_mb": 1641.92431640625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 6,
+            "matched_batch_size": 9,
+            "run": {
+              "losses": [
+                12.87446403503418,
+                12.809517860412598,
+                12.79690170288086,
+                12.793532371520996,
+                12.80923843383789,
+                12.812435150146484,
+                12.786903381347656,
+                12.781545639038086
+              ],
+              "loss_final": 12.781545639038086,
+              "loss_mean": 12.808067321777344,
+              "step_ms_mean": 53.30868399323663,
+              "tokens_per_sec": 21609.98759875889,
+              "peak_vram_mb": 1651.81884765625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 8,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                15.022357940673828,
+                12.788745880126953,
+                12.80618667602539,
+                12.79104995727539,
+                12.802006721496582,
+                12.845207214355469,
+                12.77865982055664,
+                12.814483642578125
+              ],
+              "loss_final": 12.814483642578125,
+              "loss_mean": 13.081087231636047,
+              "step_ms_mean": 60.77403224480804,
+              "tokens_per_sec": 4212.32540517945,
+              "peak_vram_mb": 1665.041015625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 12,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                14.173410415649414,
+                12.80335807800293,
+                13.87570571899414,
+                14.386371612548828,
+                15.33287239074707,
+                14.258750915527344,
+                14.019893646240234,
+                12.749834060668945
+              ],
+              "loss_final": 12.749834060668945,
+              "loss_mean": 13.950024604797363,
+              "step_ms_mean": 86.86091138952179,
+              "tokens_per_sec": 2947.240547039457,
+              "peak_vram_mb": 1897.14111328125,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          }
+        ],
+        "min_depth_meeting_loss": null,
+        "depth_reduction": null
+      }
+    },
+    {
+      "width": 768,
+      "dense": {
+        "config": {
+          "vocab_size": 32768,
+          "n_embd": 768,
+          "depth": 8,
+          "batch_size": 2,
+          "seq_len": 128
+        },
+        "metrics": {
+          "losses": [
+            11.880988121032715,
+            10.556516647338867,
+            10.436360359191895,
+            11.610190391540527,
+            11.449596405029297,
+            11.377342224121094,
+            11.427428245544434,
+            11.468343734741211
+          ],
+          "loss_final": 11.468343734741211,
+          "loss_mean": 11.275845766067505,
+          "step_ms_mean": 1779.1848915076116,
+          "tokens_per_sec": 143.8861139288765,
+          "peak_vram_mb": 2074.5888671875,
+          "steps_completed": 8,
+          "steps_requested": 8,
+          "is_finite": true
+        }
+      },
+      "sparse": {
+        "vocab_size": 327680,
+        "trials": [
+          {
+            "sparse_depth": 4,
+            "matched_batch_size": 9,
+            "run": {
+              "losses": [
+                13.054794311523438,
+                12.857636451721191,
+                12.858528137207031,
+                12.857364654541016,
+                12.87919807434082,
+                12.881593704223633,
+                12.87327766418457,
+                12.886714935302734
+              ],
+              "loss_final": 12.886714935302734,
+              "loss_mean": 12.893638491630554,
+              "step_ms_mean": 64.05692601401825,
+              "tokens_per_sec": 17984.003786692727,
+              "peak_vram_mb": 2049.2470703125,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 6,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                12.895672798156738,
+                12.805980682373047,
+                12.841681480407715,
+                12.8943452835083,
+                12.801584243774414,
+                12.87225341796875,
+                12.860353469848633,
+                12.849933624267578
+              ],
+              "loss_final": 12.849933624267578,
+              "loss_mean": 12.852725625038147,
+              "step_ms_mean": 76.32481713517336,
+              "tokens_per_sec": 3354.0859920648995,
+              "peak_vram_mb": 2277.44091796875,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 8,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                12.99962043762207,
+                13.127677917480469,
+                12.851188659667969,
+                12.833902359008789,
+                12.89123821258545,
+                12.892095565795898,
+                12.968358993530273,
+                12.873103141784668
+              ],
+              "loss_final": 12.873103141784668,
+              "loss_mean": 12.929648160934448,
+              "step_ms_mean": 98.86163225019118,
+              "tokens_per_sec": 2589.4777799352482,
+              "peak_vram_mb": 2540.015625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 12,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                12.956235885620117,
+                12.893341064453125,
+                12.835823059082031,
+                12.870979309082031,
+                12.903024673461914,
+                12.80683422088623,
+                12.823955535888672,
+                12.923927307128906
+              ],
+              "loss_final": 12.923927307128906,
+              "loss_mean": 12.876765131950378,
+              "step_ms_mean": 153.91704875219148,
+              "tokens_per_sec": 1663.2335538876102,
+              "peak_vram_mb": 3065.91552734375,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          }
+        ],
+        "min_depth_meeting_loss": null,
+        "depth_reduction": null
+      }
+    },
+    {
+      "width": 768,
+      "dense": {
+        "config": {
+          "vocab_size": 32768,
+          "n_embd": 768,
+          "depth": 12,
+          "batch_size": 2,
+          "seq_len": 128
+        },
+        "metrics": {
+          "losses": [
+            11.920150756835938,
+            10.531734466552734,
+            10.525752067565918,
+            10.468348503112793,
+            10.325821876525879,
+            10.336283683776855,
+            10.259953498840332,
+            10.228715896606445
+          ],
+          "loss_final": 10.228715896606445,
+          "loss_mean": 10.574595093727112,
+          "step_ms_mean": 63.88004525069846,
+          "tokens_per_sec": 4007.5112501145404,
+          "peak_vram_mb": 2987.36376953125,
+          "steps_completed": 8,
+          "steps_requested": 8,
+          "is_finite": true
+        }
+      },
+      "sparse": {
+        "vocab_size": 327680,
+        "trials": [
+          {
+            "sparse_depth": 4,
+            "matched_batch_size": 16,
+            "run": {
+              "losses": [
+                13.079910278320312,
+                12.827835083007812,
+                12.877494812011719,
+                12.850057601928711,
+                12.856576919555664,
+                12.867147445678711,
+                12.871919631958008,
+                12.864555358886719
+              ],
+              "loss_final": 12.864555358886719,
+              "loss_mean": 12.886937141418457,
+              "step_ms_mean": 75.30947150371503,
+              "tokens_per_sec": 27194.454550102262,
+              "peak_vram_mb": 2882.11572265625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 6,
+            "matched_batch_size": 10,
+            "run": {
+              "losses": [
+                13.019474029541016,
+                12.86376667022705,
+                12.848833084106445,
+                12.868854522705078,
+                12.868680953979492,
+                12.839500427246094,
+                12.86371898651123,
+                12.829095840454102
+              ],
+              "loss_final": 12.829095840454102,
+              "loss_mean": 12.875240564346313,
+              "step_ms_mean": 89.64016674144659,
+              "tokens_per_sec": 14279.313019262503,
+              "peak_vram_mb": 2961.35107421875,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 8,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                12.966657638549805,
+                12.895339965820312,
+                14.901778221130371,
+                12.888571739196777,
+                13.460861206054688,
+                12.84969711303711,
+                12.91920280456543,
+                12.868392944335938
+              ],
+              "loss_final": 12.868392944335938,
+              "loss_mean": 13.218812704086304,
+              "step_ms_mean": 99.9115989980055,
+              "tokens_per_sec": 2562.2650679938615,
+              "peak_vram_mb": 3158.6494140625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          },
+          {
+            "sparse_depth": 12,
+            "matched_batch_size": 2,
+            "run": {
+              "losses": [
+                12.84465217590332,
+                12.823312759399414,
+                12.825990676879883,
+                12.848509788513184,
+                12.884635925292969,
+                12.85894775390625,
+                12.812524795532227,
+                12.863361358642578
+              ],
+              "loss_final": 12.863361358642578,
+              "loss_mean": 12.845241904258728,
+              "step_ms_mean": 161.789395759115,
+              "tokens_per_sec": 1582.3039501374572,
+              "peak_vram_mb": 3684.54931640625,
+              "steps_completed": 8,
+              "steps_requested": 8,
+              "is_finite": true
+            },
+            "error": null
+          }
+        ],
+        "min_depth_meeting_loss": null,
+        "depth_reduction": null
+      }
+    }
+  ],
+  "summary": {
+    "num_results": 4,
+    "depth_reduction": null,
+    "speedup_vs_dense": {
+      "min": 0.3615099993209884,
+      "max": 202.55062724997407,
+      "mean": 31.149015315732733
+    },
+    "vram_ratio_vs_dense_target": {
+      "min": 0.9647689216999794,
+      "max": 1.4778424659629943,
+      "mean": 1.1043838528380292
+    }
+  }
+}

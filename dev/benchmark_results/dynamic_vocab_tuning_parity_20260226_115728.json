@@ -1,0 +1,106 @@
+{
+  "timestamp_utc": "20260226_115728",
+  "device": "cuda",
+  "torch_version": "2.9.1+rocm7.2.0.git7e1940d4",
+  "args": {
+    "vstd": 32768,
+    "vocab_mult": 10,
+    "widths": "512",
+    "dense_depths": "8",
+    "sparse_depths": "4",
+    "lrs": "0.001",
+    "batch_size": 2,
+    "seq_len": 128,
+    "steps": 10,
+    "active_vocab_frac": 0.1,
+    "parity_vocab": 64,
+    "parity_embd": 128,
+    "parity_depth": 2,
+    "parity_batches": 30,
+    "device": "",
+    "output": ""
+  },
+  "stability": {
+    "rows": [
+      {
+        "width": 512,
+        "dense_depth": 8,
+        "sparse_depth": 4,
+        "lr": 0.001,
+        "dense": {
+          "mode": "dense",
+          "vocab_size": 32768,
+          "n_embd": 512,
+          "depth": 8,
+          "batch_size": 2,
+          "seq_len": 128,
+          "lr": 0.001,
+          "steps_requested": 10,
+          "steps_completed": 10,
+          "is_finite": true,
+          "loss_final": 10.670307159423828,
+          "loss_mean": 10.599583435058594,
+          "loss_start": 10.70283031463623,
+          "loss_delta": -0.032523155212402344,
+          "step_ms_mean": 211.49783619330265,
+          "tokens_per_sec": 1210.4142747163792,
+          "peak_vram_mb": 1168.3642578125
+        },
+        "sparse": {
+          "mode": "sparse",
+          "vocab_size": 327680,
+          "n_embd": 512,
+          "depth": 4,
+          "batch_size": 2,
+          "seq_len": 128,
+          "lr": 0.001,
+          "steps_requested": 10,
+          "steps_completed": 10,
+          "is_finite": true,
+          "loss_final": 14.837273597717285,
+          "loss_mean": 14.03222589492798,
+          "loss_start": 12.69979190826416,
+          "loss_delta": 2.137481689453125,
+          "step_ms_mean": 132.58805170771666,
+          "tokens_per_sec": 1930.7923806312385,
+          "peak_vram_mb": 808.4306640625
+        },
+        "comparative": {
+          "both_finite": true,
+          "loss_gap_final": 4.166966438293457,
+          "speed_ratio_sparse_over_dense": 1.5951500415704005,
+          "vram_ratio_sparse_over_dense": 0.6919337515306272
+        }
+      }
+    ],
+    "summary": {
+      "num_trials": 1,
+      "num_stable": 1,
+      "best_by_shape": [
+        {
+          "width": 512,
+          "dense_depth": 8,
+          "sparse_depth": 4,
+          "best_lr": 0.001,
+          "sparse_loss_final": 14.837273597717285,
+          "dense_loss_final": 10.670307159423828,
+          "loss_gap_final": 4.166966438293457
+        }
+      ]
+    }
+  },
+  "parity": {
+    "exact_full_vocab": {
+      "dense_loss": 4.368919849395752,
+      "sparse_loss_corrected": 4.368919849395752,
+      "loss_abs_diff": 0.0,
+      "wte_grad_max_abs_diff": 0.0
+    },
+    "practical_same_vocab": {
+      "num_batches": 30,
+      "loss_abs_diff_min": 0.000370025634765625,
+      "loss_abs_diff_max": 0.06032276153564453,
+      "loss_abs_diff_mean": 0.018106969197591145
+    }
+  }
+}

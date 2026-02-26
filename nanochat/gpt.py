@@ -12,8 +12,10 @@ Notable features:
 - Flash Attention 3 integration
 """
 
-from functools import partial
 from dataclasses import dataclass
+import math
+import os
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -21,6 +23,8 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.sparse_optim import SparseHybridOptimizer
+from nanochat.sparse_vocab import compute_batch_token_set, sparse_embedding, sparse_logits, local_vocab_log_correction
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -37,6 +41,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    sparse_mode: bool = False
+    sparse_ddp_union: bool = True
+    tie_embeddings: bool = False
 
 
 def norm(x):
@@ -85,6 +92,7 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            assert self.ve_gate is not None
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
@@ -160,11 +168,15 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        self.padded_vocab_size = padded_vocab_size
+        self.tie_embeddings = config.tie_embeddings
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        if self.tie_embeddings:
+            self.lm_head.weight = self.wte().weight
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -185,6 +197,12 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
+    def wte(self):
+        return cast(nn.Embedding, self.transformer["wte"])
+
+    def blocks(self):
+        return cast(nn.ModuleList, self.transformer["h"])
+
     @torch.no_grad()
     def init_weights(self):
         """
@@ -202,13 +220,17 @@ class GPT(nn.Module):
         """
 
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if self.tie_embeddings:
+            torch.nn.init.normal_(self.wte().weight, mean=0.0, std=0.02)
+        else:
+            torch.nn.init.normal_(self.wte().weight, mean=0.0, std=1.0)
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        for block_module in self.blocks():
+            block = cast(Block, block_module)
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -221,11 +243,13 @@ class GPT(nn.Module):
         self.x0_lambdas.fill_(0.1)      # 0.1 => small initial weight for skip connection to input embedding
 
         # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
+        for ve_module in self.value_embeds.values():
+            ve = cast(nn.Embedding, ve_module)
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
-        for block in self.transformer.h:
+        for block_module in self.blocks():
+            block = cast(Block, block_module)
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
@@ -235,16 +259,46 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
-        if self.transformer.wte.weight.device.type == "cuda":
-            self.transformer.wte.to(dtype=torch.bfloat16)
-            for ve in self.value_embeds.values():
+        # Keep sparse vocab tables in CPU residency for row streaming.
+        if self.wte().weight.device.type == "cuda" and not self.config.sparse_mode:
+            self.wte().to(dtype=torch.bfloat16)
+            for ve_module in self.value_embeds.values():
+                ve = cast(nn.Embedding, ve_module)
                 ve.to(dtype=torch.bfloat16)
+
+        if self.config.sparse_mode:
+            self._move_sparse_vocab_tables_to_cpu()
+
+    @torch.no_grad()
+    def _move_sparse_vocab_tables_to_cpu(self):
+        nvme_dir = os.environ.get("NANOCHAT_SPARSE_NVME_DIR", "").strip()
+
+        def _move_or_offload(param: torch.Tensor, name: str):
+            data_cpu = param.data.to("cpu")
+            if nvme_dir:
+                os.makedirs(nvme_dir, exist_ok=True)
+                filename = os.path.join(nvme_dir, f"{name}.bin")
+                mapped = torch.from_file(filename, shared=True, size=data_cpu.numel(), dtype=data_cpu.dtype)
+                mapped = mapped.view_as(data_cpu)
+                mapped.copy_(data_cpu)
+                param.data = mapped
+            else:
+                param.data = data_cpu
+                if torch.cuda.is_available():
+                    param.data = param.data.pin_memory()
+
+        _move_or_offload(self.wte().weight, "wte")
+        for ve_module in self.value_embeds.values():
+            ve = cast(nn.Embedding, ve_module)
+            _move_or_offload(ve.weight, f"value_embed_{id(ve)}")
+        if not self.tie_embeddings:
+            _move_or_offload(self.lm_head.weight, "lm_head")
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
-            device = self.transformer.wte.weight.device
+            device = self.wte().weight.device
         # stride the channels
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
@@ -287,7 +341,7 @@ class GPT(nn.Module):
         return window_sizes
 
     def get_device(self):
-        return self.transformer.wte.weight.device
+        return next(self.blocks().parameters()).device
 
     def estimate_flops(self):
         """
@@ -303,8 +357,8 @@ class GPT(nn.Module):
         """
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        value_embeds_numel = sum(cast(nn.Embedding, ve).weight.numel() for ve in self.value_embeds.values())
+        nparams_exclude = (self.wte().weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
@@ -329,10 +383,10 @@ class GPT(nn.Module):
         can experiment with which combination gives the cleanest scaling laws.
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        wte = sum(p.numel() for p in self.wte().parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        lm_head = 0 if self.tie_embeddings else sum(p.numel() for p in self.lm_head.parameters())
+        transformer_matrices = sum(p.numel() for p in self.blocks().parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -345,32 +399,63 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, tied_embedding_lr=0.028):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
+        def unique_params(params):
+            seen = set()
+            out = []
+            for param in params:
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                out.append(param)
+            return out
+
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        matrix_params = unique_params(list(self.blocks().parameters()))
+        value_embeds_params = unique_params(list(self.value_embeds.parameters()))
+        embedding_params = unique_params(list(self.wte().parameters()))
+        lm_head_params = [] if self.tie_embeddings else unique_params(list(self.lm_head.parameters()))
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        if self.tie_embeddings:
+            shared_vocab_params = embedding_params
+            expected = len(unique_params(list(self.parameters())))
+            actual = len(matrix_params) + len(shared_vocab_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+            assert expected == actual
+        else:
+            expected = len(unique_params(list(self.parameters())))
+            actual = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+            assert expected == actual
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
         # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+        param_groups = []
+        sparse_param_groups = []
+        if self.config.sparse_mode:
+            if self.tie_embeddings:
+                sparse_param_groups.append(dict(params=embedding_params, lr=tied_embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
+            else:
+                sparse_param_groups.append(dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
+                sparse_param_groups.append(dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
+            sparse_param_groups.append(dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
+        else:
+            if self.tie_embeddings:
+                param_groups.append(dict(kind='adamw', params=embedding_params, lr=tied_embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+            else:
+                param_groups.append(dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+                param_groups.append(dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+
+        param_groups.extend([
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-        ]
+        ])
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -380,12 +465,22 @@ class GPT(nn.Module):
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
-        optimizer = Factory(param_groups)
+        dense_optimizer = Factory(param_groups)
+
+        if self.config.sparse_mode:
+            sparse_params = []
+            for group in sparse_param_groups:
+                sparse_params.extend(group['params'])
+            sparse_optimizer = torch.optim.SparseAdam(sparse_param_groups)
+            optimizer = SparseHybridOptimizer(dense_optimizer, sparse_optimizer, sparse_params)
+        else:
+            optimizer = dense_optimizer
+
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', sparse_context=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -396,27 +491,70 @@ class GPT(nn.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
-        # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx) # embed current token
+        sparse_train = self.config.sparse_mode and targets is not None
+        U = None
+        local_idx = None
+        local_targets = None
+        if sparse_train:
+            if sparse_context is not None:
+                U = sparse_context["U"]
+                local_idx = sparse_context["local_idx"]
+                local_targets = sparse_context["local_targets"]
+            else:
+                assert targets is not None
+                U, _, local_idx, local_targets = compute_batch_token_set(
+                    idx,
+                    targets,
+                    self.config.vocab_size,
+                    use_ddp_union=self.config.sparse_ddp_union,
+                )
+            x = sparse_embedding(self.wte().weight, local_idx, U)
+        else:
+            x = self.wte()(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-        for i, block in enumerate(self.transformer.h):
+        for i, block in enumerate(self.blocks()):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            if str(i) in self.value_embeds:
+                ve_weight = cast(nn.Embedding, self.value_embeds[str(i)]).weight
+                if sparse_train:
+                    assert local_idx is not None and U is not None
+                    ve = sparse_embedding(ve_weight, local_idx, U)
+                else:
+                    ve = cast(nn.Embedding, self.value_embeds[str(i)])(idx)
+            else:
+                ve = None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        if sparse_train:
+            assert U is not None
+            lm_weight = self.wte().weight if self.tie_embeddings else self.lm_head.weight
+            logits = sparse_logits(x, lm_weight, U)
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+        else:
+            logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+            logits = logits[..., :self.config.vocab_size] # slice to remove padding
+            logits = logits.float() # switch to fp32 for logit softcap and loss computation
+            logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            target_tensor = local_targets if sparse_train else targets
+            assert target_tensor is not None
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_tensor.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if sparse_train:
+                assert U is not None
+                correction = local_vocab_log_correction(self.config.vocab_size, int(U.numel()))
+                if loss_reduction == 'none':
+                    valid = target_tensor.view(-1) >= 0
+                    loss = loss + correction * valid.to(dtype=loss.dtype)
+                else:
+                    loss = loss + correction
             return loss
         else:
             # inference: just return the logits directly
