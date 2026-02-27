@@ -7,6 +7,28 @@ import torch.nn.functional as F
 from torch.autograd import Function
 
 
+@torch.compiler.allow_in_graph
+def make_sparse_grad(
+    weight_shape: tuple,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    device,
+) -> torch.Tensor:
+    """Build a coalesced sparse COO gradient tensor.
+
+    Decorated with @torch.compiler.allow_in_graph so TorchDynamo treats it as
+    a single opaque graph node instead of trying to trace into
+    torch.sparse_coo_tensor (which is an untraceble C++ builtin).
+    """
+    return torch.sparse_coo_tensor(
+        indices.unsqueeze(0),
+        values,
+        size=weight_shape,
+        dtype=values.dtype,
+        device=device,
+    ).coalesce()
+
+
 def _ddp_union_tokens(tokens: torch.Tensor) -> torch.Tensor:
     if not (dist.is_available() and dist.is_initialized()):
         return tokens
@@ -91,13 +113,7 @@ class _SparseEmbeddingFn(Function):
             sparse_device = "cpu"
         else:
             sparse_device = grad_out.device
-        grad_weight = torch.sparse_coo_tensor(
-            U.unsqueeze(0),
-            grad_W_U,
-            size=ctx.weight_shape,
-            dtype=grad_W_U.dtype,
-            device=sparse_device,
-        ).coalesce()
+        grad_weight = make_sparse_grad(ctx.weight_shape, U, grad_W_U, sparse_device)
         return grad_weight, None, None
 
 
@@ -126,13 +142,7 @@ class _SparseEmbeddingCachedFn(Function):
             sparse_device = "cpu"
         else:
             sparse_device = grad_out.device
-        grad_weight = torch.sparse_coo_tensor(
-            U.unsqueeze(0),
-            grad_W_U,
-            size=ctx.weight_shape,
-            dtype=grad_W_U.dtype,
-            device=sparse_device,
-        ).coalesce()
+        grad_weight = make_sparse_grad(ctx.weight_shape, U, grad_W_U, sparse_device)
         return grad_weight, None, None, None
 
 
@@ -171,13 +181,7 @@ class _SparseLogitsFn(Function):
             sparse_device = "cpu"
         else:
             sparse_device = grad_logits.device
-        grad_weight = torch.sparse_coo_tensor(
-            U.unsqueeze(0),
-            grad_W_U,
-            size=ctx.weight_shape,
-            dtype=grad_W_U.dtype,
-            device=sparse_device,
-        ).coalesce()
+        grad_weight = make_sparse_grad(ctx.weight_shape, U, grad_W_U, sparse_device)
         return grad_x, grad_weight, None
 
 
@@ -205,13 +209,7 @@ class _SparseLogitsCachedFn(Function):
             sparse_device = "cpu"
         else:
             sparse_device = grad_logits.device
-        grad_weight = torch.sparse_coo_tensor(
-            U.unsqueeze(0),
-            grad_W_U,
-            size=ctx.weight_shape,
-            dtype=grad_W_U.dtype,
-            device=sparse_device,
-        ).coalesce()
+        grad_weight = make_sparse_grad(ctx.weight_shape, U, grad_W_U, sparse_device)
         return grad_x, grad_weight, None, None
 
 
