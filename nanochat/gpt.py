@@ -203,6 +203,10 @@ class GPT(nn.Module):
     def blocks(self):
         return cast(nn.ModuleList, self.transformer["h"])
 
+    def retie_embeddings(self):
+        if self.tie_embeddings:
+            self.lm_head.weight = self.wte().weight
+
     @torch.no_grad()
     def init_weights(self):
         """
@@ -218,6 +222,10 @@ class GPT(nn.Module):
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      zeros
         """
+
+        # Some tensor materialization paths (e.g. to_empty from meta) can break
+        # parameter aliasing. Restore tying before any init/counting logic.
+        self.retie_embeddings()
 
         # Embedding and unembedding
         if self.tie_embeddings:
@@ -532,6 +540,60 @@ class GPT(nn.Module):
         if sparse_train:
             assert U is not None
             lm_weight = self.wte().weight if self.tie_embeddings else self.lm_head.weight
+            # Sparse mode can create a very large (B*T*|U|) tensor.
+            # Compute cross-entropy in chunks to keep peak activation memory bounded
+            # for both training and evaluation (including reduction='none').
+            if targets is not None:
+                assert local_targets is not None
+                flat_x = x.reshape(-1, x.size(-1))
+                flat_targets = local_targets.reshape(-1)
+                valid = flat_targets >= 0
+                valid_count = valid.sum().item()
+                # Limit temporary logits allocation: chunk_tokens * |U| <= budget_elems
+                # Default budget 80M fp32 elements (~320MB logits tensor).
+                budget_elems = int(os.environ.get("NANOCHAT_SPARSE_LOGITS_CHUNK_ELEMS", "80000000"))
+                chunk_tokens = max(256, min(flat_x.size(0), budget_elems // max(1, int(U.numel()))))
+
+                if loss_reduction == 'none':
+                    loss_flat = torch.empty_like(flat_targets, dtype=torch.float32)
+                    for start in range(0, flat_x.size(0), chunk_tokens):
+                        end = min(start + chunk_tokens, flat_x.size(0))
+                        logits_chunk = sparse_logits(flat_x[start:end], lm_weight, U)
+                        logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                        loss_flat[start:end] = F.cross_entropy(
+                            logits_chunk.float(),
+                            flat_targets[start:end],
+                            ignore_index=-1,
+                            reduction='none',
+                        )
+                    correction = local_vocab_log_correction(self.config.vocab_size, int(U.numel()))
+                    loss_flat = loss_flat + correction * valid.to(dtype=loss_flat.dtype)
+                    return loss_flat.view_as(local_targets)
+
+                loss_sum = x.new_zeros((), dtype=torch.float32)
+                for start in range(0, flat_x.size(0), chunk_tokens):
+                    end = min(start + chunk_tokens, flat_x.size(0))
+                    logits_chunk = sparse_logits(flat_x[start:end], lm_weight, U)
+                    logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                    loss_sum = loss_sum + F.cross_entropy(
+                        logits_chunk.float(),
+                        flat_targets[start:end],
+                        ignore_index=-1,
+                        reduction='sum',
+                    )
+                if valid_count == 0:
+                    loss = loss_sum
+                elif loss_reduction == 'mean':
+                    loss = loss_sum / valid_count
+                else:
+                    loss = loss_sum
+                correction = local_vocab_log_correction(self.config.vocab_size, int(U.numel()))
+                if loss_reduction == 'mean':
+                    loss = loss + correction
+                else:
+                    loss = loss + correction * valid_count
+                return loss
+
             logits = sparse_logits(x, lm_weight, U)
             logits = logits.float()
             logits = softcap * torch.tanh(logits / softcap)

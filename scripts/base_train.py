@@ -18,6 +18,8 @@ import json
 import time
 import math
 import argparse
+import queue
+import threading
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
 
@@ -34,6 +36,41 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
+
+
+class AsyncBatchPrefetcher:
+    def __init__(self, loader, max_prefetch=2):
+        self.loader = loader
+        self.queue = queue.Queue(maxsize=max_prefetch)
+        self._error = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            for batch in self.loader:
+                if isinstance(batch, tuple) and len(batch) == 3:
+                    x, y, state = batch
+                    # Underlying loader reuses persistent buffers; clone so queued
+                    # batches stay immutable while producer continues.
+                    self.queue.put((x.clone(), y.clone(), state))
+                else:
+                    self.queue.put(batch)
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+        return item
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -83,6 +120,14 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# SDPA fallback (no FA3) performs poorly with alternating sliding-window patterns.
+# Keep user CLI overrides intact, but choose a faster default on non-FA3 systems.
+if (not HAS_FA3
+    and args.window_pattern == parser.get_default("window_pattern")
+    and args.window_pattern != "L"):
+    args.window_pattern = "L"
+    print(f"No Flash Attention 3 detected: auto-adjusting --window-pattern to '{args.window_pattern}' (override with CLI flag)")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -92,12 +137,21 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+get_max_reserved_memory = torch.cuda.max_memory_reserved if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+
+peak_device_memory_used = 0
+def update_peak_device_memory_used():
+    global peak_device_memory_used
+    if device_type == "cuda":
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        used_mem = total_mem - free_mem
+        peak_device_memory_used = max(peak_device_memory_used, used_mem)
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -151,6 +205,7 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+model.retie_embeddings()
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -161,6 +216,7 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
+    model.retie_embeddings()
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
@@ -335,15 +391,16 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     split="train",
     device=device,
     resume_state_dict=dataloader_resume_state_dict,
-    return_sparse_context=args.sparse_mode,
+    # Let the model build sparse token sets on-device from x/y.
+    # This removes extra CPU preprocessing/transfers between steps.
+    return_sparse_context=False,
     vocab_size=vocab_size,
 )
-first_batch = next(train_loader) # kick off load of the very first batch of data
 if args.sparse_mode:
-    x, y, dataloader_state_dict, sparse_context = first_batch
-else:
-    x, y, dataloader_state_dict = first_batch
-    sparse_context = None
+    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=2)
+first_batch = next(train_loader) # kick off load of the very first batch of data
+x, y, dataloader_state_dict = first_batch
+sparse_context = None
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -511,35 +568,34 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
-    synchronize()
     t0 = time.time()
+    data_wait_time = 0.0
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y, sparse_context=sparse_context)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        t_data0 = time.time()
         batch_next = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        if args.sparse_mode:
-            x, y, dataloader_state_dict, sparse_context = batch_next
-        else:
-            x, y, dataloader_state_dict = batch_next
-            sparse_context = None
+        data_wait_time += (time.time() - t_data0)
+        x, y, dataloader_state_dict = batch_next
+        sparse_context = None
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
-    synchronize()
     t1 = time.time()
     dt = t1 - t0
+    update_peak_device_memory_used()
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -562,7 +618,7 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -571,6 +627,7 @@ while True:
             "train/loss": debiased_smooth_loss,
             "train/lrm": lrm,
             "train/dt": dt,
+            "train/data_wait": data_wait_time,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
@@ -592,7 +649,10 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+print0(f"Peak memory usage (allocator allocated): {get_max_memory() / 1024 / 1024:.2f}MiB")
+print0(f"Peak memory usage (allocator reserved): {get_max_reserved_memory() / 1024 / 1024:.2f}MiB")
+if device_type == "cuda":
+    print0(f"Peak memory usage (device used): {peak_device_memory_used / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
@@ -619,7 +679,9 @@ get_report().log(section="Base model training", data=[
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
-        "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+        "Peak memory usage (allocator allocated)": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+        "Peak memory usage (allocator reserved)": f"{get_max_reserved_memory() / 1024 / 1024:.2f}MiB",
+        "Peak memory usage (device used)": f"{peak_device_memory_used / 1024 / 1024:.2f}MiB" if device_type == "cuda" else None,
     }
 ])
 
