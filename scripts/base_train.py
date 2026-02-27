@@ -49,7 +49,15 @@ class AsyncBatchPrefetcher:
     def _worker(self):
         try:
             for batch in self.loader:
-                if isinstance(batch, tuple) and len(batch) == 3:
+                if isinstance(batch, tuple) and len(batch) == 4:
+                    x, y, state, sparse_context = batch
+                    sparse_context_cloned = {
+                        "U": sparse_context["U"].clone(),
+                        "local_idx": sparse_context["local_idx"].clone(),
+                        "local_targets": sparse_context["local_targets"].clone(),
+                    }
+                    self.queue.put((x.clone(), y.clone(), state, sparse_context_cloned))
+                elif isinstance(batch, tuple) and len(batch) == 3:
                     x, y, state = batch
                     # Underlying loader reuses persistent buffers; clone so queued
                     # batches stay immutable while producer continues.
@@ -391,16 +399,19 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     split="train",
     device=device,
     resume_state_dict=dataloader_resume_state_dict,
-    # Let the model build sparse token sets on-device from x/y.
-    # This removes extra CPU preprocessing/transfers between steps.
-    return_sparse_context=False,
+    # In sparse mode, prepare per-step uniques/local maps in the dataloader
+    # (on CPU), and hand them to the model for exact dynamic-shape execution.
+    return_sparse_context=args.sparse_mode,
     vocab_size=vocab_size,
 )
 if args.sparse_mode:
-    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=2)
+    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=1)
 first_batch = next(train_loader) # kick off load of the very first batch of data
-x, y, dataloader_state_dict = first_batch
-sparse_context = None
+if args.sparse_mode:
+    x, y, dataloader_state_dict, sparse_context = first_batch
+else:
+    x, y, dataloader_state_dict = first_batch
+    sparse_context = None
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -570,17 +581,43 @@ while True:
     # evaluate the gradient
     t0 = time.time()
     data_wait_time = 0.0
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y, sparse_context=sparse_context)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+    touched_sparse_tokens = []
+    if args.sparse_mode:
         t_data0 = time.time()
-        batch_next = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        batch_next = next(train_loader)
         data_wait_time += (time.time() - t_data0)
-        x, y, dataloader_state_dict = batch_next
-        sparse_context = None
+        for micro_step in range(grad_accum_steps):
+            _, _, _, next_sparse_context = batch_next
+            touched_sparse_tokens.append(sparse_context["U"])
+            sparse_context_step = {
+                "U": sparse_context["U"],
+                "local_idx": sparse_context["local_idx"],
+                "local_targets": sparse_context["local_targets"],
+                "next_U": next_sparse_context["U"],
+            }
+            with autocast_ctx:
+                loss = model(x, y, sparse_context=sparse_context_step)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss.backward()
+
+            x, y, dataloader_state_dict, sparse_context = batch_next
+            if micro_step != grad_accum_steps - 1:
+                t_data0 = time.time()
+                batch_next = next(train_loader)
+                data_wait_time += (time.time() - t_data0)
+    else:
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                loss = model(x, y, sparse_context=sparse_context)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss.backward()
+            t_data0 = time.time()
+            batch_next = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+            data_wait_time += (time.time() - t_data0)
+            x, y, dataloader_state_dict = batch_next
+            sparse_context = None
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -591,6 +628,11 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
+    if args.sparse_mode:
+        if len(touched_sparse_tokens) > 0:
+            touched_tokens = torch.unique(torch.cat(touched_sparse_tokens), sorted=True)
+            model.invalidate_sparse_cache_tokens(touched_tokens)
+    sparse_cache_stats = model.pop_sparse_cache_stats() if args.sparse_mode else {"hits": 0, "misses": 0, "bytes_loaded": 0, "load_ms": 0.0}
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     t1 = time.time()
@@ -618,7 +660,10 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    cache_total = sparse_cache_stats["hits"] + sparse_cache_stats["misses"]
+    cache_hit_pct = (100.0 * sparse_cache_stats["hits"] / cache_total) if cache_total > 0 else 0.0
+    cache_loaded_mb = sparse_cache_stats["bytes_loaded"] / (1024 * 1024)
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | cache_hit: {cache_hit_pct:.1f}% | cache_load: {cache_loaded_mb:.1f}MB/{sparse_cache_stats['load_ms']:.1f}ms | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -631,6 +676,9 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "sparse/cache_hit_pct": cache_hit_pct,
+            "sparse/cache_loaded_mb": cache_loaded_mb,
+            "sparse/cache_load_ms": sparse_cache_stats["load_ms"],
         }
         wandb_run.log(log_data)
 

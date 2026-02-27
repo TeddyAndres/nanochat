@@ -169,9 +169,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                 use_ddp_union=False,
             )
             sparse_context = {
-                "U": U_cpu.to(device, non_blocking=use_cuda),
-                "local_idx": local_idx_cpu.to(device, non_blocking=use_cuda),
-                "local_targets": local_targets_cpu.to(device, non_blocking=use_cuda),
+                "U": U_cpu,
+                "local_idx": local_idx_cpu,
+                "local_targets": local_targets_cpu,
             }
             yield inputs, targets, state_dict, sparse_context
         else:
