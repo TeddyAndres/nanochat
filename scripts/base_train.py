@@ -309,7 +309,12 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 if model.config.sparse_mode:
-    print0("Sparse mode enabled: skipping torch.compile because local vocabulary size changes dynamically")
+    # get_rows is @torch.compiler.disable, so TorchDynamo will graph-break there
+    # and compile the surrounding transformer body (attention + MLP) which is
+    # where the GPU utilisation gains live. dynamic=True is required because the
+    # local vocab size |U| changes every batch.
+    print0("Sparse mode: compiling with dynamic=True (SparseVocabPool.get_rows runs eagerly via @torch.compiler.disable)")
+    model = torch.compile(model, dynamic=True)
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 

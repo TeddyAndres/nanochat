@@ -1,7 +1,6 @@
 import math
 import time
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -242,7 +241,11 @@ class SparseVocabPool:
     GPU, contributing ~480 ms of dead time per optimizer step despite only ~2 ms
     of actual PCIe transfer.
 
-    This version keeps the hit/miss index entirely in CPU numpy arrays.
+    This version keeps the hit/miss index entirely in CPU torch tensors (int32).
+    No numpy is used anywhere so the method is safe to call inside a
+    torch.compile region — `@torch.compiler.disable` is applied so TorchDynamo
+    treats get_rows as an opaque eager call and does not try to trace its
+    data-dependent control flow or CPU side-effects.
     `get_rows` contains **zero GPU synchronization** in its hot path.  The only
     GPU work it enqueues is:
       - non-blocking H2D of miss-rows (into the default CUDA stream)
@@ -252,9 +255,9 @@ class SparseVocabPool:
 
     Data structures
     ---------------
-    rows              (capacity, row_dim)  bf16  GPU   row data only
-    global_to_slot_np (vocab_size,)        int32 CPU numpy  -1 = absent
-    slot_to_global_np (capacity,)          int32 CPU numpy  -1 = empty
+    rows            (capacity, row_dim)  bf16  GPU        row data only
+    global_to_slot  (vocab_size,)        int32 CPU torch  -1 = absent
+    slot_to_global  (capacity,)          int32 CPU torch  -1 = empty
     """
 
     def __init__(
@@ -275,9 +278,9 @@ class SparseVocabPool:
             (self.capacity, row_dim), dtype=dtype, device=device
         )
 
-        # ---- CPU numpy: hit/miss index (zero GPU sync ever needed) ------
-        self.global_to_slot_np = np.full(vocab_size,    -1, dtype=np.int32)
-        self.slot_to_global_np = np.full(self.capacity, -1, dtype=np.int32)
+        # ---- CPU torch int32: hit/miss index (zero GPU sync ever needed) --
+        self.global_to_slot = torch.full((vocab_size,),    -1, dtype=torch.int32)
+        self.slot_to_global = torch.full((self.capacity,), -1, dtype=torch.int32)
         self._evict_ptr: int = 0
 
         # ---- stats (reset by pop_stats) ---------------------------------
@@ -287,6 +290,7 @@ class SparseVocabPool:
         self._load_ms: float = 0.0
 
     # ------------------------------------------------------------------
+    @torch.compiler.disable
     @torch.no_grad()
     def get_rows(self, tokens: torch.Tensor, master_weight: torch.Tensor) -> torch.Tensor:
         """Return (|tokens|, row_dim) bf16 GPU tensor.
@@ -299,6 +303,11 @@ class SparseVocabPool:
         Zero GPU synchronization in this method.  All GPU writes are enqueued
         non-blocking in the default CUDA stream; downstream kernels wait via
         CUDA stream ordering.
+
+        @torch.compiler.disable: this method has data-dependent Python control
+        flow and CPU side-effects (cache index updates) that cannot be traced
+        by TorchDynamo.  Marking it disabled causes a graph-break at call-site
+        so the surrounding model forward can still be compiled.
         """
         t0 = time.perf_counter()
         assert tokens.device.type == "cpu", "get_rows requires a CPU token tensor (no GPU sync)"
@@ -306,26 +315,25 @@ class SparseVocabPool:
         if n == 0:
             return self.rows.new_empty((0, self.row_dim))
 
-        # ---- CPU classification — ZERO GPU sync ----------------------
-        tokens_np = tokens.numpy()                        # view, no copy
-        slots_np  = self.global_to_slot_np[tokens_np]    # pure numpy, instant
-        hit_mask  = slots_np >= 0
+        # ---- CPU classification — pure torch, ZERO GPU sync ----------
+        slots     = self.global_to_slot[tokens]   # (n,) int32 CPU
+        hit_mask  = slots >= 0                    # (n,) bool CPU
         miss_mask = ~hit_mask
-        n_miss    = int(miss_mask.sum())                  # Python int from numpy, no GPU
+        n_miss    = int(miss_mask.sum().item())   # Python int, CPU scalar — no GPU
         n_hit     = n - n_miss
 
-        out = self.rows.new_empty((n, self.row_dim))      # GPU alloc only
+        out = self.rows.new_empty((n, self.row_dim))  # GPU alloc only
 
         # ---- gather hits from GPU cache (no sync) --------------------
         if n_hit > 0:
-            hit_slots   = torch.from_numpy(slots_np[hit_mask].astype(np.int64)).to(self.device, non_blocking=True)
-            hit_out_pos = torch.from_numpy(np.where(hit_mask)[0].astype(np.int64)).to(self.device, non_blocking=True)
+            hit_slots   = slots[hit_mask].long().to(self.device, non_blocking=True)
+            hit_out_pos = hit_mask.nonzero(as_tuple=False).squeeze(1).to(self.device, non_blocking=True)
             out[hit_out_pos] = self.rows[hit_slots]
 
         # ---- load misses from CPU master_weight ----------------------
         if n_miss > 0:
-            miss_tokens_np  = tokens_np[miss_mask]                 # sorted view (no copy)
-            miss_tokens_cpu = torch.from_numpy(miss_tokens_np.astype(np.int64))  # CPU tensor
+            miss_out_pos    = miss_mask.nonzero(as_tuple=False).squeeze(1)  # CPU
+            miss_tokens_cpu = tokens[miss_mask]  # CPU tensor, already sorted
             # Sorted miss_tokens → sequential-ish row access → good CPU cache locality.
             miss_rows_cpu   = master_weight.index_select(0, miss_tokens_cpu)
             # pin_memory() is required: index_select on a pinned master weight
@@ -334,25 +342,28 @@ class SparseVocabPool:
             # With pinning, CUDA issues a single direct DMA from the pinned buffer.
             miss_rows = _pin(miss_rows_cpu).to(self.device, dtype=self.rows.dtype, non_blocking=True)
 
-            miss_out_pos = torch.from_numpy(np.where(miss_mask)[0].astype(np.int64)).to(self.device, non_blocking=True)
-            out[miss_out_pos] = miss_rows  # GPU scatter, enqueued after H2D
+            miss_out_pos_gpu = miss_out_pos.to(self.device, non_blocking=True)
+            out[miss_out_pos_gpu] = miss_rows  # GPU scatter, enqueued after H2D
 
-            # ---- ring-buffer eviction (pure Python/numpy — no GPU) ----
-            evict_slots_np = np.arange(self._evict_ptr, self._evict_ptr + n_miss, dtype=np.int64) % self.capacity
+            # ---- ring-buffer eviction (pure Python/torch CPU — no GPU) ----
+            evict_slots = (
+                torch.arange(self._evict_ptr, self._evict_ptr + n_miss, dtype=torch.int64)
+                % self.capacity
+            )
             self._evict_ptr = (self._evict_ptr + n_miss) % self.capacity
 
-            old_globals = self.slot_to_global_np[evict_slots_np]
+            old_globals = self.slot_to_global[evict_slots].long()
             valid_evict = old_globals >= 0
             if valid_evict.any():
-                self.global_to_slot_np[old_globals[valid_evict]] = -1
+                self.global_to_slot[old_globals[valid_evict]] = -1
 
             # write new rows into GPU buffer (enqueued after miss_rows H2D)
-            evict_slots_t = torch.from_numpy(evict_slots_np).to(self.device, non_blocking=True)
-            self.rows[evict_slots_t] = miss_rows
+            evict_slots_gpu = evict_slots.to(self.device, non_blocking=True)
+            self.rows[evict_slots_gpu] = miss_rows
 
             # update CPU index
-            self.slot_to_global_np[evict_slots_np] = miss_tokens_np.astype(np.int32)
-            self.global_to_slot_np[miss_tokens_np] = evict_slots_np.astype(np.int32)
+            self.slot_to_global[evict_slots] = miss_tokens_cpu.int()
+            self.global_to_slot[miss_tokens_cpu.long()] = evict_slots.int()
 
             self._bytes_loaded += n_miss * self.row_dim * self.rows.element_size()
 
@@ -362,6 +373,7 @@ class SparseVocabPool:
         return out
 
     # ------------------------------------------------------------------
+    @torch.compiler.disable
     def invalidate(self, tokens: torch.Tensor) -> None:
         """Evict *tokens* from the pool after the optimizer updates their rows.
 
@@ -372,12 +384,12 @@ class SparseVocabPool:
             return
         if tokens.device.type != "cpu":
             tokens = tokens.cpu()
-        tokens_np = tokens.numpy().astype(np.int64)
-        slots     = self.global_to_slot_np[tokens_np]
-        valid     = slots >= 0
+        tokens_long = tokens.long()
+        slots       = self.global_to_slot[tokens_long].long()
+        valid       = slots >= 0
         if valid.any():
-            self.global_to_slot_np[tokens_np[valid]] = -1
-            self.slot_to_global_np[slots[valid]]     = -1
+            self.global_to_slot[tokens_long[valid]] = -1
+            self.slot_to_global[slots[valid]]       = -1
 
     # ------------------------------------------------------------------
     def pop_stats(self) -> dict:
@@ -392,5 +404,5 @@ class SparseVocabPool:
         return s
 
     def vram_bytes(self) -> int:
-        """Bytes of GPU VRAM held by this pool (rows buffer only; index is CPU numpy)."""
+        """Bytes of GPU VRAM held by this pool (rows buffer only; index is CPU torch tensors)."""
         return self.rows.numel() * self.rows.element_size()

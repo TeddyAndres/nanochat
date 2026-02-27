@@ -415,8 +415,8 @@ class GPT(nn.Module):
     def clear_sparse_cache(self):
         """Fully invalidate all pools (e.g. after loading a checkpoint)."""
         for pool in self._sparse_pools.values():
-            pool.global_to_slot_np.fill(-1)
-            pool.slot_to_global_np.fill(-1)
+            pool.global_to_slot.fill_(-1)
+            pool.slot_to_global.fill_(-1)
             pool._evict_ptr = 0
 
     def invalidate_sparse_cache_tokens(self, tokens: torch.Tensor):
