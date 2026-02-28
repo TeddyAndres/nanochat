@@ -670,11 +670,12 @@ while True:
             U_step = _ddp_union_tokens(U_step)
         U_size_log = U_step.numel()   # Python int — used for logging only, never passed into compiled graph
         # Pre-compute as a GPU scalar tensor so Dynamo guards on its *shape* (always ())
-        # rather than its *value*, preventing a guard miss — and recompile — every step.
+        # rather than its *value*, preventing a guard miss — and therefore a recompile — every step.
+        # Clamp to prevent overflow when U_size_log is very small
         log_correction_t = torch.tensor(
-            math.log(model_config.vocab_size) - math.log(U_size_log),
+            math.log(model_config.vocab_size) - math.log(max(U_size_log, 1)),
             dtype=torch.float32, device=device,
-        )
+        ).clamp_(-5.0, 5.0)   # prevents bf16 gradient explosion
 
         # ---- 3. H2D: fetch exactly |U_step| rows per vocab table once. --------
         # Each W_U_* is a GPU leaf tensor with requires_grad=True.
@@ -735,11 +736,36 @@ while True:
                 "local_targets":  l_tgt.to(device, non_blocking=True),
                 "log_correction": log_correction_t,
             }
+            
+            # Debug: Check log_correction before forward pass
+            if torch.isnan(log_correction_t).any():
+                print(f"[DEBUG] log_correction is NaN before forward pass at step {step}, micro_batch {i_mb}")
+            
             with autocast_ctx:
                 loss = model(x_mb, y_mb, sparse_context=sparse_ctx_step)
+            
+            # Debug: Check loss after forward pass
+            if torch.isnan(loss).any():
+                print(f"[DEBUG] Loss is NaN after forward pass at step {step}, micro_batch {i_mb}")
+            
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
+            
+            # Debug: Check gradients after backward pass
+            if W_U_wte.grad is not None and torch.isnan(W_U_wte.grad).any():
+                print(f"[DEBUG] W_U_wte.grad is NaN after backward at step {step}, micro_batch {i_mb}")
+            if W_U_lm_head.grad is not None and torch.isnan(W_U_lm_head.grad).any():
+                print(f"[DEBUG] W_U_lm_head.grad is NaN after backward at step {step}, micro_batch {i_mb}")
+            for i_str, W_U_ve_i in W_U_ve.items():
+                if W_U_ve_i.grad is not None and torch.isnan(W_U_ve_i.grad).any():
+                    print(f"[DEBUG] W_U_ve_{i_str}.grad is NaN after backward at step {step}, micro_batch {i_mb}")
+                    # Debug: Check the magnitude of the gradient
+                    grad_norm = W_U_ve_i.grad.norm().item()
+                    print(f"[DEBUG] W_U_ve_{i_str}.grad norm: {grad_norm}")
+                    # Debug: Check if the gradient is extremely large
+                    if grad_norm > 1e6:
+                        print(f"[DEBUG] W_U_ve_{i_str}.grad is extremely large: {grad_norm}")
 
             # On the last micro-batch, fetch the first batch for the *next* step
             # while the final backward kernels are still executing on GPU.
@@ -795,13 +821,28 @@ while True:
                 if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
                     dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
                 vocab_grads[f"ve_{i_str}"] = grad_ve
+           
         # Per-table gradient norm clipping — prevents a single step from corrupting
         # vocab weights when gradients are large (e.g. early training, high LR).
         # In-place on GPU; zero allocation cost when norm <= threshold (common after warmup).
         if args.vocab_max_grad_norm > 0 and vocab_grads:
-            for g in vocab_grads.values():
-                # clamp_(max=1.0) avoids a CPU-GPU sync — no conditional required.
-                g.mul_((args.vocab_max_grad_norm / (g.norm() + 1e-6)).clamp_(max=1.0))
+            for key, g in vocab_grads.items():
+                # Use more aggressive clipping for value embeddings to prevent NaN
+                if key.startswith("ve_"):
+                    # Value embeddings are more prone to overflow, use stricter clipping
+                    clip_norm = min(args.vocab_max_grad_norm * 0.1, 0.1)  # 10x stricter for value embeddings
+                else:
+                    clip_norm = args.vocab_max_grad_norm
+                
+                # Check for NaN/Inf before clipping
+                if torch.isnan(g).any() or torch.isinf(g).any():
+                    print(f"[DEBUG] NaN/Inf detected in {key} gradient before clipping at step {step}")
+                    # Replace NaN/Inf with zeros
+                    g[torch.isnan(g) | torch.isinf(g)] = 0.0
+                
+                # Apply gradient clipping
+                g.mul_((clip_norm / (g.norm() + 1e-6)).clamp_(max=1.0))
+        
         # Record the max per-table grad norm as a GPU tensor (no CPU sync here).
         # Using norm (not amax) so it's directly comparable to the clip threshold.
         # Materialised via .item() in the logging block below alongside train_loss.item().
