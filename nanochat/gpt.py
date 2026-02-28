@@ -541,23 +541,8 @@ class GPT(nn.Module):
             local_idx      = sparse_context["local_idx"]
             local_targets  = sparse_context["local_targets"]
             log_correction = sparse_context["log_correction"]  # () float32 GPU scalar
-            
-            # Debug: Check inputs before sparse computation
-            if torch.isnan(log_correction).any():
-                print(f"[GPT DEBUG] log_correction is NaN before sparse computation")
-            if torch.isnan(W_U_wte).any():
-                print(f"[GPT DEBUG] W_U_wte contains NaN before sparse computation")
-            if torch.isnan(W_U_lm_head).any():
-                print(f"[GPT DEBUG] W_U_lm_head contains NaN before sparse computation")
-            for i_str, W_U_ve_i in W_U_ve.items():
-                if torch.isnan(W_U_ve_i).any():
-                    print(f"[GPT DEBUG] W_U_ve_{i_str} contains NaN before sparse computation")
-            
+
             x = F.embedding(local_idx, W_U_wte)
-            
-            # Debug: Check x after embedding lookup
-            if torch.isnan(x).any():
-                print(f"[GPT DEBUG] x contains NaN after embedding lookup")
         else:
             x = self._cpu_safe_embed(self.wte(), idx)
 
