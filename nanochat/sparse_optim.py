@@ -175,26 +175,20 @@ class VocabRowAdamW:
                 # grad is already GPU bf16 — upcast in-place on GPU, no H2D.
                 # prefetched_m/v/w are GPU f32 row slices fetched before the forward pass.
                 g = grad.detach().to(dtype=torch.float32)
-                # Clamp bf16-overflow infinities to ±1 before entering Adam.
-                # bf16 max is ~65504; any gradient element that overflowed to ±inf
-                # would propagate: m→inf, v→inf, update=inf/inf=NaN, weight→NaN.
-                # nan_to_num is a no-op when all values are finite (the common case).
-                g = g.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)
+                # Zero out ALL non-finite gradient elements before Adam arithmetic.
+                # Dense has f32 grads (can't overflow); sparse has bf16 grads that can
+                # produce ±inf from overflow (~65504 max). The upstream norm clip can
+                # produce NaN from 0*inf=NaN in IEEE 754. Both are neutralised here.
+                g = g.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
                 m_rows = beta1 * prefetched_m[key] + (1.0 - beta1) * g
                 v_rows = beta2 * prefetched_v[key] + (1.0 - beta2) * g.square()
 
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
-                m_hat = m_hat.nan_to_num(0.0, 1.0, -1.0).clamp_(-5.0, 5.0)
-                v_hat = v_hat.clamp_min_(1e-6)
                 update = m_hat / (v_hat.sqrt_() + self.eps)
-                update = update.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-10.0, 10.0)
-                # AdamW-correct ordering: apply the Adam delta first, then weight-decay
-                # the result.  The old formula decayed the *pre-update* weight, which
-                # diverges from standard AdamW when weight_decay > 0.
-                w_updated = (prefetched_w[key] - lr * update) * (1.0 - lr * self.weight_decay)
-                w_updated = w_updated.clamp_(-30.0, 30.0)
+                # Standard AdamW: weight decay on the pre-update weight, then subtract step.
+                w_updated = prefetched_w[key] * (1.0 - lr * self.weight_decay) - lr * update
 
                 # Non-blocking D2H into pre-allocated pinned staging buffers.
                 # The D2H stream waits for the compute stream to finish the Adam
@@ -221,8 +215,8 @@ class VocabRowAdamW:
                 # ---- CPU arithmetic path (original) ----
                 # Move grad to CPU float32 (blocking — GPU has already finished backward)
                 g = grad.detach().to(dtype=torch.float32, device="cpu")
-                # Guard against bf16 overflow (inf) — same rationale as GPU path above.
-                g = g.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)
+                # Same non-finite guard as GPU path.
+                g = g.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
                 m_rows = self._m[key][U_step]
                 v_rows = self._v[key][U_step]
@@ -230,19 +224,33 @@ class VocabRowAdamW:
                 m_rows = beta1 * m_rows + (1.0 - beta1) * g
                 v_rows = beta2 * v_rows + (1.0 - beta2) * g.square()
 
+                # Mimic dense-path behaviour: decay ALL rows (including inactive ones
+                # that received no gradient this step). Inactive rows decay as
+                # m *= beta1 each step, matching exactly what dense AdamW does when
+                # grad=0.  Active rows are then overwritten with the correct update.
+                self._m[key].mul_(beta1)
+                self._v[key].mul_(beta2)
                 self._m[key][U_step] = m_rows
                 self._v[key][U_step] = v_rows
 
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
-                m_hat = m_hat.nan_to_num(0.0, 1.0, -1.0).clamp_(-5.0, 5.0)
-                v_hat = v_hat.clamp_min_(1e-6)
 
                 update = m_hat / (v_hat.sqrt_() + self.eps)
-                update = update.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-10.0, 10.0)
                 w_rows = tables[key][U_step]
-                # AdamW-correct ordering: step first, then weight-decay the result.
-                tables[key][U_step] = (w_rows - lr * update) * (1.0 - lr * self.weight_decay)
+                # Standard AdamW: weight decay on the pre-update weight, then subtract step.
+                tables[key][U_step] = w_rows * (1.0 - lr * self.weight_decay) - lr * update
+
+        # GPU path: decay ALL rows on the CPU master tables to mimic dense behaviour
+        # (inactive rows with no gradient this step should have m *= beta1, v *= beta2).
+        # The CPU master tables still hold last-step's values for active rows because
+        # flush_pending_writes() hasn't run yet — that's fine: the next call to
+        # flush_pending_writes() will overwrite active rows with the correctly computed
+        # m_rows/v_rows that were D2H'd above, so the intermediate decay is harmless.
+        if use_gpu:
+            for key in self._m:
+                self._m[key].mul_(beta1)
+                self._v[key].mul_(beta2)
 
         # After the per-key loop: record the D2H event and store pending state.
         # flush_pending_writes() at the start of the *next* step will synchronize
