@@ -1,8 +1,8 @@
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.sparse_optim import SparseHybridOptimizer
-from nanochat.sparse_vocab import compute_batch_token_set, sparse_logits
+from nanochat.sparse_optim import VocabRowAdamW
+from nanochat.sparse_vocab import compute_batch_token_set
 
 
 def _build_model(*, sparse_mode: bool, tie_embeddings: bool, vocab_size: int = 256):
@@ -30,6 +30,33 @@ def _sample_batch(vocab_size: int, batch_size: int = 2, seq_len: int = 12):
     return idx, targets
 
 
+def _build_sparse_context(model, idx, targets, device=None):
+    """Simulate the pre-fetch that base_train does before the grad-accum loop."""
+    if device is None:
+        device = torch.device("cpu")
+    V = model.config.vocab_size
+    U, _, local_idx, local_targets = compute_batch_token_set(idx, targets, vocab_size=V)
+    U_size = U.numel()
+
+    def _rows(w):
+        rows = w.detach().index_select(0, U).to(device)
+        rows.requires_grad_(True)
+        return rows
+
+    W_U_wte = _rows(model.wte().weight)
+    W_U_lm = W_U_wte if model.config.tie_embeddings else _rows(model.lm_head.weight)
+    W_U_ve = {i_str: _rows(ve.weight) for i_str, ve in model.value_embeds.items()}
+
+    return {
+        "W_U_wte":     W_U_wte,
+        "W_U_ve":      W_U_ve,
+        "W_U_lm_head": W_U_lm,
+        "local_idx":     local_idx.to(device),
+        "local_targets": local_targets.to(device),
+        "U_size":        U_size,
+    }, U
+
+
 def test_standard_model_train_and_infer_still_work():
     model = _build_model(sparse_mode=False, tie_embeddings=False, vocab_size=128)
     optimizer = model.setup_optimizer()
@@ -46,23 +73,32 @@ def test_standard_model_train_and_infer_still_work():
     assert torch.isfinite(logits).all()
 
 
-def test_sparse_mode_train_and_infer_work_with_sparse_optimizer():
+def test_sparse_mode_train_and_infer_work_with_vocab_row_adamw():
+    """Sparse mode: dense optimizer handles non-vocab params; VocabRowAdamW handles vocab tables."""
     model = _build_model(sparse_mode=True, tie_embeddings=True, vocab_size=256)
-    optimizer = model.setup_optimizer()
-    assert isinstance(optimizer, SparseHybridOptimizer)
+    optimizer = model.setup_optimizer()  # dense-only optimizer; vocab params excluded
+
+    V, d = 256, 64
+    vocab_table = {"wte": model.wte().weight.data}  # CPU master weight
+    vocab_opt = VocabRowAdamW(
+        tables=vocab_table,
+        initial_lrs={"wte": 3e-4},
+    )
 
     idx, targets = _sample_batch(vocab_size=256)
-    loss = model(idx, targets)
+    device = torch.device("cpu")
+    sparse_ctx, U_step = _build_sparse_context(model, idx, targets, device)
+
+    loss = model(idx, targets, sparse_context=sparse_ctx)
     assert torch.isfinite(loss)
     loss.backward()
 
-    grad = model.wte().weight.grad
-    assert grad is not None
-    assert grad.is_sparse
-
-    optimizer.step()
+    # Collect grad from the pre-fetched GPU leaf
+    vocab_grads = {"wte": sparse_ctx["W_U_wte"].grad.float()}
+    vocab_opt.step(U_step, vocab_grads, vocab_table, lr_multiplier=1.0)
     optimizer.zero_grad(set_to_none=True)
 
+    # Dense inference should work fine (no sparse_context)
     logits = model(idx)
     assert logits.shape == (idx.size(0), idx.size(1), 256)
     assert torch.isfinite(logits).all()
@@ -82,41 +118,24 @@ def test_inference_is_non_destructive_under_sparse_toggle():
 
 
 def test_sparse_and_dense_match_when_local_vocab_is_full():
-    dense_model = _build_model(sparse_mode=False, tie_embeddings=True, vocab_size=32)
-    sparse_model = _build_model(sparse_mode=True, tie_embeddings=True, vocab_size=32)
+    """When U covers the whole vocab, sparse and dense produce the same loss."""
+    V = 32
+    dense_model = _build_model(sparse_mode=False, tie_embeddings=True, vocab_size=V)
+    sparse_model = _build_model(sparse_mode=True, tie_embeddings=True, vocab_size=V)
     sparse_model.load_state_dict(dense_model.state_dict(), strict=True)
 
-    idx = torch.arange(0, 32, dtype=torch.long).view(1, 32)
+    # idx covers all tokens so |U| == V
+    idx = torch.arange(0, V, dtype=torch.long).view(1, V)
     targets = idx.roll(shifts=-1, dims=1)
     targets[:, -1] = 0
 
     dense_loss = dense_model(idx, targets)
-    sparse_loss = sparse_model(idx, targets)
+
+    device = torch.device("cpu")
+    sparse_ctx, _ = _build_sparse_context(sparse_model, idx, targets, device)
+    sparse_loss = sparse_model(idx, targets, sparse_context=sparse_ctx)
+
     assert torch.allclose(dense_loss, sparse_loss, atol=1e-4, rtol=1e-4)
-
-
-def test_sparse_local_vocab_reduces_logit_tensor_size():
-    V = 1000
-    d = 64
-    B, T = 2, 16
-    x = torch.randn(B, T, d)
-    weight = torch.randn(V, d)
-
-    active_tokens = torch.randint(0, 20, (B, T), dtype=torch.long)
-    targets = active_tokens.roll(shifts=-1, dims=1)
-    targets[:, -1] = -1
-
-    U, _, _, _ = compute_batch_token_set(active_tokens, targets, vocab_size=V)
-    logits_dense = x @ weight.T
-    logits_local = sparse_logits(x, weight, U)
-
-    dense_numel = logits_dense.numel()
-    local_numel = logits_local.numel()
-    reduction = dense_numel / local_numel
-
-    assert U.numel() < V
-    assert local_numel < dense_numel
-    assert reduction > 5.0
 
 
 def test_ddp_union_flag_is_safe_without_dist_init():
@@ -127,3 +146,39 @@ def test_ddp_union_flag_is_safe_without_dist_init():
     U_plain, _, _, _ = compute_batch_token_set(idx, targets, vocab_size=64, use_ddp_union=False)
     U_union, _, _, _ = compute_batch_token_set(idx, targets, vocab_size=64, use_ddp_union=True)
     assert torch.equal(U_plain, U_union)
+
+
+def test_vocab_row_adamw_updates_only_active_rows():
+    """VocabRowAdamW must only touch rows present in U_step; inactive rows must be byte-identical."""
+    V, d = 128, 16
+    wte_data = torch.randn(V, d)
+    tables = {"wte": wte_data.clone()}
+    inactive_row_before = tables["wte"][50].clone()
+
+    opt = VocabRowAdamW(tables=tables, initial_lrs={"wte": 1e-3})
+
+    U_step = torch.tensor([1, 5, 10, 20], dtype=torch.long)
+    grads = {"wte": torch.randn(U_step.numel(), d)}
+    opt.step(U_step, grads, tables, lr_multiplier=1.0)
+
+    # Inactive row must be untouched
+    assert torch.equal(tables["wte"][50], inactive_row_before), "row 50 should not have changed"
+    # Active rows must have changed
+    assert not torch.equal(tables["wte"][1], wte_data[1]), "row 1 should have been updated"
+
+
+def test_vocab_row_adamw_state_dict_roundtrip():
+    V, d = 64, 8
+    tables = {"wte": torch.randn(V, d)}
+    opt = VocabRowAdamW(tables=tables, initial_lrs={"wte": 2e-3})
+
+    U_step = torch.arange(0, 10, dtype=torch.long)
+    grads = {"wte": torch.randn(10, d)}
+    opt.step(U_step, grads, {**tables}, lr_multiplier=1.0)
+
+    sd = opt.state_dict()
+    opt2 = VocabRowAdamW(tables={"wte": torch.randn(V, d)}, initial_lrs={"wte": 2e-3})
+    opt2.load_state_dict(sd)
+    assert torch.equal(opt2._m["wte"], opt._m["wte"])
+    assert torch.equal(opt2._v["wte"], opt._v["wte"])
+    assert opt2._t == opt._t

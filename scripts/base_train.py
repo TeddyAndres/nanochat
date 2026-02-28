@@ -25,9 +25,12 @@ from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
+import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.sparse_vocab import _ddp_union_tokens
+from nanochat.sparse_optim import VocabRowAdamW
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -99,7 +102,6 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--sparse-mode", action="store_true", help="enable dynamic local-vocab sparse training path")
 parser.add_argument("--sparse-ddp-union", action="store_true", help="when sparse mode is enabled, synchronize local token sets across DDP ranks")
 parser.add_argument("--tie-embeddings", action="store_true", help="tie wte and lm_head weights (recommended for sparse mode)")
-parser.add_argument("--sparse-pool-capacity", type=int, default=-1, help="max rows per SparseVocabPool table (-1 = full vocab size). Smaller values reduce VRAM but increase cache misses.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -202,7 +204,6 @@ def build_model_meta(depth):
         sparse_mode=args.sparse_mode,
         sparse_ddp_union=(args.sparse_ddp_union or args.sparse_mode),
         tie_embeddings=(args.tie_embeddings or args.sparse_mode),
-        sparse_pool_capacity=args.sparse_pool_capacity,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -311,11 +312,10 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 if model.config.sparse_mode:
-    # get_rows is @torch.compiler.disable, so TorchDynamo will graph-break there
-    # and compile the surrounding transformer body (attention + MLP) which is
-    # where the GPU utilisation gains live. dynamic=True is required because the
-    # local vocab size |U| changes every batch.
-    print0("Sparse mode: compiling with dynamic=True (SparseVocabPool.get_rows runs eagerly via @torch.compiler.disable)")
+    # Pre-fetched row tensors are created once per optimizer step before the
+    # gradient-accumulation loop.  The forward/backward is then graph-break-free.
+    # dynamic=True is required because |U_step| (the sub-table size) varies per step.
+    print0("Sparse mode: compiling with dynamic=True (pre-fetched row tensors, zero graph breaks)")
     model = torch.compile(model, dynamic=True)
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
@@ -392,8 +392,45 @@ optimizer = model.setup_optimizer(
 )
 
 if resuming:
-    optimizer.load_state_dict(optimizer_data)
+    optimizer_state = optimizer_data.get("dense", optimizer_data)  # backward compat
+    optimizer.load_state_dict(optimizer_state)
     del optimizer_data
+
+# -----------------------------------------------------------------------------
+# VocabRowAdamW: sparse-mode optimizer for CPU-resident vocabulary tables.
+# Manages wte, value_embeds, and lm_head weights externally; these params have
+# requires_grad=False and are NOT inside the MuonAdamW optimizer.
+vocab_optimizer = None
+vocab_tables = None   # {key: master_weight CPU f32 tensor}
+if args.sparse_mode:
+    dmodel_lr_scale_v = (model_config.n_embd / 768) ** -0.5
+    vocab_emb_lr   = args.embedding_lr   * batch_lr_scale * dmodel_lr_scale_v
+    vocab_unemb_lr = args.unembedding_lr * batch_lr_scale * dmodel_lr_scale_v
+    vocab_tied_lr  = 0.028 * dmodel_lr_scale_v   # matches setup_optimizer tied_embedding_lr default
+
+    vocab_tables = {"wte": orig_model.wte().weight.data}
+    if model_config.tie_embeddings:
+        vocab_initial_lrs = {"wte": vocab_tied_lr}
+    else:
+        vocab_tables["lm_head"] = orig_model.lm_head.weight.data
+        vocab_initial_lrs = {"wte": vocab_emb_lr, "lm_head": vocab_unemb_lr}
+    for i_str, ve_module in orig_model.value_embeds.items():
+        key = f"ve_{i_str}"
+        vocab_tables[key] = ve_module.weight.data
+        vocab_initial_lrs[key] = vocab_emb_lr
+
+    vocab_optimizer = VocabRowAdamW(
+        tables=vocab_tables,
+        initial_lrs=vocab_initial_lrs,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=1e-10,
+        weight_decay=0.0,  # embedding rows are not weight-decayed
+    )
+    print0(f"VocabRowAdamW: {len(vocab_tables)} tables, vocab_size={vocab_size:,}")
+
+if resuming and args.sparse_mode and vocab_optimizer is not None:
+    if "vocab_optimizer" in meta_data.get("loop_state", {}):
+        vocab_optimizer.load_state_dict(meta_data["loop_state"]["vocab_optimizer"])
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -556,11 +593,15 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        # Wrap optimizer state to include vocab_optimizer when in sparse mode
+        optim_state = optimizer.state_dict()
+        if args.sparse_mode and vocab_optimizer is not None:
+            optim_state = {"dense": optim_state, "vocab": vocab_optimizer.state_dict()}
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            optim_state,
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -588,31 +629,70 @@ while True:
     # evaluate the gradient
     t0 = time.time()
     data_wait_time = 0.0
-    touched_sparse_tokens = []
+    U_size_log = 0  # number of unique tokens in this step (logged for sparsity visibility)
     if args.sparse_mode:
+        # ---- 1. Collect ALL micro-batches for this optimizer step upfront. ----
+        # We start from the current (x, y, sc) and fetch grad_accum_steps-1 more.
+        # All data is on CPU at this point — no GPU work yet.
+        all_micro_batches = [(x, y, dataloader_state_dict, sparse_context)]
         t_data0 = time.time()
-        batch_next = next(train_loader)
+        for _ in range(grad_accum_steps - 1):
+            all_micro_batches.append(next(train_loader))
         data_wait_time += (time.time() - t_data0)
-        for micro_step in range(grad_accum_steps):
-            _, _, _, next_sparse_context = batch_next
-            touched_sparse_tokens.append(sparse_context["U"])
-            sparse_context_step = {
-                "U": sparse_context["U"],
-                "local_idx": sparse_context["local_idx"],
-                "local_targets": sparse_context["local_targets"],
-                "next_U": next_sparse_context["U"],
+
+        # ---- 2. U_step = union of all per-micro-batch unique token sets (CPU). ----
+        all_U = torch.cat([mb[3]["U"] for mb in all_micro_batches])
+        U_step = torch.unique(all_U, sorted=True)
+        if model_config.sparse_ddp_union:
+            U_step = _ddp_union_tokens(U_step)
+        U_size_log = U_step.numel()   # Python int
+        U_size_for_forward = U_size_log
+
+        # ---- 3. H2D: fetch exactly |U_step| rows per vocab table once. --------
+        # Each W_U_* is a GPU leaf tensor with requires_grad=True.
+        # Grads accumulate across all grad_accum_steps micro-steps.
+        def _fetch_rows(master_w):
+            rows_cpu = master_w.index_select(0, U_step)      # CPU (pageable)
+            rows_gpu = rows_cpu.pin_memory().to(device, dtype=torch.bfloat16, non_blocking=True)
+            rows_gpu.requires_grad_(True)
+            return rows_gpu
+
+        W_U_wte     = _fetch_rows(orig_model.wte().weight)
+        W_U_lm_head = W_U_wte if model_config.tie_embeddings else _fetch_rows(orig_model.lm_head.weight)
+        W_U_ve      = {i_str: _fetch_rows(ve_mod.weight)
+                       for i_str, ve_mod in orig_model.value_embeds.items()}
+
+        # ---- 4. Gradient-accumulation loop — purely GPU, zero H2D copies. -----
+        for x_mb, y_mb, _state, sc_micro in all_micro_batches:
+            # Remap local_idx / local_targets from U_micro positions → U_step positions
+            # All CPU ops, fast, no GPU sync needed.
+            U_micro   = sc_micro["U"]                            # CPU sorted
+            remap     = torch.searchsorted(U_step, U_micro)      # (|U_micro|,)
+
+            l_idx  = sc_micro["local_idx"]                       # (B, T) CPU
+            l_tgt  = sc_micro["local_targets"].clone()           # (B, T) CPU
+            valid_t = l_tgt >= 0
+            l_tgt[valid_t] = remap[l_tgt[valid_t]]
+
+            sparse_ctx_step = {
+                "W_U_wte":     W_U_wte,
+                "W_U_ve":      W_U_ve,
+                "W_U_lm_head": W_U_lm_head,
+                "local_idx":     remap[l_idx].to(device, non_blocking=True),
+                "local_targets": l_tgt.to(device, non_blocking=True),
+                "U_size":        U_size_for_forward,
             }
             with autocast_ctx:
-                loss = model(x, y, sparse_context=sparse_context_step)
-            train_loss = loss.detach() # for logging
-            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+                loss = model(x_mb, y_mb, sparse_context=sparse_ctx_step)
+            train_loss = loss.detach()
+            loss = loss / grad_accum_steps
             loss.backward()
 
-            x, y, dataloader_state_dict, sparse_context = batch_next
-            if micro_step != grad_accum_steps - 1:
-                t_data0 = time.time()
-                batch_next = next(train_loader)
-                data_wait_time += (time.time() - t_data0)
+        # Advance pointers: next step starts with a fresh batch.
+        t_data0 = time.time()
+        next_first = next(train_loader)
+        data_wait_time += (time.time() - t_data0)
+        x, y, dataloader_state_dict, sparse_context = next_first
     else:
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
@@ -635,11 +715,31 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
-    if args.sparse_mode:
-        if len(touched_sparse_tokens) > 0:
-            touched_tokens = torch.unique(torch.cat(touched_sparse_tokens), sorted=True)
-            model.invalidate_sparse_cache_tokens(touched_tokens)
-    sparse_cache_stats = model.pop_sparse_cache_stats() if args.sparse_mode else {"hits": 0, "misses": 0, "bytes_loaded": 0, "load_ms": 0.0}
+    if args.sparse_mode and vocab_optimizer is not None:
+        # Synchronize GPU so backward is fully complete before we read .grad
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        # Collect W_U_* gradients (GPU bf16); VocabRowAdamW moves them to CPU internally.
+        vocab_grads = {}
+        if W_U_wte.grad is not None:
+            grad_wte = W_U_wte.grad
+            if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                dist.all_reduce(grad_wte, op=dist.ReduceOp.AVG)
+            vocab_grads["wte"] = grad_wte
+        if not model_config.tie_embeddings and W_U_lm_head.grad is not None:
+            grad_lm = W_U_lm_head.grad
+            if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                dist.all_reduce(grad_lm, op=dist.ReduceOp.AVG)
+            vocab_grads["lm_head"] = grad_lm
+        for i_str, W_U_ve_i in W_U_ve.items():
+            if W_U_ve_i.grad is not None:
+                grad_ve = W_U_ve_i.grad
+                if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                    dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
+                vocab_grads[f"ve_{i_str}"] = grad_ve
+        vocab_optimizer.step(U_step, vocab_grads, vocab_tables, lr_multiplier=lrm)
+        # Free GPU row tensors — they'll be re-created next step from updated master weights.
+        del W_U_wte, W_U_lm_head, W_U_ve
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     t1 = time.time()
@@ -667,10 +767,8 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    cache_total = sparse_cache_stats["hits"] + sparse_cache_stats["misses"]
-    cache_hit_pct = (100.0 * sparse_cache_stats["hits"] / cache_total) if cache_total > 0 else 0.0
-    cache_loaded_mb = sparse_cache_stats["bytes_loaded"] / (1024 * 1024)
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | cache_hit: {cache_hit_pct:.1f}% | cache_load: {cache_loaded_mb:.1f}MB/{sparse_cache_stats['load_ms']:.1f}ms | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    sparse_info = f" | U_step: {U_size_log:,}" if args.sparse_mode else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{sparse_info} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -683,10 +781,9 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
-            "sparse/cache_hit_pct": cache_hit_pct,
-            "sparse/cache_loaded_mb": cache_loaded_mb,
-            "sparse/cache_load_ms": sparse_cache_stats["load_ms"],
         }
+        if args.sparse_mode:
+            log_data["sparse/U_step_size"] = U_size_log
         wandb_run.log(log_data)
 
     # state update

@@ -32,6 +32,9 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["sparse_ddp_union"] = True
     if "tie_embeddings" not in model_config_kwargs:
         model_config_kwargs["tie_embeddings"] = False
+    # sparse_pool_capacity was removed; drop it from old checkpoints so GPTConfig
+    # construction does not receive an unexpected keyword argument.
+    model_config_kwargs.pop("sparse_pool_capacity", None)
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

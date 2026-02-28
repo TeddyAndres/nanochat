@@ -24,8 +24,8 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
-from nanochat.sparse_optim import SparseHybridOptimizer
-from nanochat.sparse_vocab import compute_batch_token_set, sparse_embedding, sparse_logits, sparse_embedding_cached, sparse_logits_cached, local_vocab_log_correction, SparseVocabPool
+
+from nanochat.sparse_vocab import local_vocab_log_correction
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -45,10 +45,6 @@ class GPTConfig:
     sparse_mode: bool = False
     sparse_ddp_union: bool = True
     tie_embeddings: bool = False
-    # Capacity of each per-table SparseVocabPool in number of *rows* (not bytes).
-    # -1 means auto: set to vocab_size (correct but generous; tune down for huge vocabs).
-    # For very large vocabs set this to ~2.5 × expected |U_batch| to bound VRAM.
-    sparse_pool_capacity: int = -1
 
 
 def norm(x):
@@ -201,9 +197,6 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
-        # SparseVocabPool instances are created in init_weights() when we have a real device.
-        # Dict maps table-key → SparseVocabPool.
-        self._sparse_pools: dict = {}
 
     def wte(self):
         return cast(nn.Embedding, self.transformer["wte"])
@@ -284,62 +277,6 @@ class GPT(nn.Module):
 
         if self.config.sparse_mode:
             self._move_sparse_vocab_tables_to_cpu()
-            self._init_sparse_pools()
-
-    @torch.no_grad()
-    def _init_sparse_pools(self):
-        """Allocate one SparseVocabPool per vocab table (wte, ve_*, lm_head).
-
-        Called once from init_weights() after tables have been moved to CPU.
-        Pools are sized to hold up to `sparse_pool_capacity` rows.  For the
-        2-step lookahead to yield 100% hit rate the capacity must be ≥
-        |U_t ∪ U_{t+1}|.  The default (-1 → vocab_size) is always sufficient;
-        for huge vocabs set GPTConfig.sparse_pool_capacity explicitly.
-        """
-        device = self.get_device()
-        if device.type != "cuda":
-            return  # pools are a GPU optimisation; skip on CPU-only runs
-        cache_dtype = torch.bfloat16
-
-        capacity = (
-            self.config.vocab_size
-            if self.config.sparse_pool_capacity <= 0
-            else min(self.config.sparse_pool_capacity, self.config.vocab_size)
-        )
-
-        # wte / lm_head (shared when tie_embeddings=True)
-        self._sparse_pools["wte"] = SparseVocabPool(
-            self.config.vocab_size,
-            self.wte().weight.size(1),
-            capacity,
-            cache_dtype,
-            device,
-        )
-        if not self.tie_embeddings:
-            self._sparse_pools["lm_head"] = SparseVocabPool(
-                self.config.vocab_size,
-                self.lm_head.weight.size(1),
-                capacity,
-                cache_dtype,
-                device,
-            )
-        # value embed tables
-        for i, ve_module in self.value_embeds.items():
-            ve = cast(nn.Embedding, ve_module)
-            self._sparse_pools[f"ve_{i}"] = SparseVocabPool(
-                self.config.vocab_size,
-                ve.weight.size(1),
-                capacity,
-                cache_dtype,
-                device,
-            )
-
-        total_vram = sum(p.vram_bytes() for p in self._sparse_pools.values())
-        print0(
-            f"SparseVocabPool: {len(self._sparse_pools)} tables, "
-            f"capacity={capacity:,} rows each, "
-            f"total VRAM index+rows: {total_vram / 1024**2:.1f} MiB"
-        )
 
     @torch.no_grad()
     def _move_sparse_vocab_tables_to_cpu(self):
@@ -366,6 +303,15 @@ class GPT(nn.Module):
         if not self.tie_embeddings:
             _move_or_offload(self.lm_head.weight, "lm_head")
 
+        # Vocab table params are updated by VocabRowAdamW, not by any pytorch
+        # optimizer — mark requires_grad=False to keep them out of param groups
+        # and avoid accidental gradient accumulation during forward.
+        self.wte().weight.requires_grad_(False)
+        for ve_module in self.value_embeds.values():
+            cast(nn.Embedding, ve_module).weight.requires_grad_(False)
+        if not self.tie_embeddings:
+            self.lm_head.weight.requires_grad_(False)
+
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
@@ -382,56 +328,6 @@ class GPT(nn.Module):
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
-
-    def _get_pool(self, key: str, master_weight: torch.Tensor) -> "SparseVocabPool | None":
-        """Return the pool for *key*, lazily creating it if pools not yet inited."""
-        if key in self._sparse_pools:
-            return self._sparse_pools[key]
-        # CPU-only path (no pools): fall back to direct index_select
-        return None
-
-    def _pool_get_rows(self, key: str, master_weight: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-        """Retrieve rows from pool (GPU) or directly from master_weight (CPU fallback)."""
-        pool = self._get_pool(key, master_weight)
-        if pool is not None:
-            return pool.get_rows(tokens, master_weight)
-        # CPU-only fallback (no pool)
-        return master_weight.index_select(0, tokens.to(master_weight.device)).to(
-            tokens.device, dtype=torch.bfloat16 if tokens.device.type == "cuda" else master_weight.dtype
-        )
-
-    def pop_sparse_cache_stats(self) -> dict:
-        """Aggregate and reset stats from all pools."""
-        hits = misses = bytes_loaded = 0
-        load_ms = 0.0
-        for pool in self._sparse_pools.values():
-            s = pool.pop_stats()
-            hits         += s["hits"]
-            misses       += s["misses"]
-            bytes_loaded += s["bytes_loaded"]
-            load_ms      += s["load_ms"]
-        return {"hits": hits, "misses": misses, "bytes_loaded": bytes_loaded, "load_ms": load_ms}
-
-    def clear_sparse_cache(self):
-        """Fully invalidate all pools (e.g. after loading a checkpoint)."""
-        for pool in self._sparse_pools.values():
-            pool.global_to_slot.fill_(-1)
-            pool.slot_to_global.fill_(-1)
-            pool._evict_ptr = 0
-
-    def invalidate_sparse_cache_tokens(self, tokens: torch.Tensor):
-        """Evict *tokens* from every pool after the optimizer updates them.
-
-        O(|tokens|) per table — no GPU sync, no pool scan.
-        tokens should be a CPU tensor (from the dataloader's sparse_context).
-        """
-        if tokens.numel() == 0:
-            return
-        # Keep tokens on CPU; pool.invalidate handles CPU tensors directly.
-        if tokens.device.type != "cpu":
-            tokens = tokens.cpu()
-        for pool in self._sparse_pools.values():
-            pool.invalidate(tokens)
 
     def _compute_window_sizes(self, config):
         """
@@ -542,31 +438,29 @@ class GPT(nn.Module):
         lm_head_params = [] if self.tie_embeddings else unique_params(list(self.lm_head.parameters()))
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        if self.tie_embeddings:
-            shared_vocab_params = embedding_params
-            expected = len(unique_params(list(self.parameters())))
-            actual = len(matrix_params) + len(shared_vocab_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
-            assert expected == actual
+        # Verify all trainable params are accounted for.
+        # In sparse mode, vocab tables have requires_grad=False and are managed by
+        # VocabRowAdamW externally — only transformer matrices + scalars stay here.
+        trainable = unique_params([p for p in self.parameters() if p.requires_grad])
+        expected = len(trainable)
+        if not self.config.sparse_mode:
+            if self.tie_embeddings:
+                actual = len(matrix_params) + len(embedding_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+            else:
+                actual = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
         else:
-            expected = len(unique_params(list(self.parameters())))
-            actual = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
-            assert expected == actual
+            actual = len(matrix_params) + len(resid_params) + len(x0_params)
+        assert expected == actual, f"Param count mismatch: expected {expected}, got {actual}"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        # Build param_groups with all required fields explicit
+        # Build param_groups.
+        # In sparse mode, vocab tables (wte / value_embeds / lm_head) are managed by
+        # VocabRowAdamW and have requires_grad=False — they must NOT appear here.
         param_groups = []
-        sparse_param_groups = []
-        if self.config.sparse_mode:
-            if self.tie_embeddings:
-                sparse_param_groups.append(dict(params=embedding_params, lr=tied_embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
-            else:
-                sparse_param_groups.append(dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
-                sparse_param_groups.append(dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
-            sparse_param_groups.append(dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10))
-        else:
+        if not self.config.sparse_mode:
             if self.tie_embeddings:
                 param_groups.append(dict(kind='adamw', params=embedding_params, lr=tied_embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
             else:
@@ -587,195 +481,132 @@ class GPT(nn.Module):
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
-        dense_optimizer = Factory(param_groups)
-
-        if self.config.sparse_mode:
-            sparse_params = []
-            for group in sparse_param_groups:
-                sparse_params.extend(group['params'])
-            sparse_optimizer = torch.optim.SparseAdam(sparse_param_groups)
-            optimizer = SparseHybridOptimizer(dense_optimizer, sparse_optimizer, sparse_params)
-        else:
-            optimizer = dense_optimizer
+        optimizer = Factory(param_groups)
 
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    # ------------------------------------------------------------------
+    # CPU-safe helpers for sparse-mode eval/inference where vocab tables
+    # live on CPU but model inputs / activations are on GPU.
+
+    def _cpu_safe_embed(self, mod: nn.Embedding, idx: torch.Tensor) -> torch.Tensor:
+        """Embedding lookup that handles CPU-resident tables (sparse mode eval)."""
+        w = mod.weight
+        if w.device.type == "cpu" and idx.device.type != "cpu":
+            return mod(idx.cpu()).to(idx.device, dtype=torch.bfloat16)
+        return mod(idx)
+
+    def _cpu_safe_lm_head(self, x: torch.Tensor) -> torch.Tensor:
+        """LM-head projection that handles CPU-resident weight (sparse mode eval)."""
+        w = self.lm_head.weight
+        if w.device.type == "cpu":
+            return x @ w.to(x.device, dtype=x.dtype).T
+        return self.lm_head(x)
+
+    # ------------------------------------------------------------------
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', sparse_context=None):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        sparse_train = self.config.sparse_mode and targets is not None
-        U = None
-        local_idx = None
-        local_targets = None
-        desired_U_cpu = None   # CPU tensor for pool lookups (no GPU sync needed)
-        U_pos = None
-        wte_rows_u = None
+        # sparse_train is True only when pre-fetched row tensors are provided by the
+        # training loop (base_train.py).  Val eval and inference fall through to the
+        # dense path, which handles CPU-resident tables via _cpu_safe_* helpers.
+        sparse_train = self.config.sparse_mode and targets is not None and sparse_context is not None
+
         if sparse_train:
-            if sparse_context is not None:
-                # U, local_idx, local_targets, next_U all originate from the CPU dataloader.
-                # Compute desired_U (union of current + next batch) and U_pos on CPU
-                # *before* moving anything to GPU.  That way get_rows() receives a
-                # CPU tensor and never needs to synchronise the GPU stream.
-                U_cpu          = sparse_context["U"]                  # CPU tensor
-                local_idx_cpu  = sparse_context["local_idx"]          # CPU tensor
-                local_targets_cpu = sparse_context["local_targets"]   # CPU tensor
-                next_U_cpu     = sparse_context.get("next_U")         # CPU or None
-
-                desired_U_cpu = (
-                    U_cpu if next_U_cpu is None
-                    else torch.unique(torch.cat([U_cpu, next_U_cpu]), sorted=True)
-                )
-                # U ⊆ desired_U, both sorted → searchsorted gives U's positions in desired_U.
-                U_pos_cpu = torch.searchsorted(desired_U_cpu, U_cpu)  # CPU op
-
-                # Move model-computation tensors to GPU (all non-blocking)
-                U             = U_cpu.to(idx.device, non_blocking=True)
-                local_idx     = local_idx_cpu.to(idx.device, non_blocking=True)
-                local_targets = local_targets_cpu.to(idx.device, non_blocking=True)
-                U_pos         = U_pos_cpu.to(idx.device, non_blocking=True)
-            else:
-                # Fallback: no sparse_context (rare), compute on GPU then bring index to CPU.
-                assert targets is not None
-                U, _, local_idx, local_targets = compute_batch_token_set(
-                    idx,
-                    targets,
-                    self.config.vocab_size,
-                    use_ddp_union=self.config.sparse_ddp_union,
-                )
-                desired_U_cpu = U.cpu()   # D2H sync accepted only in this fallback path
-                U_pos = torch.arange(U.numel(), device=idx.device, dtype=torch.long)
-
-            # Pool lookups use desired_U_cpu (CPU tensor) → zero GPU synchronization
-            desired_rows_wte = self._pool_get_rows("wte", self.wte().weight, desired_U_cpu)
-            wte_rows_u = desired_rows_wte.index_select(0, U_pos)
-            x = sparse_embedding_cached(self.wte().weight, local_idx, U, wte_rows_u)
+            # Pre-fetched row tensors (created once per optimizer step in base_train.py
+            # before the gradient-accumulation loop, zero H2D copies during forward/backward):
+            #   W_U_wte    : (|U_step|, embd_dim)  GPU bf16  requires_grad=True
+            #   W_U_ve     : {str(i): (|U_step|, kv_dim)}  GPU bf16  requires_grad=True
+            #   W_U_lm_head: (|U_step|, embd_dim)  GPU bf16  requires_grad=True
+            #                (same tensor as W_U_wte when tie_embeddings=True)
+            #   local_idx    : (B, T) GPU long — row indices into the U_step sub-table
+            #   local_targets: (B, T) GPU long — row indices or -1 for ignore
+            #   U_size       : Python int = |U_step|  (safe for math.log, no GPU sync)
+            W_U_wte      = sparse_context["W_U_wte"]
+            W_U_ve       = sparse_context.get("W_U_ve", {})
+            W_U_lm_head  = sparse_context["W_U_lm_head"]
+            local_idx    = sparse_context["local_idx"]
+            local_targets = sparse_context["local_targets"]
+            U_size       = sparse_context["U_size"]
+            x = F.embedding(local_idx, W_U_wte)
         else:
-            x = self.wte()(idx) # embed current token
+            x = self._cpu_safe_embed(self.wte(), idx)
+
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.blocks()):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             if str(i) in self.value_embeds:
-                ve_weight = cast(nn.Embedding, self.value_embeds[str(i)]).weight
                 if sparse_train:
-                    assert local_idx is not None and U is not None and desired_U_cpu is not None and U_pos is not None
-                    desired_rows_ve = self._pool_get_rows(f"ve_{i}", ve_weight, desired_U_cpu)
-                    ve_rows_u = desired_rows_ve.index_select(0, U_pos)
-                    ve = sparse_embedding_cached(ve_weight, local_idx, U, ve_rows_u)
+                    ve = F.embedding(local_idx, W_U_ve[str(i)])
                 else:
-                    ve = cast(nn.Embedding, self.value_embeds[str(i)])(idx)
+                    ve = self._cpu_safe_embed(cast(nn.Embedding, self.value_embeds[str(i)]), idx)
             else:
                 ve = None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        softcap = 15  # smoothly cap logits to [-softcap, softcap]
+
         if sparse_train:
-            assert U is not None and desired_U_cpu is not None and U_pos is not None
-            lm_weight = self.wte().weight if self.tie_embeddings else self.lm_head.weight
-            lm_rows_u = wte_rows_u if self.tie_embeddings else self._pool_get_rows("lm_head", lm_weight, desired_U_cpu).index_select(0, U_pos)
-            assert lm_rows_u is not None
-            # Sparse mode can create a very large (B*T*|U|) tensor.
-            # Compute cross-entropy in chunks to keep peak activation memory bounded
-            # for both training and evaluation (including reduction='none').
-            if targets is not None:
-                assert local_targets is not None
-                flat_x = x.reshape(-1, x.size(-1))
-                flat_targets = local_targets.reshape(-1)
-                valid = flat_targets >= 0
-                valid_count = valid.sum().item()
-                # Dynamically size chunks from currently available free VRAM.
-                # This avoids hard fixed caps while still preventing large spikes.
-                if flat_x.device.type == "cuda":
-                    free_mem, total_mem = torch.cuda.mem_get_info(flat_x.device)
-                    # Dynamic safe envelope: tie budget to both current free memory
-                    # and total VRAM so chunk size adapts but cannot balloon.
-                    logits_budget_bytes = int(min(free_mem * 0.03, total_mem * 0.04))
-                    logits_budget_bytes = max(logits_budget_bytes, 64 * 1024 * 1024)
-                    # logits are cast to fp32 for CE => 4 bytes per element
-                    budget_elems = max(1, logits_budget_bytes // 4)
-                else:
-                    budget_elems = flat_x.size(0) * max(1, int(U.numel()))
-                chunk_tokens = max(128, min(flat_x.size(0), budget_elems // max(1, int(U.numel()))))
+            # All operations from here are pure GPU — no graph breaks, no H2D copies,
+            # no .item() calls.  chunk_size keeps peak logit memory bounded.
+            flat_x        = x.reshape(-1, x.size(-1))    # (B*T, d)
+            flat_targets  = local_targets.reshape(-1)     # (B*T,)
+            valid         = flat_targets >= 0
+            n_valid       = valid.float().sum()           # GPU scalar, no sync
+            chunk_size    = 2048                          # tokens per logit chunk
 
-                if loss_reduction == 'none':
-                    loss_flat = torch.empty_like(flat_targets, dtype=torch.float32)
-                    for start in range(0, flat_x.size(0), chunk_tokens):
-                        end = min(start + chunk_tokens, flat_x.size(0))
-                        logits_chunk = sparse_logits_cached(flat_x[start:end], lm_weight, U, lm_rows_u)
-                        logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
-                        loss_flat[start:end] = F.cross_entropy(
-                            logits_chunk.float(),
-                            flat_targets[start:end],
-                            ignore_index=-1,
-                            reduction='none',
-                        )
-                    correction = local_vocab_log_correction(self.config.vocab_size, int(U.numel()))
-                    loss_flat = loss_flat + correction * valid.to(dtype=loss_flat.dtype)
-                    return loss_flat.view_as(local_targets)
-
-                loss_sum = x.new_zeros((), dtype=torch.float32)
-                for start in range(0, flat_x.size(0), chunk_tokens):
-                    end = min(start + chunk_tokens, flat_x.size(0))
-                    logits_chunk = sparse_logits_cached(flat_x[start:end], lm_weight, U, lm_rows_u)
+            if loss_reduction == 'none':
+                loss_flat = torch.empty_like(flat_targets, dtype=torch.float32)
+                for start in range(0, flat_x.size(0), chunk_size):
+                    end = min(start + chunk_size, flat_x.size(0))
+                    logits_chunk = (flat_x[start:end] @ W_U_lm_head.T).float()
                     logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
-                    loss_sum = loss_sum + F.cross_entropy(
-                        logits_chunk.float(),
-                        flat_targets[start:end],
-                        ignore_index=-1,
-                        reduction='sum',
+                    loss_flat[start:end] = F.cross_entropy(
+                        logits_chunk, flat_targets[start:end],
+                        ignore_index=-1, reduction='none',
                     )
-                if valid_count == 0:
-                    loss = loss_sum
-                elif loss_reduction == 'mean':
-                    loss = loss_sum / valid_count
-                else:
-                    loss = loss_sum
-                correction = local_vocab_log_correction(self.config.vocab_size, int(U.numel()))
-                if loss_reduction == 'mean':
-                    loss = loss + correction
-                else:
-                    loss = loss + correction * valid_count
-                return loss
+                correction = local_vocab_log_correction(self.config.vocab_size, U_size)
+                loss_flat = loss_flat + correction * valid.to(dtype=loss_flat.dtype)
+                return loss_flat.view_as(local_targets)
 
-            logits = sparse_logits_cached(x, lm_weight, U, lm_rows_u)
+            loss_sum = x.new_zeros((), dtype=torch.float32)
+            for start in range(0, flat_x.size(0), chunk_size):
+                end = min(start + chunk_size, flat_x.size(0))
+                logits_chunk = (flat_x[start:end] @ W_U_lm_head.T).float()
+                logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                loss_sum = loss_sum + F.cross_entropy(
+                    logits_chunk, flat_targets[start:end],
+                    ignore_index=-1, reduction='sum',
+                )
+            correction = local_vocab_log_correction(self.config.vocab_size, U_size)
+            if loss_reduction == 'mean':
+                return loss_sum / n_valid.clamp(min=1) + correction
+            else:
+                return loss_sum + correction * n_valid
+
+        else:
+            # Dense path: val eval, inference, or non-sparse mode.
+            logits = self._cpu_safe_lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
             logits = logits.float()
             logits = softcap * torch.tanh(logits / softcap)
-        else:
-            logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-            logits = logits[..., :self.config.vocab_size] # slice to remove padding
-            logits = logits.float() # switch to fp32 for logit softcap and loss computation
-            logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            target_tensor = local_targets if sparse_train else targets
-            assert target_tensor is not None
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_tensor.view(-1), ignore_index=-1, reduction=loss_reduction)
-            if sparse_train:
-                assert U is not None
-                correction = local_vocab_log_correction(self.config.vocab_size, int(U.numel()))
-                if loss_reduction == 'none':
-                    valid = target_tensor.view(-1) >= 0
-                    loss = loss + correction * valid.to(dtype=loss.dtype)
-                else:
-                    loss = loss + correction
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
+            else:
+                return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
