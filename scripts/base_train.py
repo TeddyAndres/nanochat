@@ -111,12 +111,13 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--value-embed-lr", type=float, default=None, help="learning rate for value_embed parameters (Adam); defaults to --embedding-lr if not set. Lower values (e.g. 0.1) reduce risk of bf16 grad overflow on large models.")
+parser.add_argument("--value-embed-lr", type=float, default=0.05, help="learning rate for value_embed parameters (Adam); defaults to --embedding-lr if not set. Lower values (e.g. 0.1) reduce risk of bf16 grad overflow on large models.")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
+parser.add_argument("--vocab-max-grad-norm", type=float, default=1.0, help="per-table gradient norm clip for VocabRowAdamW (0 = disabled). Prevents a single large gradient from corrupting vocab weights.")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -795,10 +796,18 @@ while True:
                 if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
                     dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
                 vocab_grads[f"ve_{i_str}"] = grad_ve
-        # Record the max absolute grad value as a GPU tensor (no CPU sync here).
+        # Per-table gradient norm clipping — prevents a single step from corrupting
+        # vocab weights when gradients are large (e.g. early training, high LR).
+        # In-place on GPU; zero allocation cost when norm <= threshold (common after warmup).
+        if args.vocab_max_grad_norm > 0 and vocab_grads:
+            for g in vocab_grads.values():
+                # clamp_(max=1.0) avoids a CPU-GPU sync — no conditional required.
+                g.mul_((args.vocab_max_grad_norm / (g.norm() + 1e-6)).clamp_(max=1.0))
+        # Record the max per-table grad norm as a GPU tensor (no CPU sync here).
+        # Using norm (not amax) so it's directly comparable to the clip threshold.
         # Materialised via .item() in the logging block below alongside train_loss.item().
         if vocab_grads:
-            vocab_grad_max_t = torch.stack([g.abs().amax() for g in vocab_grads.values()]).amax()
+            vocab_grad_max_t = torch.stack([g.norm() for g in vocab_grads.values()]).amax()
         vocab_optimizer.step(
             U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
@@ -852,7 +861,7 @@ while True:
         if args.sparse_mode:
             log_data["sparse/U_step_size"] = U_size_log
             if vocab_grad_max_t is not None:
-                log_data["sparse/vocab_grad_max"] = vocab_grad_max_t.item()
+                log_data["sparse/vocab_grad_norm_max"] = vocab_grad_max_t.item()
         wandb_run.log(log_data)
 
     # state update
