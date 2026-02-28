@@ -645,8 +645,13 @@ while True:
         U_step = torch.unique(all_U, sorted=True)
         if model_config.sparse_ddp_union:
             U_step = _ddp_union_tokens(U_step)
-        U_size_log = U_step.numel()   # Python int
-        U_size_for_forward = U_size_log
+        U_size_log = U_step.numel()   # Python int — used for logging only, never passed into compiled graph
+        # Pre-compute as a GPU scalar tensor so Dynamo guards on its *shape* (always ())
+        # rather than its *value*, preventing a guard miss — and recompile — every step.
+        log_correction_t = torch.tensor(
+            math.log(model_config.vocab_size) - math.log(U_size_log),
+            dtype=torch.float32, device=device,
+        )
 
         # ---- 3. H2D: fetch exactly |U_step| rows per vocab table once. --------
         # Each W_U_* is a GPU leaf tensor with requires_grad=True.
@@ -678,12 +683,12 @@ while True:
             l_tgt[valid_t] = remap[l_tgt[valid_t]]
 
             sparse_ctx_step = {
-                "W_U_wte":     W_U_wte,
-                "W_U_ve":      W_U_ve,
-                "W_U_lm_head": W_U_lm_head,
-                "local_idx":     remap[l_idx].to(device, non_blocking=True),
-                "local_targets": l_tgt.to(device, non_blocking=True),
-                "U_size":        U_size_for_forward,
+                "W_U_wte":        W_U_wte,
+                "W_U_ve":         W_U_ve,
+                "W_U_lm_head":    W_U_lm_head,
+                "local_idx":      remap[l_idx].to(device, non_blocking=True),
+                "local_targets":  l_tgt.to(device, non_blocking=True),
+                "log_correction": log_correction_t,
             }
             with autocast_ctx:
                 loss = model(x_mb, y_mb, sparse_context=sparse_ctx_step)

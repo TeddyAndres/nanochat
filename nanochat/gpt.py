@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
-from nanochat.sparse_vocab import local_vocab_log_correction
+# local_vocab_log_correction is no longer called at training time — log_correction
+# is pre-computed in base_train.py and passed as a GPU tensor via sparse_context.
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -524,19 +525,22 @@ class GPT(nn.Module):
         if sparse_train:
             # Pre-fetched row tensors (created once per optimizer step in base_train.py
             # before the gradient-accumulation loop, zero H2D copies during forward/backward):
-            #   W_U_wte    : (|U_step|, embd_dim)  GPU bf16  requires_grad=True
-            #   W_U_ve     : {str(i): (|U_step|, kv_dim)}  GPU bf16  requires_grad=True
-            #   W_U_lm_head: (|U_step|, embd_dim)  GPU bf16  requires_grad=True
-            #                (same tensor as W_U_wte when tie_embeddings=True)
-            #   local_idx    : (B, T) GPU long — row indices into the U_step sub-table
-            #   local_targets: (B, T) GPU long — row indices or -1 for ignore
-            #   U_size       : Python int = |U_step|  (safe for math.log, no GPU sync)
-            W_U_wte      = sparse_context["W_U_wte"]
-            W_U_ve       = sparse_context.get("W_U_ve", {})
-            W_U_lm_head  = sparse_context["W_U_lm_head"]
-            local_idx    = sparse_context["local_idx"]
-            local_targets = sparse_context["local_targets"]
-            U_size       = sparse_context["U_size"]
+            #   W_U_wte       : (|U_step|, embd_dim)  GPU bf16  requires_grad=True  mark_dynamic dim 0
+            #   W_U_ve        : {str(i): (|U_step|, kv_dim)}  GPU bf16  requires_grad=True  mark_dynamic dim 0
+            #   W_U_lm_head   : (|U_step|, embd_dim)  GPU bf16  requires_grad=True  mark_dynamic dim 0
+            #                   (same tensor as W_U_wte when tie_embeddings=True)
+            #   local_idx     : (B, T) GPU long — row indices into the U_step sub-table
+            #   local_targets : (B, T) GPU long — row indices or -1 for ignore
+            #   log_correction: () GPU float32 scalar = log(V/|U_step|)
+            #                   Passed as a tensor (not a Python int) so Dynamo guards on
+            #                   its *shape* (always ()) rather than its *value*, preventing
+            #                   a guard miss — and therefore a recompile — every step.
+            W_U_wte        = sparse_context["W_U_wte"]
+            W_U_ve         = sparse_context.get("W_U_ve", {})
+            W_U_lm_head    = sparse_context["W_U_lm_head"]
+            local_idx      = sparse_context["local_idx"]
+            local_targets  = sparse_context["local_targets"]
+            log_correction = sparse_context["log_correction"]  # () float32 GPU scalar
             x = F.embedding(local_idx, W_U_wte)
         else:
             x = self._cpu_safe_embed(self.wte(), idx)
@@ -576,8 +580,7 @@ class GPT(nn.Module):
                         logits_chunk, flat_targets[start:end],
                         ignore_index=-1, reduction='none',
                     )
-                correction = local_vocab_log_correction(self.config.vocab_size, U_size)
-                loss_flat = loss_flat + correction * valid.to(dtype=loss_flat.dtype)
+                loss_flat = loss_flat + log_correction * valid.to(dtype=loss_flat.dtype)
                 return loss_flat.view_as(local_targets)
 
             loss_sum = x.new_zeros((), dtype=torch.float32)
@@ -589,11 +592,10 @@ class GPT(nn.Module):
                     logits_chunk, flat_targets[start:end],
                     ignore_index=-1, reduction='sum',
                 )
-            correction = local_vocab_log_correction(self.config.vocab_size, U_size)
             if loss_reduction == 'mean':
-                return loss_sum / n_valid.clamp(min=1) + correction
+                return loss_sum / n_valid.clamp(min=1) + log_correction
             else:
-                return loss_sum + correction * n_valid
+                return loss_sum + log_correction * n_valid
 
         else:
             # Dense path: val eval, inference, or non-sparse mode.

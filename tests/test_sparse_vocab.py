@@ -53,12 +53,12 @@ def _build_sparse_context(model, idx, targets, device):
         W_U_ve[i_str] = _rows(ve_mod.weight)
 
     return {
-        "W_U_wte":     W_U_wte,
-        "W_U_ve":      W_U_ve,
-        "W_U_lm_head": W_U_lm,
-        "local_idx":     local_idx.to(device),
-        "local_targets": local_targets.to(device),
-        "U_size":        U_size,
+        "W_U_wte":        W_U_wte,
+        "W_U_ve":         W_U_ve,
+        "W_U_lm_head":    W_U_lm,
+        "local_idx":      local_idx.to(device),
+        "local_targets":  local_targets.to(device),
+        "log_correction": torch.tensor(math.log(V) - math.log(U_size), dtype=torch.float32),
     }
 
 
