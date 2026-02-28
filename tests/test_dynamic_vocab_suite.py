@@ -189,7 +189,10 @@ import pytest
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_vocab_row_adamw_gpu_path_matches_cpu_path():
-    """GPU-side Adam arithmetic must produce numerically identical results to the CPU path."""
+    """GPU-side Adam arithmetic must produce numerically identical results to the CPU path.
+
+    Also exercises the full prefetch_to_gpu() → step() → flush_pending_writes() flow.
+    """
     V, d = 128, 32
     device = torch.device("cuda")
 
@@ -211,12 +214,12 @@ def test_vocab_row_adamw_gpu_path_matches_cpu_path():
     # ---- CPU path: grad moved to CPU f32 inside step() ----
     opt_cpu.step(U_step, {"wte": grad_gpu_bf16}, tables_cpu, lr_multiplier=1.0)
 
-    # ---- GPU path: prefetch m/v/w manually (mirrors _fetch_optim_rows in base_train) ----
-    pm = {"wte": opt_gpu._m["wte"].index_select(0, U_step).to(device)}
-    pv = {"wte": opt_gpu._v["wte"].index_select(0, U_step).to(device)}
-    pw = {"wte": tables_gpu["wte"].index_select(0, U_step).to(device)}
+    # ---- GPU path: use prefetch_to_gpu() which uses pre-allocated pinned buffers ----
+    pm, pv, pw = opt_gpu.prefetch_to_gpu(U_step, device, tables_gpu)
     opt_gpu.step(U_step, {"wte": grad_gpu_bf16}, tables_gpu, lr_multiplier=1.0,
                  prefetched_m=pm, prefetched_v=pv, prefetched_w=pw)
+    # D2H is async; must call flush_pending_writes() to commit to CPU tables.
+    opt_gpu.flush_pending_writes()
 
     # Results must be exactly equal (both paths use f32 arithmetic on the same f32 inputs).
     assert torch.equal(tables_cpu["wte"], tables_gpu["wte"]), \

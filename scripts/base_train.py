@@ -429,6 +429,18 @@ if args.sparse_mode:
     )
     print0(f"VocabRowAdamW: {len(vocab_tables)} tables, vocab_size={vocab_size:,}")
 
+# Pre-allocate pinned CPU staging buffers for weight-row H2D prefetch.
+# Using torch.index_select(..., out=pre_pinned_buf) writes the gathered rows
+# directly into page-locked memory — no intermediate pageable allocation
+# or separate pin_memory() copy, halving CPU bandwidth for each fetch.
+if args.sparse_mode and device_type == "cuda":
+    _pin_wte     = torch.empty_like(orig_model.wte().weight, pin_memory=True)
+    _pin_lm_head = None if model_config.tie_embeddings else torch.empty_like(orig_model.lm_head.weight, pin_memory=True)
+    _pin_ve      = {i_str: torch.empty_like(ve_mod.weight, pin_memory=True)
+                    for i_str, ve_mod in orig_model.value_embeds.items()}
+else:
+    _pin_wte = _pin_lm_head = _pin_ve = None
+
 if resuming and args.sparse_mode and vocab_optimizer is not None:
     if "vocab_optimizer" in meta_data.get("loop_state", {}):
         vocab_optimizer.load_state_dict(meta_data["loop_state"]["vocab_optimizer"])
@@ -532,11 +544,10 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 if args.sparse_mode:
-    # Each sparse step fetches grad_accum_steps micro-batches upfront plus 1 at the
-    # end — so we need at least (grad_accum_steps + 1) batches buffered at all times.
-    # Wrap NOW, after grad_accum_steps is known, so we can set the exact right depth.
-    # The background thread resumes from where first_batch left the generator.
-    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=grad_accum_steps + 1)
+    # Each sparse step drains (grad_accum_steps) batches from the queue per step.
+    # Buffer 4× that depth so transient tokenizer hiccups (parquet reads, epoch
+    # boundaries, GC) never drain the queue and stall the GPU.
+    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=max(16, (grad_accum_steps + 1) * 4))
 
 # Go!
 while True:
@@ -664,36 +675,44 @@ while True:
         # ---- 3. H2D: fetch exactly |U_step| rows per vocab table once. --------
         # Each W_U_* is a GPU leaf tensor with requires_grad=True.
         # Grads accumulate across all grad_accum_steps micro-steps.
-        def _fetch_rows(master_w):
-            rows_cpu = master_w.index_select(0, U_step)      # CPU (pageable)
-            rows_gpu = rows_cpu.pin_memory().to(device, dtype=torch.bfloat16, non_blocking=True)
+        #
+        # Flush the previous step's deferred D2H writes FIRST so that
+        # prefetch_to_gpu() reads fully-committed _m/_v/table values.
+        if vocab_optimizer is not None and device_type == "cuda":
+            vocab_optimizer.flush_pending_writes()
+
+        U_size = U_step.numel()
+        def _fetch_rows(master_w, pin_buf=None):
+            if pin_buf is not None:
+                # Write gathered rows directly into pre-allocated pinned memory
+                # (one CPU copy instead of two; no per-step pinned allocation).
+                torch.index_select(master_w, 0, U_step, out=pin_buf[:U_size])
+                rows_gpu = pin_buf[:U_size].to(device, dtype=torch.bfloat16, non_blocking=True)
+            else:
+                rows_cpu = master_w.index_select(0, U_step)      # CPU (pageable)
+                rows_gpu = rows_cpu.pin_memory().to(device, dtype=torch.bfloat16, non_blocking=True)
             rows_gpu.requires_grad_(True)
             # Tell Dynamo that dim 0 (|U_step|) varies across steps so it never
             # places a static size guard on it — prevents recompilation every step.
             torch._dynamo.mark_dynamic(rows_gpu, 0)
             return rows_gpu
 
-        W_U_wte     = _fetch_rows(orig_model.wte().weight)
-        W_U_lm_head = W_U_wte if model_config.tie_embeddings else _fetch_rows(orig_model.lm_head.weight)
-        W_U_ve      = {i_str: _fetch_rows(ve_mod.weight)
+        W_U_wte     = _fetch_rows(orig_model.wte().weight, _pin_wte)
+        W_U_lm_head = W_U_wte if model_config.tie_embeddings else _fetch_rows(orig_model.lm_head.weight, _pin_lm_head)
+        W_U_ve      = {i_str: _fetch_rows(ve_mod.weight, _pin_ve.get(i_str) if _pin_ve else None)
                        for i_str, ve_mod in orig_model.value_embeds.items()}
 
         # ---- 3b. H2D: prefetch active _m/_v/weight rows for GPU-side Adam. ----
-        # Fires non_blocking alongside the weight-row prefetch above so the
-        # PCIe transfer overlaps with the upcoming forward + backward pass.
-        # Full _m/_v tables remain CPU-resident; only |U_step| rows go to GPU.
+        # Uses pre-allocated pinned buffers inside VocabRowAdamW; fires all H2D
+        # transfers non-blocking so they arrive during the forward + backward pass.
         if vocab_optimizer is not None and device_type == "cuda":
-            def _fetch_optim_rows(cpu_table):
-                rows = cpu_table.index_select(0, U_step)      # CPU (pageable)
-                return rows.pin_memory().to(device, non_blocking=True)  # GPU f32
-            prefetched_m_gpu = {k: _fetch_optim_rows(vocab_optimizer._m[k]) for k in vocab_tables}
-            prefetched_v_gpu = {k: _fetch_optim_rows(vocab_optimizer._v[k]) for k in vocab_tables}
-            prefetched_w_gpu = {k: _fetch_optim_rows(vocab_tables[k])        for k in vocab_tables}
+            prefetched_m_gpu, prefetched_v_gpu, prefetched_w_gpu = \
+                vocab_optimizer.prefetch_to_gpu(U_step, device, vocab_tables)
         else:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
 
         # ---- 4. Gradient-accumulation loop — purely GPU, zero H2D copies. -----
-        for x_mb, y_mb, _state, sc_micro in all_micro_batches:
+        for i_mb, (x_mb, y_mb, _state, sc_micro) in enumerate(all_micro_batches):
             # Remap local_idx / local_targets from U_micro positions → U_step positions
             # All CPU ops, fast, no GPU sync needed.
             U_micro   = sc_micro["U"]                            # CPU sorted
@@ -718,11 +737,15 @@ while True:
             loss = loss / grad_accum_steps
             loss.backward()
 
-        # Advance pointers: next step starts with a fresh batch.
-        t_data0 = time.time()
-        next_first = next(train_loader)
-        data_wait_time += (time.time() - t_data0)
-        x, y, dataloader_state_dict, sparse_context = next_first
+            # On the last micro-batch, fetch the first batch for the *next* step
+            # while the final backward kernels are still executing on GPU.
+            # Since next(train_loader) is a queue.get() it returns immediately
+            # when the prefetch thread is keeping up, costing near-zero time.
+            if i_mb == len(all_micro_batches) - 1:
+                t_data0 = time.time()
+                next_first = next(train_loader)
+                data_wait_time += (time.time() - t_data0)
+                x, y, dataloader_state_dict, sparse_context = next_first
     else:
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:

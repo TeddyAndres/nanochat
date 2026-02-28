@@ -58,6 +58,73 @@ class VocabRowAdamW:
         self._m: dict = {k: torch.zeros_like(w, dtype=torch.float32) for k, w in tables.items()}
         self._v: dict = {k: torch.zeros_like(w, dtype=torch.float32) for k, w in tables.items()}
 
+        # CUDA-only: pre-allocated pinned staging buffers eliminate the per-step
+        # pin_memory() allocations and halve CPU bandwidth for prefetch/writeback.
+        # Full vocab-size buffers persist; only |U_step| rows are used each step.
+        if device == "cuda":
+            self._pin_m: dict = {k: torch.zeros_like(w, pin_memory=True) for k, w in tables.items()}
+            self._pin_v: dict = {k: torch.zeros_like(w, pin_memory=True) for k, w in tables.items()}
+            self._pin_w: dict = {k: torch.zeros_like(w, pin_memory=True) for k, w in tables.items()}
+            # Dedicated D2H stream so the updated-row DMA back to CPU doesn't
+            # stall the main compute stream.  A CUDA event lets us fence
+            # the completion at the start of the *next* step.
+            self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream()
+            self._d2h_event: torch.cuda.Event = torch.cuda.Event()
+            self._pending_U: torch.Tensor | None = None
+            self._pending_tables: dict | None = None
+
+    def prefetch_to_gpu(
+        self,
+        U_step: torch.Tensor,
+        device,
+        tables: dict,
+    ) -> tuple:
+        """Gather active rows into pre-allocated pinned buffers and fire non-blocking H2D.
+
+        Replaces the per-step ``index_select() + pin_memory() + .to(device)`` chain
+        with a single ``index_select(..., out=pre_pinned)`` per table — halving CPU
+        memory bandwidth and eliminating all per-step pinned allocations.
+
+        Returns (prefetched_m, prefetched_v, prefetched_w): dicts of GPU f32 tensors
+        with shape (|U_step|, dim), ready for immediate use in ``step()``.
+        Must be called after ``flush_pending_writes()`` for the current step.
+        """
+        U_size = U_step.numel()
+        for key in self._pin_m:
+            torch.index_select(self._m[key],  0, U_step, out=self._pin_m[key][:U_size])
+            torch.index_select(self._v[key],  0, U_step, out=self._pin_v[key][:U_size])
+            torch.index_select(tables[key],   0, U_step, out=self._pin_w[key][:U_size])
+        pm = {k: self._pin_m[k][:U_size].to(device, non_blocking=True) for k in self._pin_m}
+        pv = {k: self._pin_v[k][:U_size].to(device, non_blocking=True) for k in self._pin_v}
+        pw = {k: self._pin_w[k][:U_size].to(device, non_blocking=True) for k in self._pin_w}
+        return pm, pv, pw
+
+    def flush_pending_writes(self) -> None:
+        """Commit the previous step's deferred D2H results into the CPU master tables.
+
+        Waits for the D2H DMA (which was fired asynchronously at the end of the
+        previous step) to complete, then scatter-writes the updated rows into the
+        full-vocab ``_m``, ``_v``, and master weight tables.
+
+        Must be called at the start of each step's prefetch section, *before*
+        ``prefetch_to_gpu()`` reads from those same tables.
+        Is a no-op on the first step (nothing pending) and on the CPU path.
+        """
+        if self._device != "cuda" or not hasattr(self, '_pending_U') or self._pending_U is None:
+            return
+        # Block CPU until the D2H DMA stream has finished copying data into _pin_m/v/w.
+        self._d2h_event.synchronize()
+        U = self._pending_U
+        U_size = U.numel()
+        for key in self._pin_m:
+            self._m[key][U] = self._pin_m[key][:U_size]
+            self._v[key][U] = self._pin_v[key][:U_size]
+        if self._pending_tables is not None:
+            for key in self._pin_w:
+                self._pending_tables[key][U] = self._pin_w[key][:U_size]
+        self._pending_U = None
+        self._pending_tables = None
+
     @torch.no_grad()
     def step(
         self,
@@ -104,7 +171,7 @@ class VocabRowAdamW:
             lr = self._initial_lrs[key] * lr_multiplier
 
             if use_gpu:
-                # ---- GPU arithmetic path ----
+                # ---- GPU arithmetic path (uses pre-fetched pinned row slices) ----
                 # grad is already GPU bf16 — upcast in-place on GPU, no H2D.
                 # prefetched_m/v/w are GPU f32 row slices fetched before the forward pass.
                 g = grad.detach().to(dtype=torch.float32)
@@ -117,12 +184,19 @@ class VocabRowAdamW:
                 update = m_hat / (v_hat.sqrt_() + self.eps)
                 w_updated = (1.0 - lr * self.weight_decay) * prefetched_w[key] - lr * update
 
-                # D2H writeback: synchronous (~few ms for |U_step| rows).
-                # .to("cpu") blocks until the preceding GPU Adam kernels AND the DMA
-                # complete, so no explicit synchronize() is needed before this call.
-                self._m[key][U_step] = m_rows.to("cpu")
-                self._v[key][U_step] = v_rows.to("cpu")
-                tables[key][U_step] = w_updated.to("cpu")
+                # Non-blocking D2H into pre-allocated pinned staging buffers.
+                # The D2H stream waits for the compute stream to finish the Adam
+                # kernels above before issuing DMA — so we never copy stale data.
+                # The main thread is NOT blocked; it continues immediately to
+                # zero_grad / logging while DMA runs in the background.
+                # flush_pending_writes() at the start of the *next* step will
+                # block until DMA is done, then scatter-write into _m/_v/tables.
+                U_size = U_step.numel()
+                with torch.cuda.stream(self._d2h_stream):
+                    self._d2h_stream.wait_stream(torch.cuda.current_stream())
+                    self._pin_m[key][:U_size].copy_(m_rows, non_blocking=True)
+                    self._pin_v[key][:U_size].copy_(v_rows, non_blocking=True)
+                    self._pin_w[key][:U_size].copy_(w_updated, non_blocking=True)
 
             else:
                 # ---- CPU arithmetic path (original) ----
@@ -145,8 +219,18 @@ class VocabRowAdamW:
                 w_rows = tables[key][U_step]
                 tables[key][U_step] = (1.0 - lr * self.weight_decay) * w_rows - lr * update
 
+        # After the per-key loop: record the D2H event and store pending state.
+        # flush_pending_writes() at the start of the *next* step will synchronize
+        # on this event before reading from _m/_v/tables.
+        if use_gpu:
+            self._d2h_event.record(self._d2h_stream)
+            self._pending_U = U_step
+            self._pending_tables = tables
+
     # ------------------------------------------------------------------
     def state_dict(self) -> dict:
+        # Flush any in-flight D2H writes so the returned state is consistent.
+        self.flush_pending_writes()
         return {
             "t": self._t,
             "m": {k: v.clone() for k, v in self._m.items()},
