@@ -109,9 +109,9 @@ parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help=
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
-parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+    parser.add_argument("--embedding-lr", type=float, default=0.05, help="learning rate for embedding/wte parameters (Adam); also controls wte LR in sparse tied-embedding mode")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--value-embed-lr", type=float, default=0.05, help="learning rate for value_embed parameters (Adam); defaults to --embedding-lr if not set. Lower values (e.g. 0.1) reduce risk of bf16 grad overflow on large models.")
+    parser.add_argument("--value-embed-lr", type=float, default=0.001, help="learning rate for value_embed parameters (Adam). Kept separate from --embedding-lr because value_embeds are larger and benefit from a lower LR.")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
@@ -408,14 +408,13 @@ if args.sparse_mode:
     dmodel_lr_scale_v = (model_config.n_embd / 768) ** -0.5
     vocab_emb_lr   = args.embedding_lr   * batch_lr_scale * dmodel_lr_scale_v
     vocab_unemb_lr = args.unembedding_lr * batch_lr_scale * dmodel_lr_scale_v
-    vocab_tied_lr  = 0.028 * dmodel_lr_scale_v   # matches setup_optimizer tied_embedding_lr default
     # Separate LR knob for value_embed rows.  value_embeds are larger (n_layer × vocab × kv_dim)
     # and can accumulate larger gradients — a lower LR reduces overflow risk.
     vocab_ve_lr    = (args.value_embed_lr if args.value_embed_lr is not None else args.embedding_lr) * batch_lr_scale * dmodel_lr_scale_v
 
     vocab_tables = {"wte": orig_model.wte().weight.data}
     if model_config.tie_embeddings:
-        vocab_initial_lrs = {"wte": vocab_tied_lr}
+        vocab_initial_lrs = {"wte": vocab_emb_lr}  # respects --embedding-lr
     else:
         vocab_tables["lm_head"] = orig_model.lm_head.weight.data
         vocab_initial_lrs = {"wte": vocab_emb_lr, "lm_head": vocab_unemb_lr}
