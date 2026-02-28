@@ -448,8 +448,8 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     return_sparse_context=args.sparse_mode,
     vocab_size=vocab_size,
 )
-if args.sparse_mode:
-    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=1)
+# NOTE: We do NOT wrap with AsyncBatchPrefetcher here — grad_accum_steps is not
+# yet known. We'll wrap below after it's computed so we can set the right depth.
 first_batch = next(train_loader) # kick off load of the very first batch of data
 if args.sparse_mode:
     x, y, dataloader_state_dict, sparse_context = first_batch
@@ -529,6 +529,13 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+if args.sparse_mode:
+    # Each sparse step fetches grad_accum_steps micro-batches upfront plus 1 at the
+    # end — so we need at least (grad_accum_steps + 1) batches buffered at all times.
+    # Wrap NOW, after grad_accum_steps is known, so we can set the exact right depth.
+    # The background thread resumes from where first_batch left the generator.
+    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=grad_accum_steps + 1)
 
 # Go!
 while True:
