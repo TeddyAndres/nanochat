@@ -188,19 +188,25 @@ class VocabRowAdamW:
 
                 m_rows = beta1 * prefetched_m[key] + (1.0 - beta1) * g
                 v_rows = beta2 * prefetched_v[key] + (1.0 - beta2) * g.square()
+                # Guard m/v before D2H: if prefetched_m/v had NaN from a prior corrupted
+                # step, those NaN propagate into m_rows/v_rows and would be written to
+                # CPU master state, poisoning all future prefetches for those rows.
+                # nan_to_num here breaks the recirculation loop.
+                m_rows = m_rows.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+                v_rows = v_rows.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
+                # clamp_min before sqrt: subnormal f32 values after bf16→f32 cast and
+                # repeated global decay can produce negative v_hat on some GPU archs,
+                # causing sqrt to return NaN.  eps (=1e-10) is the floor anyway.
+                v_hat = v_hat.clamp_min_(self.eps)
                 update = m_hat / (v_hat.sqrt_() + self.eps)
-                update = update.clamp_(-1.0, 1.0)
                 # Standard AdamW: weight decay on the pre-update weight, then subtract step.
                 w_updated = prefetched_w[key] * (1.0 - lr * self.weight_decay) - lr * update
-                w_updated = w_updated.clamp_(-3.0, 3.0)
-                
-                # Check for NaN/Inf in the updated weights before D2H transfer
-                if torch.isnan(w_updated).any() or torch.isinf(w_updated).any():
-                    print(f"[VocabRowAdamW DEBUG] NaN/Inf detected in {key} GPU updated weights, replacing with zeros")
-                    w_updated[torch.isnan(w_updated) | torch.isinf(w_updated)] = 0.0
+                # Final NaN guard on weights — should never trigger after the fixes above,
+                # but kept as a last-resort safety net to prevent master weight corruption.
+                w_updated = w_updated.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
 
                 # Non-blocking D2H into pre-allocated pinned staging buffers.
                 # The D2H stream waits for the compute stream to finish the Adam
@@ -247,18 +253,12 @@ class VocabRowAdamW:
 
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
+                v_hat = v_hat.clamp_min_(self.eps)
 
                 update = m_hat / (v_hat.sqrt_() + self.eps)
                 w_rows = tables[key][U_step]
                 # Standard AdamW: weight decay on the pre-update weight, then subtract step.
-                new_weights = w_rows * (1.0 - lr * self.weight_decay) - lr * update
-                
-                # Check for NaN/Inf in the new weights before updating
-                if torch.isnan(new_weights).any() or torch.isinf(new_weights).any():
-                    print(f"[VocabRowAdamW DEBUG] NaN/Inf detected in {key} new weights, replacing with zeros")
-                    new_weights[torch.isnan(new_weights) | torch.isinf(new_weights)] = 0.0
-                
-                tables[key][U_step] = new_weights
+                tables[key][U_step] = w_rows * (1.0 - lr * self.weight_decay) - lr * update
 
         # GPU path: decay ALL rows on the CPU master tables to mimic dense behaviour
         # (inactive rows with no gradient this step should have m *= beta1, v *= beta2).
