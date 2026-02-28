@@ -315,7 +315,7 @@ if model.config.sparse_mode:
     # Pre-fetched row tensors are created once per optimizer step before the
     # gradient-accumulation loop.  The forward/backward is then graph-break-free.
     # dynamic=True is required because |U_step| (the sub-table size) varies per step.
-    print0("Sparse mode: compiling with dynamic=True (pre-fetched row tensors, zero graph breaks)")
+    print0("Sparse mode: compiling with dynamic=True (pre-fetched row tensors, zero graph breaks, dim-0 of W_U tables marked dynamic)")
     model = torch.compile(model, dynamic=True)
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
@@ -655,6 +655,9 @@ while True:
             rows_cpu = master_w.index_select(0, U_step)      # CPU (pageable)
             rows_gpu = rows_cpu.pin_memory().to(device, dtype=torch.bfloat16, non_blocking=True)
             rows_gpu.requires_grad_(True)
+            # Tell Dynamo that dim 0 (|U_step|) varies across steps so it never
+            # places a static size guard on it — prevents recompilation every step.
+            torch._dynamo.mark_dynamic(rows_gpu, 0)
             return rows_gpu
 
         W_U_wte     = _fetch_rows(orig_model.wte().weight)
