@@ -191,9 +191,16 @@ class VocabRowAdamW:
                 # zero_grad / logging while DMA runs in the background.
                 # flush_pending_writes() at the start of the *next* step will
                 # block until DMA is done, then scatter-write into _m/_v/tables.
+                #
+                # IMPORTANT: capture current_stream() BEFORE entering the
+                # `with torch.cuda.stream(self._d2h_stream):` context, because
+                # that context switch makes current_stream() return _d2h_stream
+                # itself — turning the wait_stream call into a self-wait no-op
+                # that would let DMA fire before Adam kernels complete.
+                _compute_stream = torch.cuda.current_stream()
                 U_size = U_step.numel()
                 with torch.cuda.stream(self._d2h_stream):
-                    self._d2h_stream.wait_stream(torch.cuda.current_stream())
+                    self._d2h_stream.wait_stream(_compute_stream)
                     self._pin_m[key][:U_size].copy_(m_rows, non_blocking=True)
                     self._pin_v[key][:U_size].copy_(v_rows, non_blocking=True)
                     self._pin_w[key][:U_size].copy_(w_updated, non_blocking=True)

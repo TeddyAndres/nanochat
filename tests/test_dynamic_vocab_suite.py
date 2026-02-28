@@ -228,3 +228,53 @@ def test_vocab_row_adamw_gpu_path_matches_cpu_path():
         "_m state differs between CPU and GPU Adam paths"
     assert torch.equal(opt_cpu._v["wte"], opt_gpu._v["wte"]), \
         "_v state differs between CPU and GPU Adam paths"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_vocab_row_adamw_gpu_two_step_consistency():
+    """Two consecutive GPU-path steps must each read the results committed by the previous step.
+
+    This test specifically catches the wait_stream self-wait bug: if the D2H stream
+    fires before Adam kernels complete, step 2 will read stale/garbage values from
+    the pinned buffers and diverge from the CPU reference.
+    """
+    V, d = 128, 32
+    device = torch.device("cuda")
+
+    wte_master = torch.randn(V, d, dtype=torch.float32)
+    tables_cpu = {"wte": wte_master.clone()}
+    tables_gpu = {"wte": wte_master.clone()}
+
+    opt_cpu = VocabRowAdamW(tables=tables_cpu, initial_lrs={"wte": 1e-3}, device="cpu")
+    opt_gpu = VocabRowAdamW(tables=tables_gpu, initial_lrs={"wte": 1e-3}, device="cuda")
+    opt_gpu._m["wte"].copy_(opt_cpu._m["wte"])
+    opt_gpu._v["wte"].copy_(opt_cpu._v["wte"])
+
+    # Use different U_step / grad each step to stress that committed state propagates.
+    U_step1 = torch.tensor([0, 5, 10, 20, 63], dtype=torch.long)
+    U_step2 = torch.tensor([0, 3, 10, 25, 63], dtype=torch.long)  # partial overlap
+    grad1 = torch.randn(U_step1.numel(), d, device=device, dtype=torch.bfloat16)
+    grad2 = torch.randn(U_step2.numel(), d, device=device, dtype=torch.bfloat16)
+
+    # ---- Step 1 ----
+    opt_cpu.step(U_step1, {"wte": grad1}, tables_cpu, lr_multiplier=1.0)
+
+    pm, pv, pw = opt_gpu.prefetch_to_gpu(U_step1, device, tables_gpu)
+    opt_gpu.step(U_step1, {"wte": grad1}, tables_gpu, lr_multiplier=1.0,
+                 prefetched_m=pm, prefetched_v=pv, prefetched_w=pw)
+
+    # ---- Step 2: flush first (as the training loop does), then prefetch ----
+    opt_gpu.flush_pending_writes()
+    pm2, pv2, pw2 = opt_gpu.prefetch_to_gpu(U_step2, device, tables_gpu)
+
+    opt_cpu.step(U_step2, {"wte": grad2}, tables_cpu, lr_multiplier=1.0)
+    opt_gpu.step(U_step2, {"wte": grad2}, tables_gpu, lr_multiplier=1.0,
+                 prefetched_m=pm2, prefetched_v=pv2, prefetched_w=pw2)
+    opt_gpu.flush_pending_writes()
+
+    assert torch.equal(tables_cpu["wte"], tables_gpu["wte"]), \
+        "master weight tables diverged after two GPU-path steps (check wait_stream ordering)"
+    assert torch.equal(opt_cpu._m["wte"], opt_gpu._m["wte"]), \
+        "_m state diverged after two GPU-path steps"
+    assert torch.equal(opt_cpu._v["wte"], opt_gpu._v["wte"]), \
+        "_v state diverged after two GPU-path steps"
