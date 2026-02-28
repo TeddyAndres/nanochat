@@ -111,6 +111,7 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--value-embed-lr", type=float, default=None, help="learning rate for value_embed parameters (Adam); defaults to --embedding-lr if not set. Lower values (e.g. 0.1) reduce risk of bf16 grad overflow on large models.")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
@@ -407,6 +408,9 @@ if args.sparse_mode:
     vocab_emb_lr   = args.embedding_lr   * batch_lr_scale * dmodel_lr_scale_v
     vocab_unemb_lr = args.unembedding_lr * batch_lr_scale * dmodel_lr_scale_v
     vocab_tied_lr  = 0.028 * dmodel_lr_scale_v   # matches setup_optimizer tied_embedding_lr default
+    # Separate LR knob for value_embed rows.  value_embeds are larger (n_layer × vocab × kv_dim)
+    # and can accumulate larger gradients — a lower LR reduces overflow risk.
+    vocab_ve_lr    = (args.value_embed_lr if args.value_embed_lr is not None else args.embedding_lr) * batch_lr_scale * dmodel_lr_scale_v
 
     vocab_tables = {"wte": orig_model.wte().weight.data}
     if model_config.tie_embeddings:
@@ -417,7 +421,7 @@ if args.sparse_mode:
     for i_str, ve_module in orig_model.value_embeds.items():
         key = f"ve_{i_str}"
         vocab_tables[key] = ve_module.weight.data
-        vocab_initial_lrs[key] = vocab_emb_lr
+        vocab_initial_lrs[key] = vocab_ve_lr
 
     vocab_optimizer = VocabRowAdamW(
         tables=vocab_tables,
@@ -768,6 +772,7 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
+    vocab_grad_max_t = None  # GPU scalar tensor; materialised below in sparse mode for wandb logging
     if args.sparse_mode and vocab_optimizer is not None:
         # Collect W_U_* gradients (GPU bf16).
         # No explicit synchronize() needed: the GPU path runs all Adam arithmetic
@@ -790,6 +795,10 @@ while True:
                 if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
                     dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
                 vocab_grads[f"ve_{i_str}"] = grad_ve
+        # Record the max absolute grad value as a GPU tensor (no CPU sync here).
+        # Materialised via .item() in the logging block below alongside train_loss.item().
+        if vocab_grads:
+            vocab_grad_max_t = torch.stack([g.abs().amax() for g in vocab_grads.values()]).amax()
         vocab_optimizer.step(
             U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
@@ -842,6 +851,8 @@ while True:
         }
         if args.sparse_mode:
             log_data["sparse/U_step_size"] = U_size_log
+            if vocab_grad_max_t is not None:
+                log_data["sparse/vocab_grad_max"] = vocab_grad_max_t.item()
         wandb_run.log(log_data)
 
     # state update

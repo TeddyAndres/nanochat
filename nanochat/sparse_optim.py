@@ -175,6 +175,11 @@ class VocabRowAdamW:
                 # grad is already GPU bf16 — upcast in-place on GPU, no H2D.
                 # prefetched_m/v/w are GPU f32 row slices fetched before the forward pass.
                 g = grad.detach().to(dtype=torch.float32)
+                # Clamp bf16-overflow infinities to ±1 before entering Adam.
+                # bf16 max is ~65504; any gradient element that overflowed to ±inf
+                # would propagate: m→inf, v→inf, update=inf/inf=NaN, weight→NaN.
+                # nan_to_num is a no-op when all values are finite (the common case).
+                g = g.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)
 
                 m_rows = beta1 * prefetched_m[key] + (1.0 - beta1) * g
                 v_rows = beta2 * prefetched_v[key] + (1.0 - beta2) * g.square()
@@ -182,7 +187,10 @@ class VocabRowAdamW:
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
                 update = m_hat / (v_hat.sqrt_() + self.eps)
-                w_updated = (1.0 - lr * self.weight_decay) * prefetched_w[key] - lr * update
+                # AdamW-correct ordering: apply the Adam delta first, then weight-decay
+                # the result.  The old formula decayed the *pre-update* weight, which
+                # diverges from standard AdamW when weight_decay > 0.
+                w_updated = (prefetched_w[key] - lr * update) * (1.0 - lr * self.weight_decay)
 
                 # Non-blocking D2H into pre-allocated pinned staging buffers.
                 # The D2H stream waits for the compute stream to finish the Adam
@@ -209,6 +217,8 @@ class VocabRowAdamW:
                 # ---- CPU arithmetic path (original) ----
                 # Move grad to CPU float32 (blocking — GPU has already finished backward)
                 g = grad.detach().to(dtype=torch.float32, device="cpu")
+                # Guard against bf16 overflow (inf) — same rationale as GPU path above.
+                g = g.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)
 
                 m_rows = self._m[key][U_step]
                 v_rows = self._v[key][U_step]
@@ -224,7 +234,8 @@ class VocabRowAdamW:
 
                 update = m_hat / (v_hat.sqrt_() + self.eps)
                 w_rows = tables[key][U_step]
-                tables[key][U_step] = (1.0 - lr * self.weight_decay) * w_rows - lr * update
+                # AdamW-correct ordering: step first, then weight-decay the result.
+                tables[key][U_step] = (w_rows - lr * update) * (1.0 - lr * self.weight_decay)
 
         # After the per-key loop: record the D2H event and store pending state.
         # flush_pending_writes() at the start of the *next* step will synchronize
