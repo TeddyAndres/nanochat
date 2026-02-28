@@ -99,6 +99,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--sparse-mode", action="store_true", help="enable dynamic local-vocab sparse training path")
 parser.add_argument("--sparse-ddp-union", action="store_true", help="when sparse mode is enabled, synchronize local token sets across DDP ranks")
 parser.add_argument("--tie-embeddings", action="store_true", help="tie wte and lm_head weights (recommended for sparse mode)")
+parser.add_argument("--sparse-pool-capacity", type=int, default=-1, help="max rows per SparseVocabPool table (-1 = full vocab size). Smaller values reduce VRAM but increase cache misses.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -201,6 +202,7 @@ def build_model_meta(depth):
         sparse_mode=args.sparse_mode,
         sparse_ddp_union=(args.sparse_ddp_union or args.sparse_mode),
         tie_embeddings=(args.tie_embeddings or args.sparse_mode),
+        sparse_pool_capacity=args.sparse_pool_capacity,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

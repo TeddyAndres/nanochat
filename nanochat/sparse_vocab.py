@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch.autograd import Function
 
 
-@torch.compiler.allow_in_graph
 def make_sparse_grad(
     weight_shape: tuple,
     indices: torch.Tensor,
@@ -16,9 +15,9 @@ def make_sparse_grad(
 ) -> torch.Tensor:
     """Build a coalesced sparse COO gradient tensor.
 
-    Decorated with @torch.compiler.allow_in_graph so TorchDynamo treats it as
-    a single opaque graph node instead of trying to trace into
-    torch.sparse_coo_tensor (which is an untraceble C++ builtin).
+    Called only from custom Function backward methods, which run via eager
+    autograd (see @torch.compiler.disable on the dispatch wrappers below).
+    Inductor never sees this function.
     """
     return torch.sparse_coo_tensor(
         indices.unsqueeze(0),
@@ -117,7 +116,10 @@ class _SparseEmbeddingFn(Function):
         return grad_weight, None, None
 
 
+@torch.compiler.disable
 def sparse_embedding(weight: torch.Tensor, local_idx: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+    """Graph-break wrapper: runs eager so the custom Function's backward
+    executes via Python autograd (not Inductor), avoiding aten._coalesce."""
     return _SparseEmbeddingFn.apply(weight, U, local_idx)
 
 
@@ -146,7 +148,9 @@ class _SparseEmbeddingCachedFn(Function):
         return grad_weight, None, None, None
 
 
+@torch.compiler.disable
 def sparse_embedding_cached(weight: torch.Tensor, local_idx: torch.Tensor, U: torch.Tensor, W_U: torch.Tensor) -> torch.Tensor:
+    """Graph-break wrapper: same rationale as sparse_embedding."""
     return _SparseEmbeddingCachedFn.apply(weight, U, local_idx, W_U)
 
 
@@ -185,7 +189,9 @@ class _SparseLogitsFn(Function):
         return grad_x, grad_weight, None
 
 
+@torch.compiler.disable
 def sparse_logits(x: torch.Tensor, weight: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
+    """Graph-break wrapper: same rationale as sparse_embedding."""
     return _SparseLogitsFn.apply(x, weight, U)
 
 
@@ -213,7 +219,9 @@ class _SparseLogitsCachedFn(Function):
         return grad_x, grad_weight, None, None
 
 
+@torch.compiler.disable
 def sparse_logits_cached(x: torch.Tensor, weight: torch.Tensor, U: torch.Tensor, W_U: torch.Tensor) -> torch.Tensor:
+    """Graph-break wrapper: same rationale as sparse_embedding."""
     return _SparseLogitsCachedFn.apply(x, weight, U, W_U)
 
 
