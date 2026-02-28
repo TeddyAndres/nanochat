@@ -183,3 +183,45 @@ def test_vocab_row_adamw_state_dict_roundtrip():
     assert torch.equal(opt2._m["wte"], opt._m["wte"])
     assert torch.equal(opt2._v["wte"], opt._v["wte"])
     assert opt2._t == opt._t
+
+
+import pytest
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_vocab_row_adamw_gpu_path_matches_cpu_path():
+    """GPU-side Adam arithmetic must produce numerically identical results to the CPU path."""
+    V, d = 128, 32
+    device = torch.device("cuda")
+
+    # Shared initial state — clone so both optimizers start from the same tensors.
+    wte_master = torch.randn(V, d, dtype=torch.float32)
+    tables_cpu = {"wte": wte_master.clone()}
+    tables_gpu = {"wte": wte_master.clone()}
+
+    opt_cpu = VocabRowAdamW(tables=tables_cpu, initial_lrs={"wte": 1e-3}, device="cpu")
+    opt_gpu = VocabRowAdamW(tables=tables_gpu, initial_lrs={"wte": 1e-3}, device="cuda")
+    # Sync initial _m/_v state (both are zero, but ensure same object layout)
+    opt_gpu._m["wte"].copy_(opt_cpu._m["wte"])
+    opt_gpu._v["wte"].copy_(opt_cpu._v["wte"])
+
+    U_step = torch.tensor([0, 5, 10, 20, 63], dtype=torch.long)
+    # grad as GPU bf16 (matches training path)
+    grad_gpu_bf16 = torch.randn(U_step.numel(), d, device=device, dtype=torch.bfloat16)
+
+    # ---- CPU path: grad moved to CPU f32 inside step() ----
+    opt_cpu.step(U_step, {"wte": grad_gpu_bf16}, tables_cpu, lr_multiplier=1.0)
+
+    # ---- GPU path: prefetch m/v/w manually (mirrors _fetch_optim_rows in base_train) ----
+    pm = {"wte": opt_gpu._m["wte"].index_select(0, U_step).to(device)}
+    pv = {"wte": opt_gpu._v["wte"].index_select(0, U_step).to(device)}
+    pw = {"wte": tables_gpu["wte"].index_select(0, U_step).to(device)}
+    opt_gpu.step(U_step, {"wte": grad_gpu_bf16}, tables_gpu, lr_multiplier=1.0,
+                 prefetched_m=pm, prefetched_v=pv, prefetched_w=pw)
+
+    # Results must be exactly equal (both paths use f32 arithmetic on the same f32 inputs).
+    assert torch.equal(tables_cpu["wte"], tables_gpu["wte"]), \
+        "master weight tables differ between CPU and GPU Adam paths"
+    assert torch.equal(opt_cpu._m["wte"], opt_gpu._m["wte"]), \
+        "_m state differs between CPU and GPU Adam paths"
+    assert torch.equal(opt_cpu._v["wte"], opt_gpu._v["wte"]), \
+        "_v state differs between CPU and GPU Adam paths"

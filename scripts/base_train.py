@@ -425,6 +425,7 @@ if args.sparse_mode:
         betas=(args.adam_beta1, args.adam_beta2),
         eps=1e-10,
         weight_decay=0.0,  # embedding rows are not weight-decayed
+        device=device_type,  # run Adam arithmetic on GPU when available
     )
     print0(f"VocabRowAdamW: {len(vocab_tables)} tables, vocab_size={vocab_size:,}")
 
@@ -677,6 +678,20 @@ while True:
         W_U_ve      = {i_str: _fetch_rows(ve_mod.weight)
                        for i_str, ve_mod in orig_model.value_embeds.items()}
 
+        # ---- 3b. H2D: prefetch active _m/_v/weight rows for GPU-side Adam. ----
+        # Fires non_blocking alongside the weight-row prefetch above so the
+        # PCIe transfer overlaps with the upcoming forward + backward pass.
+        # Full _m/_v tables remain CPU-resident; only |U_step| rows go to GPU.
+        if vocab_optimizer is not None and device_type == "cuda":
+            def _fetch_optim_rows(cpu_table):
+                rows = cpu_table.index_select(0, U_step)      # CPU (pageable)
+                return rows.pin_memory().to(device, non_blocking=True)  # GPU f32
+            prefetched_m_gpu = {k: _fetch_optim_rows(vocab_optimizer._m[k]) for k in vocab_tables}
+            prefetched_v_gpu = {k: _fetch_optim_rows(vocab_optimizer._v[k]) for k in vocab_tables}
+            prefetched_w_gpu = {k: _fetch_optim_rows(vocab_tables[k])        for k in vocab_tables}
+        else:
+            prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
+
         # ---- 4. Gradient-accumulation loop — purely GPU, zero H2D copies. -----
         for x_mb, y_mb, _state, sc_micro in all_micro_batches:
             # Remap local_idx / local_targets from U_micro positions → U_step positions
@@ -731,10 +746,10 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     if args.sparse_mode and vocab_optimizer is not None:
-        # Synchronize GPU so backward is fully complete before we read .grad
-        if device_type == "cuda":
-            torch.cuda.synchronize()
-        # Collect W_U_* gradients (GPU bf16); VocabRowAdamW moves them to CPU internally.
+        # Collect W_U_* gradients (GPU bf16).
+        # No explicit synchronize() needed: the GPU path runs all Adam arithmetic
+        # in the same CUDA stream as backward, so ordering is guaranteed; the
+        # D2H writeback inside step() will synchronize when it copies results to CPU.
         vocab_grads = {}
         if W_U_wte.grad is not None:
             grad_wte = W_U_wte.grad
@@ -752,7 +767,12 @@ while True:
                 if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
                     dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
                 vocab_grads[f"ve_{i_str}"] = grad_ve
-        vocab_optimizer.step(U_step, vocab_grads, vocab_tables, lr_multiplier=lrm)
+        vocab_optimizer.step(
+            U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
+            prefetched_m=prefetched_m_gpu,
+            prefetched_v=prefetched_v_gpu,
+            prefetched_w=prefetched_w_gpu,
+        )
         # Free GPU row tensors — they'll be re-created next step from updated master weights.
         del W_U_wte, W_U_lm_head, W_U_ve
     model.zero_grad(set_to_none=True)
