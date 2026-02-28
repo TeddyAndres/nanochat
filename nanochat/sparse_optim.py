@@ -186,11 +186,15 @@ class VocabRowAdamW:
 
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
+                m_hat = m_hat.nan_to_num(0.0, 1.0, -1.0).clamp_(-5.0, 5.0)
+                v_hat = v_hat.clamp_min_(1e-6)
                 update = m_hat / (v_hat.sqrt_() + self.eps)
+                update = update.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-10.0, 10.0)
                 # AdamW-correct ordering: apply the Adam delta first, then weight-decay
                 # the result.  The old formula decayed the *pre-update* weight, which
                 # diverges from standard AdamW when weight_decay > 0.
                 w_updated = (prefetched_w[key] - lr * update) * (1.0 - lr * self.weight_decay)
+                w_updated = w_updated.clamp_(-30.0, 30.0)
 
                 # Non-blocking D2H into pre-allocated pinned staging buffers.
                 # The D2H stream waits for the compute stream to finish the Adam
@@ -231,8 +235,11 @@ class VocabRowAdamW:
 
                 m_hat = m_rows / bc1
                 v_hat = v_rows / bc2
+                m_hat = m_hat.nan_to_num(0.0, 1.0, -1.0).clamp_(-5.0, 5.0)
+                v_hat = v_hat.clamp_min_(1e-6)
 
                 update = m_hat / (v_hat.sqrt_() + self.eps)
+                update = update.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-10.0, 10.0)
                 w_rows = tables[key][U_step]
                 # AdamW-correct ordering: step first, then weight-decay the result.
                 tables[key][U_step] = (w_rows - lr * update) * (1.0 - lr * self.weight_decay)
