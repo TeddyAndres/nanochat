@@ -63,3 +63,85 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         return float('inf')
     bpb = total_nats / (math.log(2) * total_bytes)
     return bpb
+
+
+@torch.no_grad()
+def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device, sparse_row_dtype=torch.float32):
+    """
+    BPB evaluation using the sparse forward path.
+
+    Builds a sparse_context per batch on-the-fly from the CPU-resident
+    vocab_tables, so only |U_batch| rows of each vocab table are ever
+    resident on GPU simultaneously.
+
+    Peak VRAM for logits = chunk_size × |U_batch| × 4 bytes (fp32)
+    vs. dense eval:        B × T × vocab_size × 4 bytes = ~8 GiB.
+
+    The returned bpb includes the log(V/|U_batch|) approximation for
+    tokens outside the local vocab — identical to the training loss
+    definition and consistent across steps.
+    """
+    from nanochat.sparse_vocab import compute_batch_token_set
+
+    vocab_size = model.config.vocab_size
+    total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+
+    # vocab_tables keys: "wte", "lm_head" (optional), "ve_0", "ve_2", ...
+    # The sparse forward expects W_U_ve keyed by plain layer index ("0", "2", ...).
+    ve_tables = {k[3:]: v for k, v in vocab_tables.items() if k.startswith("ve_")}
+
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y = next(batch_iter)
+
+        # Build sparse context on CPU (unique-token computation, no GPU)
+        U, _g2l, local_idx, local_targets = compute_batch_token_set(x, y, vocab_size)
+        U_size = U.numel()
+        log_correction_t = torch.tensor(
+            math.log(vocab_size / max(U_size, 1)),
+            dtype=torch.float32, device=device,
+        ).clamp_(-5.0, 5.0)
+
+        def _fetch(master_w):
+            return master_w.index_select(0, U).to(device, dtype=sparse_row_dtype)
+
+        W_U_wte = _fetch(vocab_tables["wte"])
+        W_U_lm_head = W_U_wte if model.config.tie_embeddings else _fetch(vocab_tables["lm_head"])
+        W_U_ve = {i_str: _fetch(master_w) for i_str, master_w in ve_tables.items()}
+
+        sparse_ctx = {
+            "W_U_wte":      W_U_wte,
+            "W_U_ve":       W_U_ve,
+            "W_U_lm_head":  W_U_lm_head,
+            "local_idx":    local_idx.to(device),
+            "local_targets": local_targets.to(device),
+            "log_correction": log_correction_t,
+        }
+
+        # (B, T) per-token loss; log_correction already added to valid positions
+        loss2d = model(x, y, loss_reduction='none', sparse_context=sparse_ctx).view(-1)
+
+        # Use original global y for byte-length lookup (not local_targets)
+        y_flat = y.to(device).view(-1)
+        valid = y_flat >= 0
+        y_safe = torch.where(valid, y_flat, torch.zeros_like(y_flat))
+        num_bytes2d = torch.where(
+            valid,
+            token_bytes[y_safe],
+            torch.zeros_like(y_flat, dtype=token_bytes.dtype),
+        )
+        total_nats += (loss2d * (num_bytes2d > 0)).sum()
+        total_bytes += num_bytes2d.sum()
+
+        del W_U_wte, W_U_lm_head, W_U_ve, sparse_ctx
+
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+
+    total_nats = total_nats.item()
+    total_bytes = total_bytes.item()
+    if total_bytes == 0:
+        return float('inf')
+    return total_nats / (math.log(2) * total_bytes)

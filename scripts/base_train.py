@@ -34,7 +34,7 @@ from nanochat.sparse_optim import VocabRowAdamW
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_bpb, evaluate_bpb_sparse
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -578,8 +578,19 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model), autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        if args.sparse_mode and vocab_tables is not None:
+            # Sparse eval: only |U_batch| vocab rows on GPU at once — no OOM risk.
+            # Uses the same chunked logit path as training and includes log_correction.
+            # Run under sparse_autocast_ctx (fp32 when --sparse-fp32, else bf16).
+            sparse_row_dtype = torch.float32 if args.sparse_fp32 else torch.bfloat16
+            with disable_fp8(orig_model), sparse_autocast_ctx:
+                val_bpb = evaluate_bpb_sparse(
+                    orig_model, val_loader, eval_steps, token_bytes,
+                    vocab_tables, device, sparse_row_dtype=sparse_row_dtype,
+                )
+        else:
+            with disable_fp8(model), autocast_ctx:
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -868,20 +879,23 @@ while True:
                     dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
                 vocab_grads[f"ve_{i_str}"] = grad_ve
            
-        # Per-table gradient norm clipping — prevents a single step from corrupting
-        # vocab weights when gradients are large (e.g. early training, high LR).
-        # In-place on GPU; zero allocation cost when norm <= threshold (common after warmup).
+        # Per-ROW gradient norm clipping (not per-table Frobenius norm).
+        # Per-table Frobenius norm scales as sqrt(|U_step| * dim) ≈ sqrt(7.7M) ≈ 2775,
+        # so a table-level clip at e.g. 0.3 would reduce every gradient by ~1000x,
+        # making the embedding optimizer a no-op regardless of the chosen LR.
+        # Per-row clip limits each token row independently, preserving relative magnitudes.
+        # In-place on GPU; clamp_(max=1.0) avoids a CPU-GPU sync on every row.
         if args.vocab_max_grad_norm > 0 and vocab_grads:
             for g in vocab_grads.values():
-                # clamp_(max=1.0) avoids a CPU-GPU sync — no conditional required.
-                g.mul_((args.vocab_max_grad_norm / (g.norm() + 1e-6)).clamp_(max=1.0))
+                # g shape: (|U_step|, dim) — clip each row independently.
+                row_norms = g.norm(dim=-1, keepdim=True)  # (|U_step|, 1)
+                g.mul_((args.vocab_max_grad_norm / (row_norms + 1e-6)).clamp_(max=1.0))
         
-        # Record the max per-table grad norm as a GPU tensor (no CPU sync here).
-        # Using norm (not amax) so it's directly comparable to the clip threshold.
+        # Record the max per-row grad norm across all vocab tables (post-clip).
         # Materialised via .item() in the logging block below alongside train_loss.item().
         if vocab_grads:
-            vocab_grad_max_t = torch.stack([g.norm() for g in vocab_grads.values()]).amax()
-            sparse_grad_norms = {k: float(g.norm().item()) for k, g in vocab_grads.items()}
+            vocab_grad_max_t = torch.stack([g.norm(dim=-1).amax() for g in vocab_grads.values()]).amax()
+            sparse_grad_norms = {k: float(g.norm(dim=-1).amax().item()) for k, g in vocab_grads.items()}
         vocab_update_norms = vocab_optimizer.step(
             U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
