@@ -239,14 +239,15 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        proj_s = s / math.sqrt(2 * self.config.n_layer)  # small but non-zero: keeps residual branch stable while preserving gradient flow
         for block_module in self.blocks():
             block = cast(Block, block_module)
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            torch.nn.init.uniform_(block.attn.c_proj.weight, -proj_s, proj_s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_proj.weight, -proj_s, proj_s)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init

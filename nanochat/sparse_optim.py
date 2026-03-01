@@ -47,6 +47,8 @@ class VocabRowAdamW:
         eps: float = 1e-10,
         weight_decay: float = 0.0,
         device: str = "cpu",
+        defer_writeback: bool = False,
+        overlap_cache: bool = False,
     ) -> None:
         self.betas = betas
         self.eps = eps
@@ -54,12 +56,15 @@ class VocabRowAdamW:
         self._initial_lrs: dict = dict(initial_lrs)
         self._t: int = 0
         self._device: str = device
+        self._defer_writeback: bool = bool(defer_writeback)
+        self._overlap_cache: bool = bool(overlap_cache) and device == "cuda"
+        self._tables_ref: dict = tables
 
         self._m: dict = {k: torch.zeros_like(w, dtype=torch.float32) for k, w in tables.items()}
         self._v: dict = {k: torch.zeros_like(w, dtype=torch.float32) for k, w in tables.items()}
         # Prevent first-update explosion on new tokens (sparse GPU bf16 path)
         for v in self._v.values():
-            v.fill_(0.001)
+            v.fill_(0.0001)
 
         # CUDA-only: pre-allocated pinned staging buffers eliminate the per-step
         # pin_memory() allocations and halve CPU bandwidth for prefetch/writeback.
@@ -75,6 +80,23 @@ class VocabRowAdamW:
             self._d2h_event: torch.cuda.Event = torch.cuda.Event()
             self._pending_U: torch.Tensor | None = None
             self._pending_tables: dict | None = None
+            self._pending_keys: tuple[str, ...] | None = None
+            self._pending_size: int = 0
+
+            # Overlap cache (GPU-resident active rows from previous step)
+            self._cache_U: torch.Tensor | None = None  # CPU sorted global ids
+            self._cache_m: dict[str, torch.Tensor] = {}
+            self._cache_v: dict[str, torch.Tensor] = {}
+            self._cache_w: dict[str, torch.Tensor] = {}
+
+        self._last_prefetch_stats: dict = {
+            "overlap_enabled": self._overlap_cache,
+            "rows_total": 0,
+            "rows_hit": 0,
+            "rows_miss": 0,
+            "rows_evict": 0,
+            "hit_rate": 0.0,
+        }
 
     def prefetch_to_gpu(
         self,
@@ -92,6 +114,98 @@ class VocabRowAdamW:
         with shape (|U_step|, dim), ready for immediate use in ``step()``.
         Must be called after ``flush_pending_writes()`` for the current step.
         """
+        if self._overlap_cache:
+            self.flush_pending_writes()
+            U_cpu = U_step.to(device="cpu")
+            U_size = U_cpu.numel()
+
+            if self._cache_U is None:
+                pm, pv, pw = self._fetch_rows_from_cpu(U_cpu, device, tables)
+                self._cache_U = U_cpu.clone()
+                self._cache_m = pm
+                self._cache_v = pv
+                self._cache_w = pw
+                self._last_prefetch_stats = {
+                    "overlap_enabled": True,
+                    "rows_total": int(U_size),
+                    "rows_hit": 0,
+                    "rows_miss": int(U_size),
+                    "rows_evict": 0,
+                    "hit_rate": 0.0,
+                }
+                return self._cache_m, self._cache_v, self._cache_w
+
+            old_U = self._cache_U
+            old_size = old_U.numel()
+
+            new_pos_in_old = torch.searchsorted(old_U, U_cpu)
+            hit_mask = (new_pos_in_old < old_size)
+            if hit_mask.any():
+                hit_mask = hit_mask & (old_U[new_pos_in_old.clamp(max=max(old_size - 1, 0))] == U_cpu)
+            hit_count = int(hit_mask.sum().item())
+            miss_mask = ~hit_mask
+            miss_ids = U_cpu[miss_mask]
+            miss_count = int(miss_ids.numel())
+
+            old_pos_in_new = torch.searchsorted(U_cpu, old_U)
+            keep_old_mask = (old_pos_in_new < U_size)
+            if keep_old_mask.any():
+                keep_old_mask = keep_old_mask & (U_cpu[old_pos_in_new.clamp(max=max(U_size - 1, 0))] == old_U)
+            evict_mask = ~keep_old_mask
+            evict_ids = old_U[evict_mask]
+            evict_count = int(evict_ids.numel())
+
+            if evict_count > 0:
+                evict_pos = torch.nonzero(evict_mask, as_tuple=False).squeeze(-1)
+                self._write_back_evicted(evict_ids, evict_pos, tables)
+
+            miss_m = miss_v = miss_w = None
+            if miss_count > 0:
+                miss_m, miss_v, miss_w = self._fetch_rows_from_cpu(miss_ids, device, tables)
+
+            new_cache_m: dict[str, torch.Tensor] = {}
+            new_cache_v: dict[str, torch.Tensor] = {}
+            new_cache_w: dict[str, torch.Tensor] = {}
+
+            for key in self._pin_m:
+                dim = self._cache_m[key].size(1)
+                rows_m = torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_v = torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_w = torch.empty((U_size, dim), device=device, dtype=torch.float32)
+
+                if hit_count > 0:
+                    hit_pos_new = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
+                    hit_pos_old = new_pos_in_old[hit_mask]
+                    rows_m[hit_pos_new] = self._cache_m[key][hit_pos_old]
+                    rows_v[hit_pos_new] = self._cache_v[key][hit_pos_old]
+                    rows_w[hit_pos_new] = self._cache_w[key][hit_pos_old]
+
+                if miss_count > 0 and miss_m is not None and miss_v is not None and miss_w is not None:
+                    miss_pos_new = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)
+                    rows_m[miss_pos_new] = miss_m[key]
+                    rows_v[miss_pos_new] = miss_v[key]
+                    rows_w[miss_pos_new] = miss_w[key]
+
+                new_cache_m[key] = rows_m
+                new_cache_v[key] = rows_v
+                new_cache_w[key] = rows_w
+
+            self._cache_U = U_cpu.clone()
+            self._cache_m = new_cache_m
+            self._cache_v = new_cache_v
+            self._cache_w = new_cache_w
+
+            hit_rate = float(hit_count / max(U_size, 1))
+            self._last_prefetch_stats = {
+                "overlap_enabled": True,
+                "rows_total": int(U_size),
+                "rows_hit": int(hit_count),
+                "rows_miss": int(miss_count),
+                "rows_evict": int(evict_count),
+                "hit_rate": hit_rate,
+            }
+            return self._cache_m, self._cache_v, self._cache_w
+
         U_size = U_step.numel()
         for key in self._pin_m:
             torch.index_select(self._m[key],  0, U_step, out=self._pin_m[key][:U_size])
@@ -100,7 +214,74 @@ class VocabRowAdamW:
         pm = {k: self._pin_m[k][:U_size].to(device, non_blocking=True) for k in self._pin_m}
         pv = {k: self._pin_v[k][:U_size].to(device, non_blocking=True) for k in self._pin_v}
         pw = {k: self._pin_w[k][:U_size].to(device, non_blocking=True) for k in self._pin_w}
+        self._last_prefetch_stats = {
+            "overlap_enabled": False,
+            "rows_total": int(U_size),
+            "rows_hit": 0,
+            "rows_miss": int(U_size),
+            "rows_evict": 0,
+            "hit_rate": 0.0,
+        }
         return pm, pv, pw
+
+    def _fetch_rows_from_cpu(self, ids_cpu: torch.Tensor, device, tables: dict) -> tuple:
+        n_rows = ids_cpu.numel()
+        out_m: dict[str, torch.Tensor] = {}
+        out_v: dict[str, torch.Tensor] = {}
+        out_w: dict[str, torch.Tensor] = {}
+        for key in self._pin_m:
+            torch.index_select(self._m[key], 0, ids_cpu, out=self._pin_m[key][:n_rows])
+            torch.index_select(self._v[key], 0, ids_cpu, out=self._pin_v[key][:n_rows])
+            torch.index_select(tables[key], 0, ids_cpu, out=self._pin_w[key][:n_rows])
+            out_m[key] = self._pin_m[key][:n_rows].to(device, non_blocking=True)
+            out_v[key] = self._pin_v[key][:n_rows].to(device, non_blocking=True)
+            out_w[key] = self._pin_w[key][:n_rows].to(device, non_blocking=True)
+        return out_m, out_v, out_w
+
+    def _write_back_evicted(self, evict_ids: torch.Tensor, evict_pos_cpu: torch.Tensor, tables: dict) -> None:
+        n_evict = int(evict_ids.numel())
+        if n_evict == 0:
+            return
+        if self._defer_writeback:
+            evict_pos_gpu = evict_pos_cpu.to(device=self._cache_m[next(iter(self._cache_m))].device)
+            _compute_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(self._d2h_stream):
+                self._d2h_stream.wait_stream(_compute_stream)
+                for key in self._pin_m:
+                    evict_m = self._cache_m[key].index_select(0, evict_pos_gpu)
+                    evict_v = self._cache_v[key].index_select(0, evict_pos_gpu)
+                    evict_w = self._cache_w[key].index_select(0, evict_pos_gpu)
+                    self._pin_m[key][:n_evict].copy_(evict_m, non_blocking=True)
+                    self._pin_v[key][:n_evict].copy_(evict_v, non_blocking=True)
+                    self._pin_w[key][:n_evict].copy_(evict_w, non_blocking=True)
+            self._d2h_event.record(self._d2h_stream)
+            self._pending_U = evict_ids.clone()
+            self._pending_tables = tables
+            self._pending_keys = tuple(self._pin_m.keys())
+            self._pending_size = n_evict
+            return
+
+        for key in self._pin_m:
+            evict_rows_m = self._cache_m[key].index_select(0, evict_pos_cpu.to(device=self._cache_m[key].device)).to(device="cpu")
+            evict_rows_v = self._cache_v[key].index_select(0, evict_pos_cpu.to(device=self._cache_v[key].device)).to(device="cpu")
+            evict_rows_w = self._cache_w[key].index_select(0, evict_pos_cpu.to(device=self._cache_w[key].device)).to(device="cpu")
+            self._m[key][evict_ids] = evict_rows_m
+            self._v[key][evict_ids] = evict_rows_v
+            tables[key][evict_ids] = evict_rows_w
+
+    def flush_cache_to_master(self, tables: dict | None = None) -> None:
+        if self._device != "cuda":
+            return
+        if tables is None:
+            tables = self._tables_ref
+        self.flush_pending_writes()
+        if not self._overlap_cache or self._cache_U is None or self._cache_U.numel() == 0:
+            return
+        ids = self._cache_U
+        for key in self._cache_m:
+            self._m[key][ids] = self._cache_m[key].to(device="cpu")
+            self._v[key][ids] = self._cache_v[key].to(device="cpu")
+            tables[key][ids] = self._cache_w[key].to(device="cpu")
 
     def flush_pending_writes(self) -> dict:
         """Commit the previous step's deferred D2H results into the CPU master tables.
@@ -113,22 +294,30 @@ class VocabRowAdamW:
         ``prefetch_to_gpu()`` reads from those same tables.
         Is a no-op on the first step (nothing pending) and on the CPU path.
         """
-        if self._device != "cuda" or not hasattr(self, '_pending_U') or self._pending_U is None:
+        if (
+            self._device != "cuda"
+            or not hasattr(self, '_pending_U')
+            or self._pending_U is None
+            or self._pending_keys is None
+            or len(self._pending_keys) == 0
+        ):
             return {}
         # Block CPU until the D2H DMA stream has finished copying data into _pin_m/v/w.
         self._d2h_event.synchronize()
         U = self._pending_U
-        U_size = U.numel()
+        U_size = int(self._pending_size) if self._pending_size > 0 else U.numel()
         applied_update_norms: dict = {}
-        for key in self._pin_m:
+        for key in self._pending_keys:
             applied_update_norms[key] = (self._pin_w[key][:U_size] - self._pending_tables[key][U]).norm()
             self._m[key][U] = self._pin_m[key][:U_size]
             self._v[key][U] = self._pin_v[key][:U_size]
         if self._pending_tables is not None:
-            for key in self._pin_w:
+            for key in self._pending_keys:
                 self._pending_tables[key][U] = self._pin_w[key][:U_size]
         self._pending_U = None
         self._pending_tables = None
+        self._pending_keys = None
+        self._pending_size = 0
         return applied_update_norms
 
     @torch.no_grad()
@@ -170,6 +359,7 @@ class VocabRowAdamW:
             and prefetched_v is not None
             and prefetched_w is not None
         )
+        updated_keys: list[str] = []
 
         
 
@@ -226,13 +416,29 @@ class VocabRowAdamW:
                 # that context switch makes current_stream() return _d2h_stream
                 # itself — turning the wait_stream call into a self-wait no-op
                 # that would let DMA fire before Adam kernels complete.
-                _compute_stream = torch.cuda.current_stream()
-                U_size = U_step.numel()
-                with torch.cuda.stream(self._d2h_stream):
-                    self._d2h_stream.wait_stream(_compute_stream)
-                    self._pin_m[key][:U_size].copy_(m_rows, non_blocking=True)
-                    self._pin_v[key][:U_size].copy_(v_rows, non_blocking=True)
-                    self._pin_w[key][:U_size].copy_(w_updated, non_blocking=True)
+                if self._defer_writeback and not self._overlap_cache:
+                    _compute_stream = torch.cuda.current_stream()
+                    U_size = U_step.numel()
+                    with torch.cuda.stream(self._d2h_stream):
+                        self._d2h_stream.wait_stream(_compute_stream)
+                        self._pin_m[key][:U_size].copy_(m_rows, non_blocking=True)
+                        self._pin_v[key][:U_size].copy_(v_rows, non_blocking=True)
+                        self._pin_w[key][:U_size].copy_(w_updated, non_blocking=True)
+                    updated_keys.append(key)
+                else:
+                    if not self._overlap_cache:
+                        # Match CPU semantics: decay full-table moments first,
+                        # then overwrite active rows with this step's updated values.
+                        self._m[key].mul_(beta1)
+                        self._v[key].mul_(beta2)
+                        self._m[key][U_step] = m_rows.to(device="cpu")
+                        self._v[key][U_step] = v_rows.to(device="cpu")
+                        tables[key][U_step] = w_updated.to(device="cpu")
+
+                if self._overlap_cache and self._cache_U is not None:
+                    self._cache_m[key].copy_(m_rows)
+                    self._cache_v[key].copy_(v_rows)
+                    self._cache_w[key].copy_(w_updated)
 
             else:
                 # ---- CPU arithmetic path (original) ----
@@ -273,24 +479,30 @@ class VocabRowAdamW:
         # flush_pending_writes() hasn't run yet — that's fine: the next call to
         # flush_pending_writes() will overwrite active rows with the correctly computed
         # m_rows/v_rows that were D2H'd above, so the intermediate decay is harmless.
-        if use_gpu:
-            for key in self._m:
+        if use_gpu and not self._overlap_cache:
+            for key in updated_keys:
                 self._m[key].mul_(beta1)
                 self._v[key].mul_(beta2)
 
         # After the per-key loop: record the D2H event and store pending state.
         # flush_pending_writes() at the start of the *next* step will synchronize
         # on this event before reading from _m/_v/tables.
-        if use_gpu:
+        if use_gpu and self._defer_writeback and not self._overlap_cache:
             self._d2h_event.record(self._d2h_stream)
-            self._pending_U = U_step
-            self._pending_tables = tables
+            if len(updated_keys) > 0:
+                self._pending_U = U_step
+                self._pending_tables = tables
+                self._pending_keys = tuple(updated_keys)
+            else:
+                self._pending_U = None
+                self._pending_tables = None
+                self._pending_keys = None
         return update_norms
 
     # ------------------------------------------------------------------
     def state_dict(self) -> dict:
-        # Flush any in-flight D2H writes so the returned state is consistent.
-        self.flush_pending_writes()
+        # Flush any in-flight D2H writes and overlap-cache rows so state is consistent.
+        self.flush_cache_to_master(self._tables_ref)
         return {
             "t": self._t,
             "m": {k: v.clone() for k, v in self._m.items()},
@@ -304,3 +516,12 @@ class VocabRowAdamW:
                 self._m[k].copy_(state["m"][k])
             if k in state["v"]:
                 self._v[k].copy_(state["v"][k])
+        if self._device == "cuda":
+            self._cache_U = None
+            self._cache_m = {}
+            self._cache_v = {}
+            self._cache_w = {}
+            self._pending_U = None
+            self._pending_tables = None
+            self._pending_keys = None
+            self._pending_size = 0

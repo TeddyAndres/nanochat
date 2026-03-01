@@ -105,6 +105,15 @@ parser.add_argument("--tie-embeddings", action="store_true", help="tie wte and l
 parser.add_argument("--no-sparse-prefetch", action="store_true", help="disable AsyncBatchPrefetcher in sparse mode")
 parser.add_argument("--sparse-extra-negatives", type=int, default=0, help="number of random non-batch token rows to add to U_step each sparse step (0 = disable)")
 parser.add_argument("--sparse-fp32", action="store_true", help="disable autocast in sparse mode to avoid bf16 gradient underflow")
+parser.add_argument("--no-sparse-compile", action="store_true", help="disable torch.compile(dynamic=True) for sparse mode")
+parser.add_argument("--sparse-optimizer-device", type=str, choices=["auto", "cpu", "cuda"], default="auto", help="device for sparse vocab optimizer arithmetic: auto uses current training device, cpu/cuda force a specific backend")
+parser.add_argument("--sparse-cuda-deferred-writeback", action="store_true", help="enable deferred CUDA D2H writeback in sparse vocab optimizer (experimental)")
+parser.add_argument("--no-sparse-overlap-cache", action="store_true", help="disable overlap cache that keeps intersecting U_step rows resident on GPU between sparse steps")
+parser.add_argument("--sparse-diagnostics", action="store_true", help="print sparse eval/train memory + phase timing diagnostics")
+parser.add_argument("--sparse-diagnostics-every", type=int, default=10, help="emit sparse diagnostics every N steps")
+parser.add_argument("--sparse-sync-profile", action="store_true", help="when sparse diagnostics are enabled, force cuda synchronize around key phases to attribute async wait time")
+parser.add_argument("--sparse-empty-cache-after-eval", action="store_true", help="call torch.cuda.empty_cache() after each eval pass in sparse mode to reduce allocator bleed")
+parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="if >0, call torch.cuda.empty_cache() every N sparse train steps")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -114,7 +123,7 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.05, help="learning rate for embedding/wte parameters (Adam); also controls wte LR in sparse tied-embedding mode")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--value-embed-lr", type=float, default=0.005, help="learning rate for value_embed parameters (Adam). If unset, defaults to --embedding-lr to mirror dense-path calibration.")
+parser.add_argument("--value-embed-lr", type=float, default=None, help="learning rate for value_embed parameters (Adam). If unset, defaults to --embedding-lr to mirror dense-path calibration.")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
@@ -128,6 +137,7 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-device-batch-size", type=int, default=-1, help="per-device batch size used only for eval (-1 = auto; sparse mode defaults to min(train_bs,16))")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
@@ -189,7 +199,8 @@ else:
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
 tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+token_bytes_cpu = get_token_bytes(device="cpu")
+token_bytes = token_bytes_cpu if device_type == "cpu" else token_bytes_cpu.to(device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -321,12 +332,16 @@ if model.config.sparse_mode:
     # Pre-fetched row tensors are created once per optimizer step before the
     # gradient-accumulation loop.  The forward/backward is then graph-break-free.
     # dynamic=True is required because |U_step| (the sub-table size) varies per step.
+    sparse_compile_enabled = (not args.sparse_fp32) and (not args.no_sparse_compile)
     if args.sparse_fp32:
         print0("Sparse mode: --sparse-fp32 enabled, skipping torch.compile for dtype-stable fp32 sparse path")
-    else:
+    elif sparse_compile_enabled:
         print0("Sparse mode: compiling with dynamic=True (pre-fetched row tensors, zero graph breaks, dim-0 of W_U tables marked dynamic)")
         model = torch.compile(model, dynamic=True)
+    else:
+        print0("Sparse mode: running eager (--no-sparse-compile)")
 else:
+    sparse_compile_enabled = False
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
@@ -437,15 +452,31 @@ if args.sparse_mode:
         vocab_tables[key] = ve_module.weight.data
         vocab_initial_lrs[key] = vocab_ve_lr
 
+    sparse_optimizer_device = device_type if args.sparse_optimizer_device == "auto" else args.sparse_optimizer_device
+    if sparse_optimizer_device == "cuda" and device_type != "cuda":
+        print0("Requested --sparse-optimizer-device=cuda without CUDA runtime; falling back to cpu")
+        sparse_optimizer_device = "cpu"
+
     vocab_optimizer = VocabRowAdamW(
         tables=vocab_tables,
         initial_lrs=vocab_initial_lrs,
         betas=(args.adam_beta1, args.adam_beta2),
         eps=1e-10,
         weight_decay=0.0,  # embedding rows are not weight-decayed
-        device=device_type,  # run Adam arithmetic on GPU when available
+        device=sparse_optimizer_device,
+        defer_writeback=args.sparse_cuda_deferred_writeback,
+        overlap_cache=not args.no_sparse_overlap_cache,
     )
-    print0(f"VocabRowAdamW: {len(vocab_tables)} tables, vocab_size={vocab_size:,}")
+    print0(
+        f"VocabRowAdamW: {len(vocab_tables)} tables, vocab_size={vocab_size:,}, "
+        f"device={sparse_optimizer_device}, deferred_writeback={args.sparse_cuda_deferred_writeback}, "
+        f"overlap_cache={not args.no_sparse_overlap_cache}"
+    )
+    print0(
+        f"Sparse table LRs (scaled): wte={vocab_emb_lr:.6g}, "
+        f"lm_head={'tied' if model_config.tie_embeddings else f'{vocab_unemb_lr:.6g}'}, "
+        f"value_embeds={vocab_ve_lr:.6g}"
+    )
 
 # Pre-allocate pinned CPU staging buffers for weight-row H2D prefetch.
 # Using torch.index_select(..., out=pre_pinned_buf) writes the gathered rows
@@ -467,6 +498,17 @@ if resuming and args.sparse_mode and vocab_optimizer is not None:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+
+if args.eval_device_batch_size > 0:
+    eval_device_batch_size = args.eval_device_batch_size
+elif args.sparse_mode:
+    eval_device_batch_size = min(args.device_batch_size, 16)
+else:
+    eval_device_batch_size = args.device_batch_size
+if eval_device_batch_size != args.device_batch_size:
+    print0(f"Eval micro-batch size set to {eval_device_batch_size} (train micro-batch is {args.device_batch_size})")
+
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, eval_device_batch_size, args.max_seq_len, split="val", device=device)
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer,
     args.device_batch_size,
@@ -569,15 +611,21 @@ if args.sparse_mode:
         train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=max(32, (grad_accum_steps + 1) * 4))
 
 # Go!
+prev_reserved_mb = None
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    diag_step = args.sparse_mode and args.sparse_diagnostics and (step % max(args.sparse_diagnostics_every, 1) == 0)
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+        if args.sparse_mode and vocab_optimizer is not None:
+            vocab_optimizer.flush_cache_to_master(vocab_tables)
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        eval_steps = args.eval_tokens // (eval_device_batch_size * args.max_seq_len * ddp_world_size)
+        if args.sparse_diagnostics and device_type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         if args.sparse_mode and vocab_tables is not None:
             # Sparse eval: only |U_batch| vocab rows on GPU at once — no OOM risk.
             # Uses the same chunked logit path as training and includes log_correction.
@@ -585,12 +633,35 @@ while True:
             sparse_row_dtype = torch.float32 if args.sparse_fp32 else torch.bfloat16
             with disable_fp8(orig_model), sparse_autocast_ctx:
                 val_bpb = evaluate_bpb_sparse(
-                    orig_model, val_loader, eval_steps, token_bytes,
+                    orig_model, val_loader, eval_steps, token_bytes_cpu,
                     vocab_tables, device, sparse_row_dtype=sparse_row_dtype,
+                    debug_memory=args.sparse_diagnostics,
                 )
         else:
             with disable_fp8(model), autocast_ctx:
                 val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        if args.sparse_diagnostics and device_type == "cuda":
+            eval_peak_alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            eval_peak_reserved_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+            eval_curr_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            eval_curr_reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            free_b, total_b = torch.cuda.mem_get_info()
+            eval_device_used_mb = (total_b - free_b) / (1024 * 1024)
+            eval_active_mb = eval_inactive_split_mb = 0.0
+            try:
+                mem_stats = torch.cuda.memory_stats()
+                eval_active_mb = mem_stats.get("active_bytes.all.current", 0) / (1024 * 1024)
+                eval_inactive_split_mb = mem_stats.get("inactive_split_bytes.all.current", 0) / (1024 * 1024)
+            except Exception:
+                pass
+            print0(
+                f"[eval_mem] step={step:05d} peak_alloc={eval_peak_alloc_mb:.1f}MiB "
+                f"peak_reserved={eval_peak_reserved_mb:.1f}MiB alloc_now={eval_curr_alloc_mb:.1f}MiB "
+                f"reserved_now={eval_curr_reserved_mb:.1f}MiB active_now={eval_active_mb:.1f}MiB "
+                f"inactive_split={eval_inactive_split_mb:.1f}MiB device_used={eval_device_used_mb:.1f}MiB"
+            )
+        if args.sparse_empty_cache_after_eval and args.sparse_mode and device_type == "cuda":
+            torch.cuda.empty_cache()
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -642,6 +713,8 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if args.sparse_mode and vocab_optimizer is not None:
+            vocab_optimizer.flush_cache_to_master(vocab_tables)
         # Wrap optimizer state to include vocab_optimizer when in sparse mode
         optim_state = optimizer.state_dict()
         if args.sparse_mode and vocab_optimizer is not None:
@@ -683,6 +756,22 @@ while True:
     flush_update_norms_prev: dict[str, float] = {}
     train_loss_sum = None  # accumulated loss across micro-batches (reset each step)
     if args.sparse_mode:
+        t_phase_union = 0.0
+        t_phase_flush = 0.0
+        t_phase_row_fetch = 0.0
+        t_phase_optim_prefetch = 0.0
+        t_phase_local_remap = 0.0
+        t_phase_fwd_bwd = 0.0
+        t_phase_dense_step = 0.0
+        t_phase_grad_pack = 0.0
+        t_phase_clip = 0.0
+        t_phase_grad_stats = 0.0
+        t_phase_vocab_step = 0.0
+        t_phase_zero_grad = 0.0
+        t_phase_loss_item = 0.0
+        t_phase_mem_probe = 0.0
+        t_phase_sync_tail = 0.0
+        t_phase_other_gap = 0.0
         # ---- 1. Collect ALL micro-batches for this optimizer step upfront. ----
         # We start from the current (x, y, sc) and fetch grad_accum_steps-1 more.
         # All data is on CPU at this point — no GPU work yet.
@@ -694,6 +783,7 @@ while True:
 
         # ---- 2. U_step = union of all per-micro-batch unique token sets (CPU). ----
         all_U = torch.cat([mb[3]["U"] for mb in all_micro_batches])
+        t_union0 = time.time()
         U_step = torch.unique(all_U, sorted=True)
         if model_config.sparse_ddp_union:
             U_step = _ddp_union_tokens(U_step)
@@ -701,6 +791,7 @@ while True:
             need = min(args.sparse_extra_negatives, model_config.vocab_size - U_step.numel())
             extra = torch.randperm(model_config.vocab_size, device=U_step.device, dtype=torch.long)[:need]
             U_step = torch.unique(torch.cat([U_step, extra]), sorted=True)
+        t_phase_union += (time.time() - t_union0)
         U_size_log = U_step.numel()   # Python int — used for logging only, never passed into compiled graph
         # Pre-compute as a GPU scalar tensor so Dynamo guards on its *shape* (always ())
         # rather than its *value*, preventing a guard miss — and therefore a recompile — every step.
@@ -711,18 +802,28 @@ while True:
         ).clamp_(-5.0, 5.0)   # prevents bf16 gradient explosion
         log_correction_f = float(log_correction_t.item())
 
+        optimizer_uses_cuda = vocab_optimizer is not None and getattr(vocab_optimizer, "_device", device_type) == "cuda"
+        optimizer_overlap_cache = optimizer_uses_cuda and bool(getattr(vocab_optimizer, "_overlap_cache", False))
+
         # ---- 3. H2D: fetch exactly |U_step| rows per vocab table once. --------
         # Each W_U_* is a GPU leaf tensor with requires_grad=True.
         # Grads accumulate across all grad_accum_steps micro-steps.
         #
-        # Flush the previous step's deferred D2H writes FIRST so that
-        # prefetch_to_gpu() reads fully-committed _m/_v/table values.
-        if vocab_optimizer is not None and device_type == "cuda":
+        # For overlap-cache mode, prefetch_to_gpu() handles pending flush +
+        # overlap reconciliation internally. For non-overlap mode, flush first.
+        if optimizer_uses_cuda and not optimizer_overlap_cache:
+            if diag_step and args.sparse_sync_profile:
+                torch.cuda.synchronize()
+            t_flush0 = time.time()
             flushed = vocab_optimizer.flush_pending_writes()
+            if diag_step and args.sparse_sync_profile:
+                torch.cuda.synchronize()
+            t_phase_flush += (time.time() - t_flush0)
             flush_update_norms_prev = {k: float(v.item()) for k, v in flushed.items()}
 
         U_size = U_step.numel()
         sparse_row_dtype = torch.float32 if args.sparse_fp32 else torch.bfloat16
+        t_rows0 = time.time()
         def _fetch_rows(master_w, pin_buf=None):
             if pin_buf is not None:
                 # Write gathered rows directly into pre-allocated pinned memory
@@ -735,45 +836,80 @@ while True:
             rows_gpu.requires_grad_(True)
             # Tell Dynamo that dim 0 (|U_step|) varies across steps so it never
             # places a static size guard on it — prevents recompilation every step.
-            torch._dynamo.mark_dynamic(rows_gpu, 0)
+            if sparse_compile_enabled:
+                torch._dynamo.mark_dynamic(rows_gpu, 0)
             return rows_gpu
 
-        W_U_wte     = _fetch_rows(orig_model.wte().weight, _pin_wte)
-        W_U_lm_head = W_U_wte if model_config.tie_embeddings else _fetch_rows(orig_model.lm_head.weight, _pin_lm_head)
-        W_U_ve      = {i_str: _fetch_rows(ve_mod.weight, _pin_ve.get(i_str) if _pin_ve else None)
-                       for i_str, ve_mod in orig_model.value_embeds.items()}
+        def _rows_from_prefetched(prefetched_rows):
+            rows_gpu = prefetched_rows.to(dtype=sparse_row_dtype)
+            rows_gpu.requires_grad_(True)
+            if sparse_compile_enabled:
+                torch._dynamo.mark_dynamic(rows_gpu, 0)
+            return rows_gpu
 
         # ---- 3b. H2D: prefetch active _m/_v/weight rows for GPU-side Adam. ----
         # Uses pre-allocated pinned buffers inside VocabRowAdamW; fires all H2D
         # transfers non-blocking so they arrive during the forward + backward pass.
-        if vocab_optimizer is not None and device_type == "cuda":
+        if optimizer_uses_cuda:
+            if diag_step and args.sparse_sync_profile:
+                torch.cuda.synchronize()
+            t_prefetch0 = time.time()
             prefetched_m_gpu, prefetched_v_gpu, prefetched_w_gpu = \
                 vocab_optimizer.prefetch_to_gpu(U_step, device, vocab_tables)
+            if diag_step and args.sparse_sync_profile:
+                torch.cuda.synchronize()
+            t_phase_optim_prefetch += (time.time() - t_prefetch0)
         else:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
 
-        # ---- 4. Gradient-accumulation loop — purely GPU, zero H2D copies. -----
-        skip_sparse_step = False
-        for i_mb, (x_mb, y_mb, _state, sc_micro) in enumerate(all_micro_batches):
-            # Remap local_idx / local_targets from U_micro positions → U_step positions
-            # All CPU ops, fast, no GPU sync needed.
-            U_micro   = sc_micro["U"]                            # CPU sorted
-            remap     = torch.searchsorted(U_step, U_micro)      # (|U_micro|,)
+        if optimizer_overlap_cache and prefetched_w_gpu is not None:
+            W_U_wte = _rows_from_prefetched(prefetched_w_gpu["wte"])
+            W_U_lm_head = W_U_wte if model_config.tie_embeddings else _rows_from_prefetched(prefetched_w_gpu["lm_head"])
+            W_U_ve = {
+                i_str: _rows_from_prefetched(prefetched_w_gpu[f"ve_{i_str}"])
+                for i_str in orig_model.value_embeds.keys()
+            }
+        else:
+            W_U_wte     = _fetch_rows(orig_model.wte().weight, _pin_wte)
+            W_U_lm_head = W_U_wte if model_config.tie_embeddings else _fetch_rows(orig_model.lm_head.weight, _pin_lm_head)
+            W_U_ve      = {i_str: _fetch_rows(ve_mod.weight, _pin_ve.get(i_str) if _pin_ve else None)
+                           for i_str, ve_mod in orig_model.value_embeds.items()}
+        t_phase_row_fetch += (time.time() - t_rows0)
 
-            l_idx  = sc_micro["local_idx"]                       # (B, T) CPU
-            l_tgt  = sc_micro["local_targets"].clone()           # (B, T) CPU
-            valid_t = l_tgt >= 0
+        # ---- 4a. Precompute per-micro-batch remapped index tensors (CPU → GPU). ----
+        # All CPU remap work and non-blocking H2D transfers happen here, BEFORE the
+        # accumulation loop, while the W_U H2D transfers from step 3 are still in
+        # flight.  By the time model() executes there are no CPU stalls between
+        # micro-batch forward/backward calls → GPU runs continuously at 100%.
+        mb_local_idx_gpu  = []
+        mb_local_tgt_gpu  = []
+        t_local0 = time.time()
+        for _x_pre, _y_pre, _st_pre, sc_micro in all_micro_batches:
+            U_micro  = sc_micro["U"]                             # CPU sorted
+            remap    = torch.searchsorted(U_step, U_micro)       # (|U_micro|,) CPU
+            l_idx    = sc_micro["local_idx"]                     # (B, T) CPU
+            l_tgt    = sc_micro["local_targets"].clone()         # (B, T) CPU
+            valid_t  = l_tgt >= 0
             l_tgt[valid_t] = remap[l_tgt[valid_t]]
+            mb_local_idx_gpu.append(remap[l_idx].to(device, non_blocking=True))
+            mb_local_tgt_gpu.append(l_tgt.to(device, non_blocking=True))
+        t_phase_local_remap += (time.time() - t_local0)
 
+        # ---- 4b. Gradient-accumulation loop — purely GPU, zero CPU stalls. -----
+        skip_sparse_step = False
+        for i_mb, (x_mb, y_mb, _state, _sc_micro) in enumerate(all_micro_batches):
             sparse_ctx_step = {
                 "W_U_wte":        W_U_wte,
                 "W_U_ve":         W_U_ve,
                 "W_U_lm_head":    W_U_lm_head,
-                "local_idx":      remap[l_idx].to(device, non_blocking=True),
-                "local_targets":  l_tgt.to(device, non_blocking=True),
+                "local_idx":      mb_local_idx_gpu[i_mb],
+                "local_targets":  mb_local_tgt_gpu[i_mb],
                 "log_correction": log_correction_t,
             }
 
+            t_fwdbwd0 = time.time()
+            if diag_step and args.sparse_sync_profile and device_type == "cuda":
+                torch.cuda.synchronize()
             with sparse_autocast_ctx:
                 loss = model(x_mb, y_mb, sparse_context=sparse_ctx_step)
 
@@ -788,6 +924,9 @@ while True:
                 train_loss_sum = train_loss_sum + loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
+            if diag_step and args.sparse_sync_profile and device_type == "cuda":
+                torch.cuda.synchronize()
+            t_phase_fwd_bwd += (time.time() - t_fwdbwd0)
 
             # On the last micro-batch, fetch the first batch for the *next* step
             # while the final backward kernels are still executing on GPU.
@@ -845,11 +984,25 @@ while True:
         if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    t_dense_step0 = time.time()
+    if diag_step and args.sparse_sync_profile and device_type == "cuda":
+        torch.cuda.synchronize()
     optimizer.step()
+    if diag_step and args.sparse_sync_profile and device_type == "cuda":
+        torch.cuda.synchronize()
+    if args.sparse_mode:
+        t_phase_dense_step += (time.time() - t_dense_step0)
     vocab_grad_max_t = None  # GPU scalar tensor; materialised below in sparse mode for wandb logging
     vocab_update_max_t = None  # GPU/CPU scalar tensor; max row-update norm across sparse vocab tables
     sparse_grad_norms: dict[str, float] = {}
     sparse_update_norms: dict[str, float] = {}
+    sparse_clip_fracs: dict[str, float] = {}
+    sparse_preclip_means: dict[str, float] = {}
+    sparse_preclip_maxes: dict[str, float] = {}
+    sparse_update_to_weight: dict[str, float] = {}
+    sparse_overlap_stats: dict[str, float] = {}
+    sparse_tables_with_grad = 0
+    sparse_tables_total = len(vocab_tables) if (args.sparse_mode and vocab_tables is not None) else 0
     sparse_matrix_grad_probe: dict[str, float] = {}
     if args.sparse_mode:
         probe_cproj = orig_model.blocks()[0].attn.c_proj.weight.grad
@@ -857,10 +1010,21 @@ while True:
         sparse_matrix_grad_probe["attn_c_proj"] = 0.0 if probe_cproj is None else float(probe_cproj.norm().item())
         sparse_matrix_grad_probe["attn_c_q"] = 0.0 if probe_cq is None else float(probe_cq.norm().item())
     if args.sparse_mode and vocab_optimizer is not None:
+        last_prefetch_stats = getattr(vocab_optimizer, "_last_prefetch_stats", None)
+        if isinstance(last_prefetch_stats, dict):
+            sparse_overlap_stats = {
+                "enabled": float(1.0 if last_prefetch_stats.get("overlap_enabled", False) else 0.0),
+                "rows_total": float(last_prefetch_stats.get("rows_total", 0)),
+                "rows_hit": float(last_prefetch_stats.get("rows_hit", 0)),
+                "rows_miss": float(last_prefetch_stats.get("rows_miss", 0)),
+                "rows_evict": float(last_prefetch_stats.get("rows_evict", 0)),
+                "hit_rate": float(last_prefetch_stats.get("hit_rate", 0.0)),
+            }
         # Collect W_U_* gradients (GPU bf16).
         # No explicit synchronize() needed: the GPU path runs all Adam arithmetic
         # in the same CUDA stream as backward, so ordering is guaranteed; the
         # D2H writeback inside step() will synchronize when it copies results to CPU.
+        t_grad_pack0 = time.time()
         vocab_grads = {}
         if W_U_wte.grad is not None:
             grad_wte = W_U_wte.grad
@@ -878,6 +1042,8 @@ while True:
                 if ddp and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
                     dist.all_reduce(grad_ve, op=dist.ReduceOp.AVG)
                 vocab_grads[f"ve_{i_str}"] = grad_ve
+        sparse_tables_with_grad = len(vocab_grads)
+        t_phase_grad_pack += (time.time() - t_grad_pack0)
            
         # Per-ROW gradient norm clipping (not per-table Frobenius norm).
         # Per-table Frobenius norm scales as sqrt(|U_step| * dim) ≈ sqrt(7.7M) ≈ 2775,
@@ -886,33 +1052,74 @@ while True:
         # Per-row clip limits each token row independently, preserving relative magnitudes.
         # In-place on GPU; clamp_(max=1.0) avoids a CPU-GPU sync on every row.
         if args.vocab_max_grad_norm > 0 and vocab_grads:
-            for g in vocab_grads.values():
+            t_clip0 = time.time()
+            for key, g in vocab_grads.items():
                 # g shape: (|U_step|, dim) — clip each row independently.
                 row_norms = g.norm(dim=-1, keepdim=True)  # (|U_step|, 1)
-                g.mul_((args.vocab_max_grad_norm / (row_norms + 1e-6)).clamp_(max=1.0))
+                sparse_preclip_means[key] = float(row_norms.mean().item())
+                sparse_preclip_maxes[key] = float(row_norms.amax().item())
+                clip_scales = (args.vocab_max_grad_norm / (row_norms + 1e-6)).clamp_(max=1.0)
+                g.mul_(clip_scales)
+                sparse_clip_fracs[key] = float((clip_scales < 1.0).float().mean().item())
+            t_phase_clip += (time.time() - t_clip0)
         
         # Record the max per-row grad norm across all vocab tables (post-clip).
         # Materialised via .item() in the logging block below alongside train_loss.item().
         if vocab_grads:
+            t_grad_stats0 = time.time()
             vocab_grad_max_t = torch.stack([g.norm(dim=-1).amax() for g in vocab_grads.values()]).amax()
             sparse_grad_norms = {k: float(g.norm(dim=-1).amax().item()) for k, g in vocab_grads.items()}
+            t_phase_grad_stats += (time.time() - t_grad_stats0)
+        t_vocab_step0 = time.time()
+        if diag_step and args.sparse_sync_profile and device_type == "cuda":
+            torch.cuda.synchronize()
         vocab_update_norms = vocab_optimizer.step(
             U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
             prefetched_v=prefetched_v_gpu,
             prefetched_w=prefetched_w_gpu,
         )
+        if diag_step and args.sparse_sync_profile and device_type == "cuda":
+            torch.cuda.synchronize()
+        t_phase_vocab_step += (time.time() - t_vocab_step0)
         if vocab_update_norms:
             vocab_update_max_t = torch.stack(list(vocab_update_norms.values())).amax()
             sparse_update_norms = {k: float(v.item()) for k, v in vocab_update_norms.items()}
+            for key in sparse_update_norms:
+                w_rows = prefetched_w_gpu.get(key) if prefetched_w_gpu is not None else None
+                if w_rows is not None:
+                    denom = float(w_rows.norm().item()) + 1e-12
+                    sparse_update_to_weight[key] = float(sparse_update_norms[key] / denom)
         # Free GPU row tensors — they'll be re-created next step from updated master weights.
         del W_U_wte, W_U_lm_head, W_U_ve
+    t_zero0 = time.time()
     model.zero_grad(set_to_none=True)
+    if args.sparse_mode:
+        t_phase_zero_grad += (time.time() - t_zero0)
     train_loss = train_loss_sum / grad_accum_steps  # average over all micro-batches
+    t_item0 = time.time()
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if args.sparse_mode:
+        t_phase_loss_item += (time.time() - t_item0)
+    if diag_step and args.sparse_sync_profile and device_type == "cuda":
+        t_sync_tail0 = time.time()
+        torch.cuda.synchronize()
+        t_phase_sync_tail += (time.time() - t_sync_tail0)
     t1 = time.time()
     dt = t1 - t0
+    t_mem0 = time.time()
     update_peak_device_memory_used()
+    if args.sparse_mode:
+        t_phase_mem_probe += (time.time() - t_mem0)
+
+    if args.sparse_mode:
+        t_phase_known = (
+            t_phase_union + t_phase_flush + t_phase_row_fetch + t_phase_optim_prefetch +
+            t_phase_local_remap + t_phase_fwd_bwd + t_phase_dense_step + t_phase_grad_pack +
+            t_phase_clip + t_phase_grad_stats + t_phase_vocab_step + t_phase_zero_grad +
+            t_phase_loss_item + t_phase_mem_probe
+        )
+        t_phase_other_gap = max(dt - t_phase_known, 0.0)
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -937,7 +1144,46 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     sparse_info = f" | U_step: {U_size_log:,}" if args.sparse_mode else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{sparse_info} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    sparse_diag_info = ""
+    if diag_step:
+        curr_alloc_mb = curr_reserved_mb = curr_peak_alloc_mb = 0.0
+        curr_active_mb = curr_inactive_split_mb = curr_device_used_mb = 0.0
+        flush_norm_mb_per_s = 0.0
+        if device_type == "cuda":
+            curr_alloc_mb = torch.cuda.memory_allocated()/1024/1024
+            curr_reserved_mb = torch.cuda.memory_reserved()/1024/1024
+            curr_peak_alloc_mb = torch.cuda.max_memory_allocated()/1024/1024
+            free_b, total_b = torch.cuda.mem_get_info()
+            curr_device_used_mb = (total_b - free_b) / (1024 * 1024)
+            try:
+                mem_stats = torch.cuda.memory_stats()
+                curr_active_mb = mem_stats.get("active_bytes.all.current", 0) / (1024 * 1024)
+                curr_inactive_split_mb = mem_stats.get("inactive_split_bytes.all.current", 0) / (1024 * 1024)
+            except Exception:
+                pass
+        if flush_update_norms_prev and t_phase_flush > 0:
+            flush_norm_mb_per_s = (max(flush_update_norms_prev.values()) * 4 / (1024*1024)) / t_phase_flush
+        sparse_diag_info = (
+            f" | sparse_t(ms): union={t_phase_union*1000:.2f} flush={t_phase_flush*1000:.2f}"
+            f" rows={t_phase_row_fetch*1000:.2f} prefetch={t_phase_optim_prefetch*1000:.2f}"
+            f" remap={t_phase_local_remap*1000:.2f} fwdbwd={t_phase_fwd_bwd*1000:.2f}"
+            f" dense_step={t_phase_dense_step*1000:.2f} grad_pack={t_phase_grad_pack*1000:.2f}"
+            f" clip={t_phase_clip*1000:.2f} grad_stats={t_phase_grad_stats*1000:.2f}"
+            f" vocab_step={t_phase_vocab_step*1000:.2f} zero={t_phase_zero_grad*1000:.2f}"
+            f" item_sync={t_phase_loss_item*1000:.2f} mem_probe={t_phase_mem_probe*1000:.2f}"
+            f" sync_tail={t_phase_sync_tail*1000:.2f} gap={t_phase_other_gap*1000:.2f}"
+            f" flush_norm_MiBps={flush_norm_mb_per_s:.2f}"
+        )
+        if device_type == "cuda":
+            reserved_delta_mb = 0.0 if prev_reserved_mb is None else (curr_reserved_mb - prev_reserved_mb)
+            prev_reserved_mb = curr_reserved_mb
+            sparse_diag_info += (
+                f" | cuda_mem(MiB): alloc={curr_alloc_mb:.1f} reserved={curr_reserved_mb:.1f}"
+                f" peak_alloc={curr_peak_alloc_mb:.1f} active={curr_active_mb:.1f}"
+                f" inactive_split={curr_inactive_split_mb:.1f} device_used={curr_device_used_mb:.1f}"
+                f" reserved_delta={reserved_delta_mb:.1f}"
+            )
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{sparse_info}{sparse_diag_info} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -955,6 +1201,52 @@ while True:
             log_data["sparse/U_step_size"] = U_size_log
             log_data["sparse/log_correction"] = log_correction_f
             log_data["sparse/local_ce_avg_mb"] = local_train_loss_f  # avg across all micro-batches
+            log_data["sparse/vocab_tables_with_grad"] = sparse_tables_with_grad
+            log_data["sparse/vocab_tables_total"] = sparse_tables_total
+            log_data["sparse/vocab_tables_missing_grad"] = max(sparse_tables_total - sparse_tables_with_grad, 0)
+            if sparse_clip_fracs:
+                log_data["sparse/vocab_clip_frac_max"] = max(sparse_clip_fracs.values())
+                log_data["sparse/vocab_clip_frac_mean"] = sum(sparse_clip_fracs.values()) / len(sparse_clip_fracs)
+            if sparse_preclip_means:
+                log_data["sparse/vocab_preclip_rownorm_mean_max"] = max(sparse_preclip_means.values())
+            if sparse_preclip_maxes:
+                log_data["sparse/vocab_preclip_rownorm_max"] = max(sparse_preclip_maxes.values())
+            if sparse_update_to_weight:
+                log_data["sparse/vocab_update_weight_ratio_max"] = max(sparse_update_to_weight.values())
+                log_data["sparse/vocab_update_weight_ratio_mean"] = sum(sparse_update_to_weight.values()) / len(sparse_update_to_weight)
+            if sparse_overlap_stats:
+                log_data["sparse/overlap_enabled"] = sparse_overlap_stats["enabled"]
+                log_data["sparse/overlap_rows_total"] = sparse_overlap_stats["rows_total"]
+                log_data["sparse/overlap_rows_hit"] = sparse_overlap_stats["rows_hit"]
+                log_data["sparse/overlap_rows_miss"] = sparse_overlap_stats["rows_miss"]
+                log_data["sparse/overlap_rows_evict"] = sparse_overlap_stats["rows_evict"]
+                log_data["sparse/overlap_hit_rate"] = sparse_overlap_stats["hit_rate"]
+            if args.sparse_diagnostics:
+                log_data["sparse/t_union_ms"] = t_phase_union * 1000
+                log_data["sparse/t_flush_ms"] = t_phase_flush * 1000
+                log_data["sparse/t_rows_ms"] = t_phase_row_fetch * 1000
+                log_data["sparse/t_prefetch_ms"] = t_phase_optim_prefetch * 1000
+                log_data["sparse/t_remap_ms"] = t_phase_local_remap * 1000
+                log_data["sparse/t_fwdbwd_ms"] = t_phase_fwd_bwd * 1000
+                log_data["sparse/t_dense_step_ms"] = t_phase_dense_step * 1000
+                log_data["sparse/t_grad_pack_ms"] = t_phase_grad_pack * 1000
+                log_data["sparse/t_clip_ms"] = t_phase_clip * 1000
+                log_data["sparse/t_grad_stats_ms"] = t_phase_grad_stats * 1000
+                log_data["sparse/t_vocab_step_ms"] = t_phase_vocab_step * 1000
+                log_data["sparse/t_zero_ms"] = t_phase_zero_grad * 1000
+                log_data["sparse/t_item_sync_ms"] = t_phase_loss_item * 1000
+                log_data["sparse/t_mem_probe_ms"] = t_phase_mem_probe * 1000
+                log_data["sparse/t_sync_tail_ms"] = t_phase_sync_tail * 1000
+                log_data["sparse/t_other_gap_ms"] = t_phase_other_gap * 1000
+                if device_type == "cuda":
+                    log_data["mem/alloc_mb"] = torch.cuda.memory_allocated() / (1024 * 1024)
+                    log_data["mem/reserved_mb"] = torch.cuda.memory_reserved() / (1024 * 1024)
+                    try:
+                        mem_stats = torch.cuda.memory_stats()
+                        log_data["mem/active_mb"] = mem_stats.get("active_bytes.all.current", 0) / (1024 * 1024)
+                        log_data["mem/inactive_split_mb"] = mem_stats.get("inactive_split_bytes.all.current", 0) / (1024 * 1024)
+                    except Exception:
+                        pass
             # Scalar monitors: detect x0_lambda runaway and matrix weight decay collapse
             log_data["sparse/x0_lambdas_max"] = float(orig_model.x0_lambdas.max().item())
             log_data["sparse/x0_lambdas_min"] = float(orig_model.x0_lambdas.min().item())
@@ -993,6 +1285,13 @@ while True:
         gc.collect() # manually collect a lot of garbage from setup
         gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
         gc.disable() # nuclear intervention here: disable GC entirely except:
+        if device_type == "cuda":
+            # torch.compile(dynamic=True) keeps a large working-memory cache after
+            # the first fwd+bwd trace (~19 GB spike).  Release it immediately so
+            # VRAM settles back to baseline before the next eval checkpoint.
+            torch.cuda.empty_cache()
+    elif args.sparse_mode and device_type == "cuda" and args.sparse_empty_cache_every > 0 and step % args.sparse_empty_cache_every == 0:
+        torch.cuda.empty_cache()
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
 

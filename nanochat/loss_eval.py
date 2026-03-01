@@ -66,7 +66,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 
 
 @torch.no_grad()
-def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device, sparse_row_dtype=torch.float32):
+def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device, sparse_row_dtype=torch.float32, debug_memory=False):
     """
     BPB evaluation using the sparse forward path.
 
@@ -81,24 +81,36 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
     tokens outside the local vocab — identical to the training loss
     definition and consistent across steps.
     """
-    from nanochat.sparse_vocab import compute_batch_token_set
-
     vocab_size = model.config.vocab_size
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
-    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+    total_bytes = 0
 
     # vocab_tables keys: "wte", "lm_head" (optional), "ve_0", "ve_2", ...
     # The sparse forward expects W_U_ve keyed by plain layer index ("0", "2", ...).
     ve_tables = {k[3:]: v for k, v in vocab_tables.items() if k.startswith("ve_")}
 
     batch_iter = iter(batches)
-    for _ in range(steps):
+    for i_eval in range(steps):
         x, y = next(batch_iter)
 
-        # compute_batch_token_set returns tensors on the same device as x (GPU).
-        # index_select on CPU master weights requires a CPU index — move U to CPU first.
-        U, _g2l, local_idx, local_targets = compute_batch_token_set(x, y, vocab_size)
-        U_cpu = U.cpu()
+        # Build local vocab maps on CPU using torch.unique(..., return_inverse=True)
+        # so we NEVER materialize a vocab-sized global_to_local tensor on GPU.
+        x_cpu = x.view(-1).to("cpu")
+        y_cpu = y.view(-1).to("cpu")
+        valid_t = y_cpu >= 0
+        y_valid = y_cpu[valid_t]
+        if y_valid.numel() > 0:
+            tokens = torch.cat([x_cpu, y_valid], dim=0)
+            U_cpu, inverse = torch.unique(tokens, sorted=True, return_inverse=True)
+            local_idx_cpu = inverse[:x_cpu.numel()].view_as(x)
+            local_targets_cpu = torch.full_like(y, -1, device="cpu")
+            local_targets_flat = local_targets_cpu.view(-1)
+            local_targets_flat[valid_t] = inverse[x_cpu.numel():]
+        else:
+            U_cpu, inverse = torch.unique(x_cpu, sorted=True, return_inverse=True)
+            local_idx_cpu = inverse.view_as(x)
+            local_targets_cpu = torch.full_like(y, -1, device="cpu")
+
         U_size = U_cpu.numel()
         log_correction_t = torch.tensor(
             math.log(vocab_size / max(U_size, 1)),
@@ -116,34 +128,38 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
             "W_U_wte":      W_U_wte,
             "W_U_ve":       W_U_ve,
             "W_U_lm_head":  W_U_lm_head,
-            "local_idx":    local_idx.to(device),
-            "local_targets": local_targets.to(device),
+            "local_idx":    local_idx_cpu.to(device),
+            "local_targets": local_targets_cpu.to(device),
             "log_correction": log_correction_t,
         }
 
         # (B, T) per-token loss; log_correction already added to valid positions
         loss2d = model(x, y, loss_reduction='none', sparse_context=sparse_ctx).view(-1)
 
-        # Use original global y for byte-length lookup (not local_targets)
-        y_flat = y.to(device).view(-1)
-        valid = y_flat >= 0
-        y_safe = torch.where(valid, y_flat, torch.zeros_like(y_flat))
-        num_bytes2d = torch.where(
-            valid,
-            token_bytes[y_safe],
-            torch.zeros_like(y_flat, dtype=token_bytes.dtype),
-        )
-        total_nats += (loss2d * (num_bytes2d > 0)).sum()
-        total_bytes += num_bytes2d.sum()
+        # Use original global y for byte-length lookup (not local_targets).
+        # Keep token_bytes on CPU for sparse eval so no full-vocab tensor lives on GPU.
+        valid = y_cpu >= 0
+        y_safe = torch.where(valid, y_cpu, torch.zeros_like(y_cpu))
+        num_bytes2d = torch.where(valid, token_bytes[y_safe], torch.zeros_like(y_cpu, dtype=token_bytes.dtype))
+        byte_mask = (num_bytes2d > 0).to(device)
+        total_nats += (loss2d * byte_mask).sum()
+        total_bytes += int(num_bytes2d.sum().item())
+
+        if debug_memory and device.type == "cuda" and i_eval == 0:
+            alloc_mb = torch.cuda.memory_allocated(device) / (1024 * 1024)
+            reserved_mb = torch.cuda.memory_reserved(device) / (1024 * 1024)
+            peak_alloc_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            print(f"[sparse_eval_mem] U_batch={U_size:,} alloc={alloc_mb:.1f}MiB reserved={reserved_mb:.1f}MiB peak_alloc={peak_alloc_mb:.1f}MiB")
 
         del W_U_wte, W_U_lm_head, W_U_ve, sparse_ctx
 
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        total_bytes_t = torch.tensor(total_bytes, dtype=torch.int64, device=device)
+        dist.all_reduce(total_bytes_t, op=dist.ReduceOp.SUM)
+        total_bytes = int(total_bytes_t.item())
 
     total_nats = total_nats.item()
-    total_bytes = total_bytes.item()
     if total_bytes == 0:
         return float('inf')
     return total_nats / (math.log(2) * total_bytes)
