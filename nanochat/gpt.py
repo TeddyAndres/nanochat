@@ -472,9 +472,12 @@ class GPT(nn.Module):
         param_groups.extend([
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # x0_lambdas gate how much of the raw initial embedding bypasses all transformer layers at every block.
-            # 0.1× scalar_lr (10× resid_lambdas) keeps them faster than resid_lambdas (they start at 0.1 vs 1.0)
-            # but prevents runaway growth that collapses every hidden state toward the constant initial embedding.
-            dict(kind='adamw', params=x0_params, lr=scalar_lr * 0.1, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            # Use 0.001× scalar_lr to match the fractional update rate of resid_lambdas:
+            #   resid_lambdas: init=1.0, lr rate=0.01   => relative rate = 0.01/1.0 = 0.01
+            #   x0_lambdas:    init=0.1, lr rate=0.001  => relative rate = 0.001/0.1 = 0.01  (equal)
+            # Using 0.1× (10× resid_lambdas) was wrong: it made x0_lambdas 100× faster fractionally,
+            # causing them to shift by ~68% of their init value in 48 steps and collapsing residual streams.
+            dict(kind='adamw', params=x0_params, lr=scalar_lr * 0.001, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ])
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
