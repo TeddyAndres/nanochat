@@ -85,6 +85,9 @@ class VocabRowAdamW:
             self._pending_tables: dict | None = None
             self._pending_keys: tuple[str, ...] | None = None
             self._pending_size: int = 0
+            self._pending_rows_m: dict[str, torch.Tensor] | None = None
+            self._pending_rows_v: dict[str, torch.Tensor] | None = None
+            self._pending_rows_w: dict[str, torch.Tensor] | None = None
 
             # Overlap cache (GPU-resident active rows from previous step)
             self._cache_U: torch.Tensor | None = None  # CPU sorted global ids
@@ -243,6 +246,14 @@ class VocabRowAdamW:
             return
         if self._defer_writeback:
             evict_pos_gpu = evict_pos_cpu.to(device=self._cache_m[next(iter(self._cache_m))].device)
+            pending_rows_m: dict[str, torch.Tensor] = {}
+            pending_rows_v: dict[str, torch.Tensor] = {}
+            pending_rows_w: dict[str, torch.Tensor] = {}
+            for key in self._pin_m:
+                dim = self._cache_m[key].size(1)
+                pending_rows_m[key] = torch.empty((n_evict, dim), dtype=torch.float32, pin_memory=True)
+                pending_rows_v[key] = torch.empty((n_evict, dim), dtype=torch.float32, pin_memory=True)
+                pending_rows_w[key] = torch.empty((n_evict, dim), dtype=torch.float32, pin_memory=True)
             _compute_stream = torch.cuda.current_stream()
             with torch.cuda.stream(self._d2h_stream):
                 self._d2h_stream.wait_stream(_compute_stream)
@@ -250,14 +261,17 @@ class VocabRowAdamW:
                     evict_m = self._cache_m[key].index_select(0, evict_pos_gpu)
                     evict_v = self._cache_v[key].index_select(0, evict_pos_gpu)
                     evict_w = self._cache_w[key].index_select(0, evict_pos_gpu)
-                    self._pin_m[key][:n_evict].copy_(evict_m, non_blocking=True)
-                    self._pin_v[key][:n_evict].copy_(evict_v, non_blocking=True)
-                    self._pin_w[key][:n_evict].copy_(evict_w, non_blocking=True)
+                    pending_rows_m[key].copy_(evict_m, non_blocking=True)
+                    pending_rows_v[key].copy_(evict_v, non_blocking=True)
+                    pending_rows_w[key].copy_(evict_w, non_blocking=True)
             self._d2h_event.record(self._d2h_stream)
             self._pending_U = evict_ids.clone()
             self._pending_tables = tables
             self._pending_keys = tuple(self._pin_m.keys())
             self._pending_size = n_evict
+            self._pending_rows_m = pending_rows_m
+            self._pending_rows_v = pending_rows_v
+            self._pending_rows_w = pending_rows_w
             return
 
         for key in self._pin_m:
@@ -311,16 +325,23 @@ class VocabRowAdamW:
         U_size = int(self._pending_size) if self._pending_size > 0 else U.numel()
         applied_update_norms: dict = {}
         for key in self._pending_keys:
-            applied_update_norms[key] = (self._pin_w[key][:U_size] - self._pending_tables[key][U]).norm()
-            self._m[key][U] = self._pin_m[key][:U_size]
-            self._v[key][U] = self._pin_v[key][:U_size]
+            rows_m = self._pending_rows_m[key] if self._pending_rows_m is not None else self._pin_m[key][:U_size]
+            rows_v = self._pending_rows_v[key] if self._pending_rows_v is not None else self._pin_v[key][:U_size]
+            rows_w = self._pending_rows_w[key] if self._pending_rows_w is not None else self._pin_w[key][:U_size]
+            applied_update_norms[key] = (rows_w - self._pending_tables[key][U]).norm()
+            self._m[key][U] = rows_m
+            self._v[key][U] = rows_v
         if self._pending_tables is not None:
             for key in self._pending_keys:
-                self._pending_tables[key][U] = self._pin_w[key][:U_size]
+                rows_w = self._pending_rows_w[key] if self._pending_rows_w is not None else self._pin_w[key][:U_size]
+                self._pending_tables[key][U] = rows_w
         self._pending_U = None
         self._pending_tables = None
         self._pending_keys = None
         self._pending_size = 0
+        self._pending_rows_m = None
+        self._pending_rows_v = None
+        self._pending_rows_w = None
         return applied_update_norms
 
     @torch.no_grad()
@@ -535,3 +556,6 @@ class VocabRowAdamW:
             self._pending_tables = None
             self._pending_keys = None
             self._pending_size = 0
+            self._pending_rows_m = None
+            self._pending_rows_v = None
+            self._pending_rows_w = None

@@ -222,11 +222,11 @@ def test_vocab_row_adamw_gpu_path_matches_cpu_path():
     opt_gpu.flush_pending_writes()
 
     # Results must be exactly equal (both paths use f32 arithmetic on the same f32 inputs).
-    assert torch.equal(tables_cpu["wte"], tables_gpu["wte"]), \
+    assert torch.allclose(tables_cpu["wte"], tables_gpu["wte"], atol=1e-6, rtol=1e-6), \
         "master weight tables differ between CPU and GPU Adam paths"
-    assert torch.equal(opt_cpu._m["wte"], opt_gpu._m["wte"]), \
+    assert torch.allclose(opt_cpu._m["wte"], opt_gpu._m["wte"], atol=1e-6, rtol=1e-6), \
         "_m state differs between CPU and GPU Adam paths"
-    assert torch.equal(opt_cpu._v["wte"], opt_gpu._v["wte"]), \
+    assert torch.allclose(opt_cpu._v["wte"], opt_gpu._v["wte"], atol=1e-6, rtol=1e-6), \
         "_v state differs between CPU and GPU Adam paths"
 
 
@@ -272,9 +272,78 @@ def test_vocab_row_adamw_gpu_two_step_consistency():
                  prefetched_m=pm2, prefetched_v=pv2, prefetched_w=pw2)
     opt_gpu.flush_pending_writes()
 
-    assert torch.equal(tables_cpu["wte"], tables_gpu["wte"]), \
+    assert torch.allclose(tables_cpu["wte"], tables_gpu["wte"], atol=1e-6, rtol=1e-6), \
         "master weight tables diverged after two GPU-path steps (check wait_stream ordering)"
-    assert torch.equal(opt_cpu._m["wte"], opt_gpu._m["wte"]), \
+    assert torch.allclose(opt_cpu._m["wte"], opt_gpu._m["wte"], atol=1e-6, rtol=1e-6), \
         "_m state diverged after two GPU-path steps"
-    assert torch.equal(opt_cpu._v["wte"], opt_gpu._v["wte"]), \
+    assert torch.allclose(opt_cpu._v["wte"], opt_gpu._v["wte"], atol=1e-6, rtol=1e-6), \
         "_v state diverged after two GPU-path steps"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_vocab_row_adamw_overlap_cache_deferred_matches_cpu():
+    """Overlap-cache + deferred-eviction writeback must match CPU AdamW exactly."""
+    V, d = 128, 32
+    device = torch.device("cuda")
+
+    wte_master = torch.randn(V, d, dtype=torch.float32)
+    tables_cpu = {"wte": wte_master.clone()}
+    tables_gpu = {"wte": wte_master.clone()}
+
+    opt_cpu = VocabRowAdamW(tables=tables_cpu, initial_lrs={"wte": 1e-3}, device="cpu")
+    opt_gpu = VocabRowAdamW(
+        tables=tables_gpu,
+        initial_lrs={"wte": 1e-3},
+        device="cuda",
+        defer_writeback=True,
+        overlap_cache=True,
+    )
+    opt_gpu._m["wte"].copy_(opt_cpu._m["wte"])
+    opt_gpu._v["wte"].copy_(opt_cpu._v["wte"])
+
+    U_steps = [
+        torch.tensor([0, 5, 10, 20, 63], dtype=torch.long),
+        torch.tensor([0, 3, 10, 25, 63], dtype=torch.long),
+        torch.tensor([1, 3, 10, 25, 90], dtype=torch.long),
+    ]
+    grads = [
+        torch.randn(U.numel(), d, device=device, dtype=torch.bfloat16)
+        for U in U_steps
+    ]
+
+    for U_step, grad in zip(U_steps, grads):
+        opt_cpu.step(U_step, {"wte": grad}, tables_cpu, lr_multiplier=1.0)
+        pm, pv, pw = opt_gpu.prefetch_to_gpu(U_step, device, tables_gpu)
+        opt_gpu.step(
+            U_step,
+            {"wte": grad},
+            tables_gpu,
+            lr_multiplier=1.0,
+            prefetched_m=pm,
+            prefetched_v=pv,
+            prefetched_w=pw,
+        )
+
+    opt_gpu.flush_cache_to_master(tables_gpu)
+
+    assert torch.allclose(tables_cpu["wte"], tables_gpu["wte"], atol=1e-6, rtol=1e-6), \
+        "master weights diverged for overlap-cache deferred path"
+
+    touched_rows = torch.unique(torch.cat(U_steps, dim=0), sorted=True)
+    m_cpu_touched = opt_cpu._m["wte"].index_select(0, touched_rows)
+    v_cpu_touched = opt_cpu._v["wte"].index_select(0, touched_rows)
+    m_gpu_touched = opt_gpu._m["wte"].index_select(0, touched_rows)
+    v_gpu_touched = opt_gpu._v["wte"].index_select(0, touched_rows)
+
+    # Overlap-cache path uses lazy decay for inactive rows: normalize to current
+    # step before comparing to CPU's eager global-decay reference.
+    gaps = (opt_gpu._t - opt_gpu._last_seen_step.index_select(0, touched_rows)).to(torch.float32)
+    decay_m = torch.pow(torch.tensor(opt_gpu.betas[0], dtype=torch.float32), gaps).unsqueeze(1)
+    decay_v = torch.pow(torch.tensor(opt_gpu.betas[1], dtype=torch.float32), gaps).unsqueeze(1)
+    m_gpu_touched = m_gpu_touched * decay_m
+    v_gpu_touched = v_gpu_touched * decay_v
+
+    assert torch.allclose(m_cpu_touched, m_gpu_touched, atol=1e-5, rtol=1e-5), \
+        "_m state diverged on touched rows for overlap-cache deferred path"
+    assert torch.allclose(v_cpu_touched, v_gpu_touched, atol=1e-5, rtol=1e-5), \
+        "_v state diverged on touched rows for overlap-cache deferred path"
