@@ -89,6 +89,15 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
     # The sparse forward expects W_U_ve keyed by plain layer index ("0", "2", ...).
     ve_tables = {k[3:]: v for k, v in vocab_tables.items() if k.startswith("ve_")}
 
+    cache_U_cpu = None
+    cache_rows: dict[str, torch.Tensor] = {}
+
+    table_map: dict[str, torch.Tensor] = {"wte": vocab_tables["wte"]}
+    if not model.config.tie_embeddings:
+        table_map["lm_head"] = vocab_tables["lm_head"]
+    for i_str, master_w in ve_tables.items():
+        table_map[f"ve_{i_str}"] = master_w
+
     batch_iter = iter(batches)
     for i_eval in range(steps):
         x, y = next(batch_iter)
@@ -117,12 +126,45 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
             dtype=torch.float32, device=device,
         )
 
-        def _fetch(master_w):
-            return master_w.index_select(0, U_cpu).to(device, dtype=sparse_row_dtype)
+        if cache_U_cpu is None:
+            cache_rows = {
+                key: master_w.index_select(0, U_cpu).to(device, dtype=sparse_row_dtype)
+                for key, master_w in table_map.items()
+            }
+            cache_U_cpu = U_cpu.clone()
+        else:
+            old_U = cache_U_cpu
+            old_size = old_U.numel()
+            U_size = U_cpu.numel()
 
-        W_U_wte = _fetch(vocab_tables["wte"])
-        W_U_lm_head = W_U_wte if model.config.tie_embeddings else _fetch(vocab_tables["lm_head"])
-        W_U_ve = {i_str: _fetch(master_w) for i_str, master_w in ve_tables.items()}
+            new_pos_in_old = torch.searchsorted(old_U, U_cpu)
+            hit_mask = (new_pos_in_old < old_size)
+            if hit_mask.any():
+                hit_mask = hit_mask & (old_U[new_pos_in_old.clamp(max=max(old_size - 1, 0))] == U_cpu)
+
+            miss_mask = ~hit_mask
+            miss_ids = U_cpu[miss_mask]
+
+            hit_pos_new = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
+            miss_pos_new = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)
+            hit_pos_old = new_pos_in_old[hit_mask] if hit_pos_new.numel() > 0 else None
+
+            new_cache_rows: dict[str, torch.Tensor] = {}
+            for key, master_w in table_map.items():
+                old_rows = cache_rows[key]
+                rows = torch.empty((U_size, old_rows.size(1)), device=device, dtype=sparse_row_dtype)
+                if hit_pos_new.numel() > 0 and hit_pos_old is not None:
+                    rows[hit_pos_new] = old_rows[hit_pos_old]
+                if miss_pos_new.numel() > 0:
+                    rows[miss_pos_new] = master_w.index_select(0, miss_ids).to(device, dtype=sparse_row_dtype)
+                new_cache_rows[key] = rows
+
+            cache_rows = new_cache_rows
+            cache_U_cpu = U_cpu.clone()
+
+        W_U_wte = cache_rows["wte"]
+        W_U_lm_head = W_U_wte if model.config.tie_embeddings else cache_rows["lm_head"]
+        W_U_ve = {i_str: cache_rows[f"ve_{i_str}"] for i_str in ve_tables}
 
         sparse_ctx = {
             "W_U_wte":      W_U_wte,

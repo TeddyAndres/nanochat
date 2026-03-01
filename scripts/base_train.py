@@ -109,6 +109,11 @@ parser.add_argument("--no-sparse-compile", action="store_true", help="disable to
 parser.add_argument("--sparse-optimizer-device", type=str, choices=["auto", "cpu", "cuda"], default="auto", help="device for sparse vocab optimizer arithmetic: auto uses current training device, cpu/cuda force a specific backend")
 parser.add_argument("--sparse-cuda-deferred-writeback", action="store_true", help="enable deferred CUDA D2H writeback in sparse vocab optimizer")
 parser.add_argument("--no-sparse-overlap-cache", action="store_true", help="disable overlap cache that keeps intersecting U_step rows resident on GPU between sparse steps")
+parser.add_argument("--sparse-untied-lm-head", action="store_true", help="keep lm_head untied in sparse mode (default is tied)")
+parser.add_argument("--sparse-profile", action="store_true", help="print sparse phase timings every N steps")
+parser.add_argument("--sparse-profile-every", type=int, default=20, help="emit sparse phase timings every N steps when --sparse-profile is enabled")
+parser.add_argument("--sparse-profile-sync", action="store_true", help="synchronize CUDA around profiled sparse phases for attribution accuracy")
+parser.add_argument("--sparse-logit-chunk-size", type=int, default=4096, help="number of token positions processed per sparse logit chunk during training")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -142,6 +147,10 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+if args.sparse_mode and (not args.tie_embeddings) and (not args.sparse_untied_lm_head):
+    args.tie_embeddings = True
+    print("Sparse mode: auto-enabling --tie-embeddings (use --sparse-untied-lm-head to opt out)")
 
 # SDPA fallback (no FA3) performs poorly with alternating sliding-window patterns.
 # Keep user CLI overrides intact, but choose a faster default on non-FA3 systems.
@@ -725,7 +734,19 @@ while True:
     U_size_log = 0  # number of unique tokens in this step (logged for sparsity visibility)
     log_correction_f = 0.0  # scalar correction added by sparse objective: log(V/|U_step|)
     train_loss_sum = None  # accumulated loss across micro-batches (reset each step)
+    profile_this_step = False
+    profile_sync = False
+    t_phase_dense_step = 0.0
     if args.sparse_mode:
+        profile_this_step = args.sparse_profile and (step % max(args.sparse_profile_every, 1) == 0)
+        profile_sync = profile_this_step and args.sparse_profile_sync and device_type == "cuda"
+        t_phase_union = 0.0
+        t_phase_prefetch = 0.0
+        t_phase_remap = 0.0
+        t_phase_fwdbwd = 0.0
+        t_phase_dense_step = 0.0
+        t_phase_vocab_step = 0.0
+
         # ---- 1. Collect ALL micro-batches for this optimizer step upfront. ----
         # We start from the current (x, y, sc) and fetch grad_accum_steps-1 more.
         # All data is on CPU at this point — no GPU work yet.
@@ -736,6 +757,7 @@ while True:
         data_wait_time += (time.time() - t_data0)
 
         # ---- 2. U_step = union of all per-micro-batch unique token sets (CPU). ----
+        t_union0 = time.time()
         all_U = torch.cat([mb[3]["U"] for mb in all_micro_batches])
         U_step = torch.unique(all_U, sorted=True)
         if model_config.sparse_ddp_union:
@@ -744,6 +766,8 @@ while True:
             need = min(args.sparse_extra_negatives, model_config.vocab_size - U_step.numel())
             extra = torch.randperm(model_config.vocab_size, device=U_step.device, dtype=torch.long)[:need]
             U_step = torch.unique(torch.cat([U_step, extra]), sorted=True)
+        if profile_this_step:
+            t_phase_union += (time.time() - t_union0)
         U_size_log = U_step.numel()   # Python int — used for logging only, never passed into compiled graph
         # Pre-compute as a GPU scalar tensor so Dynamo guards on its *shape* (always ())
         # rather than its *value*, preventing a guard miss — and therefore a recompile — every step.
@@ -794,11 +818,18 @@ while True:
         # ---- 3b. H2D: prefetch active _m/_v/weight rows for GPU-side Adam. ----
         # Uses pre-allocated pinned buffers inside VocabRowAdamW; fires all H2D
         # transfers non-blocking so they arrive during the forward + backward pass.
+        if profile_sync:
+            torch.cuda.synchronize()
+        t_prefetch0 = time.time()
         if optimizer_uses_cuda:
             prefetched_m_gpu, prefetched_v_gpu, prefetched_w_gpu = \
                 vocab_optimizer.prefetch_to_gpu(U_step, device, vocab_tables)
         else:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
+        if profile_sync:
+            torch.cuda.synchronize()
+        if profile_this_step:
+            t_phase_prefetch += (time.time() - t_prefetch0)
 
         if optimizer_overlap_cache and prefetched_w_gpu is not None:
             W_U_wte = _rows_from_prefetched(prefetched_w_gpu["wte"])
@@ -818,6 +849,7 @@ while True:
         # accumulation loop, while the W_U H2D transfers from step 3 are still in
         # flight.  By the time model() executes there are no CPU stalls between
         # micro-batch forward/backward calls → GPU runs continuously at 100%.
+        t_remap0 = time.time()
         mb_local_idx_gpu  = []
         mb_local_tgt_gpu  = []
         for _x_pre, _y_pre, _st_pre, sc_micro in all_micro_batches:
@@ -829,6 +861,8 @@ while True:
             l_tgt[valid_t] = remap[l_tgt[valid_t]]
             mb_local_idx_gpu.append(remap[l_idx].to(device, non_blocking=True))
             mb_local_tgt_gpu.append(l_tgt.to(device, non_blocking=True))
+        if profile_this_step:
+            t_phase_remap += (time.time() - t_remap0)
 
         # ---- 4b. Gradient-accumulation loop — purely GPU, zero CPU stalls. -----
         skip_sparse_step = False
@@ -840,8 +874,12 @@ while True:
                 "local_idx":      mb_local_idx_gpu[i_mb],
                 "local_targets":  mb_local_tgt_gpu[i_mb],
                 "log_correction": log_correction_t,
+                "logit_chunk_size": args.sparse_logit_chunk_size,
             }
 
+            if profile_sync:
+                torch.cuda.synchronize()
+            t_fwdbwd0 = time.time()
             with sparse_autocast_ctx:
                 loss = model(x_mb, y_mb, sparse_context=sparse_ctx_step)
 
@@ -856,6 +894,10 @@ while True:
                 train_loss_sum = train_loss_sum + loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
+            if profile_sync:
+                torch.cuda.synchronize()
+            if profile_this_step:
+                t_phase_fwdbwd += (time.time() - t_fwdbwd0)
 
             # On the last micro-batch, fetch the first batch for the *next* step
             # while the final backward kernels are still executing on GPU.
@@ -913,7 +955,14 @@ while True:
         if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    if args.sparse_mode and profile_sync:
+        torch.cuda.synchronize()
+    t_dense_step0 = time.time()
     optimizer.step()
+    if args.sparse_mode and profile_sync:
+        torch.cuda.synchronize()
+    if args.sparse_mode and profile_this_step:
+        t_phase_dense_step += (time.time() - t_dense_step0)
 
     vocab_grad_max_t = None  # GPU scalar tensor; materialised below in sparse mode for wandb logging
     vocab_update_max_t = None  # GPU/CPU scalar tensor; max row-update norm across sparse vocab tables
@@ -961,12 +1010,19 @@ while True:
             vocab_grad_max_t = torch.stack([g.norm(dim=-1).amax() for g in vocab_grads.values()]).amax()
             sparse_grad_norms = {k: float(g.norm(dim=-1).amax().item()) for k, g in vocab_grads.items()}
 
+        t_vocab_step0 = time.time()
+        if profile_sync:
+            torch.cuda.synchronize()
         vocab_update_norms = vocab_optimizer.step(
             U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
             prefetched_v=prefetched_v_gpu,
             prefetched_w=prefetched_w_gpu,
         )
+        if profile_sync:
+            torch.cuda.synchronize()
+        if profile_this_step:
+            t_phase_vocab_step += (time.time() - t_vocab_step0)
         if vocab_update_norms:
             vocab_update_max_t = torch.stack(list(vocab_update_norms.values())).amax()
             sparse_update_norms = {k: float(v.item()) for k, v in vocab_update_norms.items()}
@@ -1005,7 +1061,16 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     sparse_info = f" | U_step: {U_size_log:,}" if args.sparse_mode else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{sparse_info} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    sparse_profile_info = ""
+    if args.sparse_mode and profile_this_step:
+        t_known = t_phase_union + t_phase_prefetch + t_phase_remap + t_phase_fwdbwd + t_phase_dense_step + t_phase_vocab_step
+        sparse_profile_info = (
+            f" | sparse(ms): union={t_phase_union*1000:.1f} prefetch={t_phase_prefetch*1000:.1f}"
+            f" remap={t_phase_remap*1000:.1f} fwdbwd={t_phase_fwdbwd*1000:.1f}"
+            f" dense_step={t_phase_dense_step*1000:.1f} vocab_step={t_phase_vocab_step*1000:.1f}"
+            f" gap={max(dt - t_known, 0.0)*1000:.1f}"
+        )
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{sparse_info}{sparse_profile_info} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,

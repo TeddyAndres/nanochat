@@ -548,6 +548,7 @@ class GPT(nn.Module):
             local_idx      = sparse_context["local_idx"]
             local_targets  = sparse_context["local_targets"]
             log_correction = sparse_context["log_correction"]  # () float32 GPU scalar
+            logit_chunk_size = int(sparse_context.get("logit_chunk_size", 4096))
 
             x = F.embedding(local_idx, W_U_wte)
         else:
@@ -578,7 +579,10 @@ class GPT(nn.Module):
             n_valid       = valid.float().sum()           # GPU scalar, no sync
             # During training (grad enabled) keep chunks small to bound activation memory.
             # During eval/inference (no_grad) no activations stored; larger chunks run faster.
-            chunk_size    = 2048 if torch.is_grad_enabled() else 16384
+            if torch.is_grad_enabled():
+                chunk_size = min(max(logit_chunk_size, 512), flat_x.size(0))
+            else:
+                chunk_size = 16384
 
             if loss_reduction == 'none':
                 loss_flat = torch.empty_like(flat_targets, dtype=torch.float32)
