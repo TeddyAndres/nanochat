@@ -471,7 +471,10 @@ class GPT(nn.Module):
 
         param_groups.extend([
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            # x0_lambdas gate how much of the raw initial embedding bypasses all transformer layers at every block.
+            # 0.1× scalar_lr (10× resid_lambdas) keeps them faster than resid_lambdas (they start at 0.1 vs 1.0)
+            # but prevents runaway growth that collapses every hidden state toward the constant initial embedding.
+            dict(kind='adamw', params=x0_params, lr=scalar_lr * 0.1, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ])
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -577,7 +580,7 @@ class GPT(nn.Module):
                     end = min(start + chunk_size, flat_x.size(0))
                     logits_chunk = (flat_x[start:end] @ W_U_lm_head.T).float()
                     logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
-                    logits_chunk = logits_chunk.clamp_(-25.0, 25.0)
+                    #logits_chunk = logits_chunk.clamp_(-25.0, 25.0)
                     loss_flat[start:end] = F.cross_entropy(
                         logits_chunk, flat_targets[start:end],
                         ignore_index=-1, reduction='none',

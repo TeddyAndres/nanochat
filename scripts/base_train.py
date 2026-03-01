@@ -384,7 +384,14 @@ if batch_ratio != 1.0:
 # λ = λ_ref · √(B/B_ref) · (D_ref/D)
 # Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
-if weight_decay_scaled != args.weight_decay:
+# Cap at the user-specified value: the formula outputs λ_ref × √(B/B_ref) × (D_ref/D), which is designed
+# for long compute-optimal runs where target_tokens >> D_ref (so the cap never triggers). For short sweep/debug
+# runs (target_tokens << D_ref), the formula overshoots dramatically, decaying transformer matrices to near-zero
+# before any useful gradient signal accumulates. Never silently exceed the user's stated intent.
+if weight_decay_scaled > args.weight_decay:
+    print0(f"Weight decay formula gave {weight_decay_scaled:.6f} (> user value {args.weight_decay:.6f}); capping at user value")
+    weight_decay_scaled = args.weight_decay
+elif weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
@@ -663,6 +670,7 @@ while True:
     U_size_log = 0  # number of unique tokens in this step (logged for sparsity visibility)
     log_correction_f = 0.0  # scalar correction added by sparse objective: log(V/|U_step|)
     flush_update_norms_prev: dict[str, float] = {}
+    train_loss_sum = None  # accumulated loss across micro-batches (reset each step)
     if args.sparse_mode:
         # ---- 1. Collect ALL micro-batches for this optimizer step upfront. ----
         # We start from the current (x, y, sc) and fetch grad_accum_steps-1 more.
@@ -763,7 +771,10 @@ while True:
                 skip_sparse_step = True
                 break
 
-            train_loss = loss.detach()
+            if train_loss_sum is None:
+                train_loss_sum = loss.detach()
+            else:
+                train_loss_sum = train_loss_sum + loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
 
@@ -803,7 +814,10 @@ while True:
         for micro_step in range(grad_accum_steps):
             with sparse_autocast_ctx:
                 loss = model(x, y, sparse_context=sparse_context)
-            train_loss = loss.detach() # for logging
+            if train_loss_sum is None:
+                train_loss_sum = loss.detach()
+            else:
+                train_loss_sum = train_loss_sum + loss.detach()
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
             loss.backward()
             t_data0 = time.time()
@@ -880,6 +894,7 @@ while True:
         # Free GPU row tensors — they'll be re-created next step from updated master weights.
         del W_U_wte, W_U_lm_head, W_U_ve
     model.zero_grad(set_to_none=True)
+    train_loss = train_loss_sum / grad_accum_steps  # average over all micro-batches
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     t1 = time.time()
     dt = t1 - t0
@@ -925,7 +940,11 @@ while True:
         if args.sparse_mode:
             log_data["sparse/U_step_size"] = U_size_log
             log_data["sparse/log_correction"] = log_correction_f
-            log_data["sparse/local_ce_last_mb"] = local_train_loss_f
+            log_data["sparse/local_ce_avg_mb"] = local_train_loss_f  # avg across all micro-batches
+            # Scalar monitors: detect x0_lambda runaway and matrix weight decay collapse
+            log_data["sparse/x0_lambdas_max"] = float(orig_model.x0_lambdas.max().item())
+            log_data["sparse/x0_lambdas_min"] = float(orig_model.x0_lambdas.min().item())
+            log_data["sparse/c_q_weight_norm"] = float(orig_model.blocks()[0].attn.c_q.weight.norm().item())
             if sparse_matrix_grad_probe:
                 log_data["sparse/matrix_grad_attn_c_proj"] = sparse_matrix_grad_probe["attn_c_proj"]
                 log_data["sparse/matrix_grad_attn_c_q"] = sparse_matrix_grad_probe["attn_c_q"]

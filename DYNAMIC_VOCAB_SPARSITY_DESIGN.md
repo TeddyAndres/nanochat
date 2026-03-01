@@ -537,3 +537,86 @@ Run paired experiments from identical seeds comparing sparse vs dense training l
 | Correction added to loss scalar, not logits | Adding to logits cancels in cross-entropy; correct placement is after `F.cross_entropy` |
 | `SparseAdam` for vocab-sized parameters | Dense AdamW moment tensors at full V are the dominant memory cost at large vocab |
 | DDP via `U_union` dense reduce | Correct and simple; sparse reduce only needed at very large V |
+
+
+## 20260301 Model review
+
+Plan: Architectural Review Report — Sparse Mode Training
+TL;DR
+A thorough review of every layer of the sparse-vocab pipeline — dataloader, CPU remapping, H2D prefetch, GPU forward/backward, log-correction math, VocabRowAdamW optimizer, and async D2H writeback — confirms the remapping algebra and async memory pipeline are arithmetically correct. No data-corruption or indexing bugs were found. However, six distinct issues were identified, of which three are critical and at least one is almost certainly responsible for the loss diverging from ~9.79 back toward ~10.39 (random-guess territory) after step 47.
+
+The Run Log: What the Numbers Say
+Observation	Value	Implication
+log(V=32768)	10.397 nats	Exact full-vocab random-guess loss
+Step-0 raw loss	10.397	Model is at exact random-guess before any update ✓
+log_correction	log(32768/20200) ≈ 0.49 nats	Correction applied per step
+Step-47 lose	9.79 nats	Real learning — 0.61 nats below random ✓
+Step-196 loss	10.39 nats	Near-identical to random-guess again ✗
+Final status	Interrupted via KeyboardInterrupt	No convergence
+The loss trajectory shows genuine improvement followed by systematic divergence — a classic optimizer-/weight-decay-instability signature, not a random-guessing failure of the correction formula.
+
+Critical Issues (likely root-causes)
+Issue 1 — CRITICAL: Weight decay is catastrophically aggressive for this run length
+The formula weight_decay_scaled = 0.2 * sqrt(B/B_ref) * (D_ref/D) produces 0.6711 for this run (base_train.py:386). Muon applies this as w *= (1 - lr * wd) each step with matrix_lr = 0.02. Per-step decay ≈ 0.02 × 0.671 = 0.0134.
+
+Over the first 47 steps (before divergence begins):
+
+Cumulative decay ≈ (1-0.0134)^47 ≈ e^{-0.63} ≈ 0.53
+All initialized QKV + FFN layers are at ~53% of their initial magnitude by step 47
+This is not a calibration problem — the formula is designed for runs with a token budget matching D_ref. This run is 2 000 steps on a d6 model with a much smaller D_ref, making the computed weight_decay_scaled incompatible with the run duration. The c_q, c_k, c_v, and c_fc matrices halve before they can accumulate a usable learning signal. The c_proj / mlp.c_proj are zero-init, so weight-decay actually has no effect on them—but the decayed QKV/FFN matrices mean the attention pattern and feedforward transformation collapse within 50 steps, exactly matching the observed loss upturn at step 47.
+
+Verification step: print block.attn.c_q.weight.norm() every few steps. If it drops monotonically from ~0.9 toward 0, this is confirmed.
+
+Issue 2 — CRITICAL: x0_lambdas learning rate is 354× the per-element update norm
+The LR for x0_lambdas is scalar_lr × batch_lr_scale = 0.5 × 0.7071 = 0.354 (base_train.py:472). These are the skip-connection scalars initialized to 0.1 at gpt.py:251.
+
+In each block: x = resid_lambdas[i] * x + x0_lambdas[i] * x0 before block application (gpt.py:550). If x0_lambdas grow (gradient consistently positive), the hidden state at each layer regresses toward the initial normalized embedding x0, progressively washing out context and making every layer output nearly identical. The gradient through these scalars is ∂L/∂λ_x0[i] = ⟨∂L/∂x_input_i, x0⟩ — for a model that's not yet contextually competent, this dot product is systematically nonzero.
+
+With betas=(0.96, 0.95) and lr=0.354, these scalars can accumulate significant bias after 47 steps. If x0_lambdas have grown to e.g. 0.5, the information contribution of the residual stream from the transformer becomes comparable to the constant initial-embedding content, degrading contextual predictions.
+
+Verification step: log model.x0_lambdas every 10 steps via wandb.
+
+Issue 3 — CRITICAL: _v.fill_(0.001) inflates the Adam step size by 31.6× in the first step
+In sparse_optim.py:61:
+
+v=0.001 means sqrt(v_hat at step 1) ≈ sqrt(0.001/(1-0.95)) ≈ 0.141, not the expected sqrt(|grad|²). For wte (LR=0.05), the effective step size is 0.05 / 0.141 ≈ 0.35 per element regardless of gradient magnitude. For embedding vectors with std=1.0, this can produce updates of magnitude 0.35 on randomly-initialized vectors — a ~35% change to every active embedding in the first step alone. This explains the raw loss spike to ~17.5 nats at step 1 (logged as EMA 14.17 at step 1). The model recovers slowly from this self-inflicted first-step explosion, but the artificially displaced embeddings create a poor initialisation point for subsequent learning.
+
+The comment says this prevents "first-update explosion on new tokens" — but the initial gradient magnitude for a near-zero lm_head (std=0.001) is already tiny. The large pre-filled _v achieves the opposite of the stated intent at step 1 because early gradients for wte are non-trivially sized (passed through large-std embeddings, scaled by token frequency).
+
+Serious Concerns
+Issue 4 — The log_correction approximation becomes less accurate as training proceeds
+The correction log(V/|U_step|) is derived under the assumption that all tokens outside U_step have the same logit as the average logit within U_step. This holds near random initialization (all logits ≈ 0). As the model learns, high-frequency tokens (which are overrepresented in U_step) get higher logits, making Z_local an overestimate of |U_step|/V × Z_full. Result: the gradient landscape computed from the local CE is increasingly biased — the model is being trained on an objective that diverges from true cross-entropy more each step.
+
+This doesn't explain divergence on its own, but it means the loss plateau will be above what a properly calibrated model would achieve, and the reported corrected loss will systematically over-estimate the true full-vocab CE as training progresses.
+
+Issue 5 — Only 61% of vocabulary is covered per optimizer step
+U_step ≈ 20,000-21,000 from 262,144 tokens across 4 micro-batches. Theoretically 262,144 tokens over a 32,768-token vocab gives ~32,766 unique tokens (birthday paradox). The observed 20K implies highly skewed token frequency distribution — ~39% of tokens receive zero gradient for the embeddings and lm_head rows this step. While this is by design (sparse vocab), it means rare tokens' representations are updated only when they happen to appear in a batch, severely limiting their learning. For the value_embeds tables (3 tables, each managed by VocabRowAdamW), this creates even more severe gradient sparsity.
+
+Issue 6 — train_loss_f is from last micro-batch only
+At base_train.py:764: train_loss = loss.detach() inside the micro-batch loop. With grad_accum_steps=4, this overwrites the variable on each iteration — the reported loss and the EMA are computed from only micro-batch index 3 out of 4. This introduces significant step-to-step variance in reported loss independent of any actual training change and makes diagnosing instability from the log harder.
+
+Architecture Verified Correct
+The following were verified arithmetically sound:
+
+Token remapping: compute_batch_token_set in sparse_vocab.py:29 correctly maps global→local via global_to_local[U] = arange(|U|). The U_micro→U_step re-index in base_train.py:740 via torch.searchsorted(U_step, U_micro) is correct since U_micro ⊆ U_step by construction of the union.
+
+flush_pending_writes ordering: flush is called before prefetch_to_gpu (base_train.py:700-730), guaranteeing the D2H from the prior step completes before fresh rows are read from master tables. The _d2h_event.synchronize() ensures CPU-GPU ordering.
+
+flush_pending_writes loop body: The actual source at sparse_optim.py:123-127 correctly includes _m[key][U] and _v[key][U] updates inside the for key in self._pin_m: loop.
+
+W_U_* row ordering alignment: W_U_wte = index_select(master_wte, 0, U_step) (sorted). local_idx values are positions in the sorted U_step array. F.embedding(local_idx, W_U_wte) correctly retrieves the embedding for the original token. ✓
+
+Loss gradient is unaffected by log_correction: log_correction_t is a non-differentiable constant tensor (created via torch.tensor(...) without requires_grad). Adding it to the loss shifts the scalar metric but contributes zero gradient to any parameter. ✓
+
+Gradient accumulation: Each micro-batch loss is divided by grad_accum_steps before .backward(). Gradients accumulate in W_U_wte.grad across 4 backward passes, then passed to VocabRowAdamW.step(). Correct average gradient.
+
+GPU-path Adam numerics: Prefetch of _m/_v/w rows fires before the forward pass, runs decay on CPU master tables contemporaneously (ok since flush overwrites active rows), and the D2H writeback correctly uses a dedicated stream with a fence event. The only concern is the _v.fill_(0.001) issue (Issue 3 above).
+
+Validation eval uses dense path: evaluate_bpb (loss_eval.py:9) calls the model without sparse_context, falling through to _cpu_safe_lm_head over the full vocab. Val bpb is therefore a true full-vocab measurement unaffected by sparse-path approximations.
+
+Verification Steps
+Decisions
+
+Weight decay formula: designed for longer compute-optimal runs; for short sweep runs, needs a hard cap (e.g. weight_decay_scaled = min(computed_value, 0.05)) or explicit --weight-decay override
+_v.fill_(0.001) should be reconsidered — either reduce to 1e-4 so initial Adam steps are more conservative, or initialize _v from a brief warmup pass
+x0_lambdas LR should be decoupled from scalar_lr or kept at scalar_lr * 0.01 like resid_lambdas during initial experiments
