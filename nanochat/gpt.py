@@ -575,7 +575,9 @@ class GPT(nn.Module):
             flat_targets  = local_targets.reshape(-1)     # (B*T,)
             valid         = flat_targets >= 0
             n_valid       = valid.float().sum()           # GPU scalar, no sync
-            chunk_size    = 2048                          # tokens per logit chunk
+            # During training (grad enabled) keep chunks small to bound activation memory.
+            # During eval/inference (no_grad) no activations stored; larger chunks run faster.
+            chunk_size    = 2048 if torch.is_grad_enabled() else 16384
 
             if loss_reduction == 'none':
                 loss_flat = torch.empty_like(flat_targets, dtype=torch.float32)
