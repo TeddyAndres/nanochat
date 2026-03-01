@@ -66,7 +66,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 
 
 @torch.no_grad()
-def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device, sparse_row_dtype=torch.float32, debug_memory=False):
+def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device, sparse_row_dtype=torch.float32):
     """
     BPB evaluation using the sparse forward path.
 
@@ -115,7 +115,7 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
         log_correction_t = torch.tensor(
             math.log(vocab_size / max(U_size, 1)),
             dtype=torch.float32, device=device,
-        ).clamp_(-5.0, 5.0)
+        )
 
         def _fetch(master_w):
             return master_w.index_select(0, U_cpu).to(device, dtype=sparse_row_dtype)
@@ -144,12 +144,6 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
         byte_mask = (num_bytes2d > 0).to(device)
         total_nats += (loss2d * byte_mask).sum()
         total_bytes += int(num_bytes2d.sum().item())
-
-        if debug_memory and device.type == "cuda" and i_eval == 0:
-            alloc_mb = torch.cuda.memory_allocated(device) / (1024 * 1024)
-            reserved_mb = torch.cuda.memory_reserved(device) / (1024 * 1024)
-            peak_alloc_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
-            print(f"[sparse_eval_mem] U_batch={U_size:,} alloc={alloc_mb:.1f}MiB reserved={reserved_mb:.1f}MiB peak_alloc={peak_alloc_mb:.1f}MiB")
 
         del W_U_wte, W_U_lm_head, W_U_ve, sparse_ctx
 
