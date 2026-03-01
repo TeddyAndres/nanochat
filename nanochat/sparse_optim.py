@@ -59,7 +59,7 @@ class VocabRowAdamW:
         self._v: dict = {k: torch.zeros_like(w, dtype=torch.float32) for k, w in tables.items()}
         # Prevent first-update explosion on new tokens (sparse GPU bf16 path)
         for v in self._v.values():
-            v.fill_(1e-6)
+            v.fill_(0.001)
 
         # CUDA-only: pre-allocated pinned staging buffers eliminate the per-step
         # pin_memory() allocations and halve CPU bandwidth for prefetch/writeback.
@@ -102,7 +102,7 @@ class VocabRowAdamW:
         pw = {k: self._pin_w[k][:U_size].to(device, non_blocking=True) for k in self._pin_w}
         return pm, pv, pw
 
-    def flush_pending_writes(self) -> None:
+    def flush_pending_writes(self) -> dict:
         """Commit the previous step's deferred D2H results into the CPU master tables.
 
         Waits for the D2H DMA (which was fired asynchronously at the end of the
@@ -114,12 +114,14 @@ class VocabRowAdamW:
         Is a no-op on the first step (nothing pending) and on the CPU path.
         """
         if self._device != "cuda" or not hasattr(self, '_pending_U') or self._pending_U is None:
-            return
+            return {}
         # Block CPU until the D2H DMA stream has finished copying data into _pin_m/v/w.
         self._d2h_event.synchronize()
         U = self._pending_U
         U_size = U.numel()
+        applied_update_norms: dict = {}
         for key in self._pin_m:
+            applied_update_norms[key] = (self._pin_w[key][:U_size] - self._pending_tables[key][U]).norm()
             self._m[key][U] = self._pin_m[key][:U_size]
             self._v[key][U] = self._pin_v[key][:U_size]
         if self._pending_tables is not None:
@@ -127,6 +129,7 @@ class VocabRowAdamW:
                 self._pending_tables[key][U] = self._pin_w[key][:U_size]
         self._pending_U = None
         self._pending_tables = None
+        return applied_update_norms
 
     @torch.no_grad()
     def step(
@@ -138,7 +141,7 @@ class VocabRowAdamW:
         prefetched_m: dict = None,
         prefetched_v: dict = None,
         prefetched_w: dict = None,
-    ) -> None:
+    ) -> dict:
         """Apply one Adam update to the U_step rows of every table.
 
         U_step        : CPU sorted LongTensor of active global token indices.
@@ -159,6 +162,7 @@ class VocabRowAdamW:
         t = self._t
         bc1 = 1.0 - beta1 ** t
         bc2 = 1.0 - beta2 ** t
+        update_norms: dict = {}
 
         use_gpu = (
             self._device == "cuda"
@@ -204,6 +208,7 @@ class VocabRowAdamW:
                 update = m_hat / (v_hat.sqrt_() + self.eps)
                 # Standard AdamW: weight decay on the pre-update weight, then subtract step.
                 w_updated = prefetched_w[key] * (1.0 - lr * self.weight_decay) - lr * update
+                update_norms[key] = (w_updated - prefetched_w[key]).norm()
                 # Final NaN guard on weights — should never trigger after the fixes above,
                 # but kept as a last-resort safety net to prevent master weight corruption.
                 w_updated = w_updated.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
@@ -257,8 +262,10 @@ class VocabRowAdamW:
 
                 update = m_hat / (v_hat.sqrt_() + self.eps)
                 w_rows = tables[key][U_step]
+                w_updated = w_rows * (1.0 - lr * self.weight_decay) - lr * update
+                update_norms[key] = (w_updated - w_rows).norm()
                 # Standard AdamW: weight decay on the pre-update weight, then subtract step.
-                tables[key][U_step] = w_rows * (1.0 - lr * self.weight_decay) - lr * update
+                tables[key][U_step] = w_updated
 
         # GPU path: decay ALL rows on the CPU master tables to mimic dense behaviour
         # (inactive rows with no gradient this step should have m *= beta1, v *= beta2).
@@ -278,6 +285,7 @@ class VocabRowAdamW:
             self._d2h_event.record(self._d2h_stream)
             self._pending_U = U_step
             self._pending_tables = tables
+        return update_norms
 
     # ------------------------------------------------------------------
     def state_dict(self) -> dict:

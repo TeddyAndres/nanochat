@@ -102,6 +102,9 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--sparse-mode", action="store_true", help="enable dynamic local-vocab sparse training path")
 parser.add_argument("--sparse-ddp-union", action="store_true", help="when sparse mode is enabled, synchronize local token sets across DDP ranks")
 parser.add_argument("--tie-embeddings", action="store_true", help="tie wte and lm_head weights (recommended for sparse mode)")
+parser.add_argument("--no-sparse-prefetch", action="store_true", help="disable AsyncBatchPrefetcher in sparse mode")
+parser.add_argument("--sparse-extra-negatives", type=int, default=0, help="number of random non-batch token rows to add to U_step each sparse step (0 = disable)")
+parser.add_argument("--sparse-fp32", action="store_true", help="disable autocast in sparse mode to avoid bf16 gradient underflow")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -111,7 +114,7 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.05, help="learning rate for embedding/wte parameters (Adam); also controls wte LR in sparse tied-embedding mode")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--value-embed-lr", type=float, default=0.001, help="learning rate for value_embed parameters (Adam). Kept separate from --embedding-lr because value_embeds are larger and benefit from a lower LR.")
+parser.add_argument("--value-embed-lr", type=float, default=0.005, help="learning rate for value_embed parameters (Adam). If unset, defaults to --embedding-lr to mirror dense-path calibration.")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
@@ -148,6 +151,7 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+sparse_autocast_ctx = nullcontext() if (args.sparse_mode and args.sparse_fp32) else autocast_ctx
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 get_max_reserved_memory = torch.cuda.max_memory_reserved if device_type == "cuda" else lambda: 0
@@ -204,8 +208,8 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         sparse_mode=args.sparse_mode,
-        sparse_ddp_union=(args.sparse_ddp_union or args.sparse_mode),
-        tie_embeddings=(args.tie_embeddings or args.sparse_mode),
+        sparse_ddp_union=args.sparse_ddp_union,
+        tie_embeddings=args.tie_embeddings,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -317,8 +321,11 @@ if model.config.sparse_mode:
     # Pre-fetched row tensors are created once per optimizer step before the
     # gradient-accumulation loop.  The forward/backward is then graph-break-free.
     # dynamic=True is required because |U_step| (the sub-table size) varies per step.
-    print0("Sparse mode: compiling with dynamic=True (pre-fetched row tensors, zero graph breaks, dim-0 of W_U tables marked dynamic)")
-    model = torch.compile(model, dynamic=True)
+    if args.sparse_fp32:
+        print0("Sparse mode: --sparse-fp32 enabled, skipping torch.compile for dtype-stable fp32 sparse path")
+    else:
+        print0("Sparse mode: compiling with dynamic=True (pre-fetched row tensors, zero graph breaks, dim-0 of W_U tables marked dynamic)")
+        model = torch.compile(model, dynamic=True)
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
@@ -408,8 +415,8 @@ if args.sparse_mode:
     dmodel_lr_scale_v = (model_config.n_embd / 768) ** -0.5
     vocab_emb_lr   = args.embedding_lr   * batch_lr_scale * dmodel_lr_scale_v
     vocab_unemb_lr = args.unembedding_lr * batch_lr_scale * dmodel_lr_scale_v
-    # Separate LR knob for value_embed rows.  value_embeds are larger (n_layer × vocab × kv_dim)
-    # and can accumulate larger gradients — a lower LR reduces overflow risk.
+    # By default match dense setup_optimizer behaviour: value_embeds use embedding_lr.
+    # Users can still override with --value-embed-lr for experiments.
     vocab_ve_lr    = (args.value_embed_lr if args.value_embed_lr is not None else args.embedding_lr) * batch_lr_scale * dmodel_lr_scale_v
 
     vocab_tables = {"wte": orig_model.wte().weight.data}
@@ -551,7 +558,8 @@ if args.sparse_mode:
     # Each sparse step drains (grad_accum_steps) batches from the queue per step.
     # Buffer 4× that depth so transient tokenizer hiccups (parquet reads, epoch
     # boundaries, GC) never drain the queue and stall the GPU.
-    train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=max(16, (grad_accum_steps + 1) * 4))
+    if not args.no_sparse_prefetch:
+        train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=max(32, (grad_accum_steps + 1) * 4))
 
 # Go!
 while True:
@@ -653,6 +661,8 @@ while True:
     t0 = time.time()
     data_wait_time = 0.0
     U_size_log = 0  # number of unique tokens in this step (logged for sparsity visibility)
+    log_correction_f = 0.0  # scalar correction added by sparse objective: log(V/|U_step|)
+    flush_update_norms_prev: dict[str, float] = {}
     if args.sparse_mode:
         # ---- 1. Collect ALL micro-batches for this optimizer step upfront. ----
         # We start from the current (x, y, sc) and fetch grad_accum_steps-1 more.
@@ -668,6 +678,10 @@ while True:
         U_step = torch.unique(all_U, sorted=True)
         if model_config.sparse_ddp_union:
             U_step = _ddp_union_tokens(U_step)
+        if args.sparse_extra_negatives > 0 and U_step.numel() < model_config.vocab_size:
+            need = min(args.sparse_extra_negatives, model_config.vocab_size - U_step.numel())
+            extra = torch.randperm(model_config.vocab_size, device=U_step.device, dtype=torch.long)[:need]
+            U_step = torch.unique(torch.cat([U_step, extra]), sorted=True)
         U_size_log = U_step.numel()   # Python int — used for logging only, never passed into compiled graph
         # Pre-compute as a GPU scalar tensor so Dynamo guards on its *shape* (always ())
         # rather than its *value*, preventing a guard miss — and therefore a recompile — every step.
@@ -676,6 +690,7 @@ while True:
             math.log(model_config.vocab_size) - math.log(max(U_size_log, 1)),
             dtype=torch.float32, device=device,
         ).clamp_(-5.0, 5.0)   # prevents bf16 gradient explosion
+        log_correction_f = float(log_correction_t.item())
 
         # ---- 3. H2D: fetch exactly |U_step| rows per vocab table once. --------
         # Each W_U_* is a GPU leaf tensor with requires_grad=True.
@@ -684,18 +699,20 @@ while True:
         # Flush the previous step's deferred D2H writes FIRST so that
         # prefetch_to_gpu() reads fully-committed _m/_v/table values.
         if vocab_optimizer is not None and device_type == "cuda":
-            vocab_optimizer.flush_pending_writes()
+            flushed = vocab_optimizer.flush_pending_writes()
+            flush_update_norms_prev = {k: float(v.item()) for k, v in flushed.items()}
 
         U_size = U_step.numel()
+        sparse_row_dtype = torch.float32 if args.sparse_fp32 else torch.bfloat16
         def _fetch_rows(master_w, pin_buf=None):
             if pin_buf is not None:
                 # Write gathered rows directly into pre-allocated pinned memory
                 # (one CPU copy instead of two; no per-step pinned allocation).
                 torch.index_select(master_w, 0, U_step, out=pin_buf[:U_size])
-                rows_gpu = pin_buf[:U_size].to(device, dtype=torch.bfloat16, non_blocking=True)
+                rows_gpu = pin_buf[:U_size].to(device, dtype=sparse_row_dtype, non_blocking=True)
             else:
                 rows_cpu = master_w.index_select(0, U_step)      # CPU (pageable)
-                rows_gpu = rows_cpu.pin_memory().to(device, dtype=torch.bfloat16, non_blocking=True)
+                rows_gpu = rows_cpu.pin_memory().to(device, dtype=sparse_row_dtype, non_blocking=True)
             rows_gpu.requires_grad_(True)
             # Tell Dynamo that dim 0 (|U_step|) varies across steps so it never
             # places a static size guard on it — prevents recompilation every step.
@@ -717,6 +734,7 @@ while True:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
 
         # ---- 4. Gradient-accumulation loop — purely GPU, zero H2D copies. -----
+        skip_sparse_step = False
         for i_mb, (x_mb, y_mb, _state, sc_micro) in enumerate(all_micro_batches):
             # Remap local_idx / local_targets from U_micro positions → U_step positions
             # All CPU ops, fast, no GPU sync needed.
@@ -737,8 +755,13 @@ while True:
                 "log_correction": log_correction_t,
             }
 
-            with autocast_ctx:
+            with sparse_autocast_ctx:
                 loss = model(x_mb, y_mb, sparse_context=sparse_ctx_step)
+
+            if not torch.isfinite(loss).all():
+                print0(f"Non-finite sparse loss at step {step}, micro_batch {i_mb}; skipping optimizer step")
+                skip_sparse_step = True
+                break
 
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
@@ -753,9 +776,32 @@ while True:
                 next_first = next(train_loader)
                 data_wait_time += (time.time() - t_data0)
                 x, y, dataloader_state_dict, sparse_context = next_first
+
+        if skip_sparse_step:
+            model.zero_grad(set_to_none=True)
+            t_data0 = time.time()
+            next_first = next(train_loader)
+            data_wait_time += (time.time() - t_data0)
+            x, y, dataloader_state_dict, sparse_context = next_first
+            t1 = time.time()
+            dt = t1 - t0
+            update_peak_device_memory_used()
+            epoch = dataloader_state_dict["epoch"]
+            pct_done = 100 * step / num_iterations
+            sparse_info = f" | U_step: {U_size_log:,}" if args.sparse_mode else ""
+            print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: nan (skipped) | lrm: {get_lr_multiplier(step):.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms{sparse_info} | epoch: {epoch}")
+            first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
+            step += 1
+            if first_step_of_run:
+                gc.collect()
+                gc.freeze()
+                gc.disable()
+            elif step % 5000 == 0:
+                gc.collect()
+            continue
     else:
         for micro_step in range(grad_accum_steps):
-            with autocast_ctx:
+            with sparse_autocast_ctx:
                 loss = model(x, y, sparse_context=sparse_context)
             train_loss = loss.detach() # for logging
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
@@ -776,6 +822,15 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     vocab_grad_max_t = None  # GPU scalar tensor; materialised below in sparse mode for wandb logging
+    vocab_update_max_t = None  # GPU/CPU scalar tensor; max row-update norm across sparse vocab tables
+    sparse_grad_norms: dict[str, float] = {}
+    sparse_update_norms: dict[str, float] = {}
+    sparse_matrix_grad_probe: dict[str, float] = {}
+    if args.sparse_mode:
+        probe_cproj = orig_model.blocks()[0].attn.c_proj.weight.grad
+        probe_cq = orig_model.blocks()[0].attn.c_q.weight.grad
+        sparse_matrix_grad_probe["attn_c_proj"] = 0.0 if probe_cproj is None else float(probe_cproj.norm().item())
+        sparse_matrix_grad_probe["attn_c_q"] = 0.0 if probe_cq is None else float(probe_cq.norm().item())
     if args.sparse_mode and vocab_optimizer is not None:
         # Collect W_U_* gradients (GPU bf16).
         # No explicit synchronize() needed: the GPU path runs all Adam arithmetic
@@ -812,12 +867,16 @@ while True:
         # Materialised via .item() in the logging block below alongside train_loss.item().
         if vocab_grads:
             vocab_grad_max_t = torch.stack([g.norm() for g in vocab_grads.values()]).amax()
-        vocab_optimizer.step(
+            sparse_grad_norms = {k: float(g.norm().item()) for k, g in vocab_grads.items()}
+        vocab_update_norms = vocab_optimizer.step(
             U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
             prefetched_v=prefetched_v_gpu,
             prefetched_w=prefetched_w_gpu,
         )
+        if vocab_update_norms:
+            vocab_update_max_t = torch.stack(list(vocab_update_norms.values())).amax()
+            sparse_update_norms = {k: float(v.item()) for k, v in vocab_update_norms.items()}
         # Free GPU row tensors — they'll be re-created next step from updated master weights.
         del W_U_wte, W_U_lm_head, W_U_ve
     model.zero_grad(set_to_none=True)
@@ -828,6 +887,7 @@ while True:
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
+    local_train_loss_f = train_loss_f - log_correction_f if args.sparse_mode else train_loss_f
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
@@ -864,8 +924,29 @@ while True:
         }
         if args.sparse_mode:
             log_data["sparse/U_step_size"] = U_size_log
+            log_data["sparse/log_correction"] = log_correction_f
+            log_data["sparse/local_ce_last_mb"] = local_train_loss_f
+            if sparse_matrix_grad_probe:
+                log_data["sparse/matrix_grad_attn_c_proj"] = sparse_matrix_grad_probe["attn_c_proj"]
+                log_data["sparse/matrix_grad_attn_c_q"] = sparse_matrix_grad_probe["attn_c_q"]
+            if flush_update_norms_prev:
+                log_data["sparse/flush_applied_update_norm_max"] = max(flush_update_norms_prev.values())
+                if "wte" in flush_update_norms_prev:
+                    log_data["sparse/flush_applied_update_norm_wte"] = flush_update_norms_prev["wte"]
             if vocab_grad_max_t is not None:
                 log_data["sparse/vocab_grad_norm_max"] = vocab_grad_max_t.item()
+                if "wte" in sparse_grad_norms:
+                    log_data["sparse/wte_grad_norm"] = sparse_grad_norms["wte"]
+                ve_grad_keys = [k for k in sparse_grad_norms if k.startswith("ve_")]
+                if ve_grad_keys:
+                    log_data["sparse/ve_grad_norm_max"] = max(sparse_grad_norms[k] for k in ve_grad_keys)
+            if vocab_update_max_t is not None:
+                log_data["sparse/vocab_row_update_norm_max"] = vocab_update_max_t.item()
+                if "wte" in sparse_update_norms:
+                    log_data["sparse/wte_row_update_norm"] = sparse_update_norms["wte"]
+                ve_update_keys = [k for k in sparse_update_norms if k.startswith("ve_")]
+                if ve_update_keys:
+                    log_data["sparse/ve_row_update_norm_max"] = max(sparse_update_norms[k] for k in ve_update_keys)
         wandb_run.log(log_data)
 
     # state update
