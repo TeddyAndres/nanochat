@@ -95,16 +95,18 @@ def evaluate_bpb_sparse(model, batches, steps, token_bytes, vocab_tables, device
     for _ in range(steps):
         x, y = next(batch_iter)
 
-        # Build sparse context on CPU (unique-token computation, no GPU)
+        # compute_batch_token_set returns tensors on the same device as x (GPU).
+        # index_select on CPU master weights requires a CPU index — move U to CPU first.
         U, _g2l, local_idx, local_targets = compute_batch_token_set(x, y, vocab_size)
-        U_size = U.numel()
+        U_cpu = U.cpu()
+        U_size = U_cpu.numel()
         log_correction_t = torch.tensor(
             math.log(vocab_size / max(U_size, 1)),
             dtype=torch.float32, device=device,
         ).clamp_(-5.0, 5.0)
 
         def _fetch(master_w):
-            return master_w.index_select(0, U).to(device, dtype=sparse_row_dtype)
+            return master_w.index_select(0, U_cpu).to(device, dtype=sparse_row_dtype)
 
         W_U_wte = _fetch(vocab_tables["wte"])
         W_U_lm_head = W_U_wte if model.config.tie_embeddings else _fetch(vocab_tables["lm_head"])
