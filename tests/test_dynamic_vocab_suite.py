@@ -335,14 +335,6 @@ def test_vocab_row_adamw_overlap_cache_deferred_matches_cpu():
     m_gpu_touched = opt_gpu._m["wte"].index_select(0, touched_rows)
     v_gpu_touched = opt_gpu._v["wte"].index_select(0, touched_rows)
 
-    # Overlap-cache path uses lazy decay for inactive rows: normalize to current
-    # step before comparing to CPU's eager global-decay reference.
-    gaps = (opt_gpu._t - opt_gpu._last_seen_step.index_select(0, touched_rows)).to(torch.float32)
-    decay_m = torch.pow(torch.tensor(opt_gpu.betas[0], dtype=torch.float32), gaps).unsqueeze(1)
-    decay_v = torch.pow(torch.tensor(opt_gpu.betas[1], dtype=torch.float32), gaps).unsqueeze(1)
-    m_gpu_touched = m_gpu_touched * decay_m
-    v_gpu_touched = v_gpu_touched * decay_v
-
     assert torch.allclose(m_cpu_touched, m_gpu_touched, atol=1e-5, rtol=1e-5), \
         "_m state diverged on touched rows for overlap-cache deferred path"
     assert torch.allclose(v_cpu_touched, v_gpu_touched, atol=1e-5, rtol=1e-5), \

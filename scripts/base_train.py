@@ -83,6 +83,64 @@ class AsyncBatchPrefetcher:
             raise StopIteration
         return item
 
+
+class AsyncSparseStepPrefetcher:
+    def __init__(self, loader, grad_accum_steps, initial_batch=None, max_prefetch=2):
+        self.loader = loader
+        self.grad_accum_steps = grad_accum_steps
+        self.initial_batch = initial_batch
+        self.queue = queue.Queue(maxsize=max_prefetch)
+        self._error = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            first = self.initial_batch
+            while True:
+                if first is None:
+                    first = next(self.loader)
+                micro_batches = [first]
+                for _ in range(self.grad_accum_steps - 1):
+                    micro_batches.append(next(self.loader))
+                all_U = torch.cat([mb[3]["U"] for mb in micro_batches])
+                U_step = torch.unique(all_U, sorted=True)
+                remapped_local_idx = []
+                remapped_local_tgt = []
+                for _x_mb, _y_mb, _st_mb, sc_mb in micro_batches:
+                    U_micro = sc_mb["U"]
+                    remap = torch.searchsorted(U_step, U_micro)
+                    l_idx = remap[sc_mb["local_idx"]]
+                    l_tgt = sc_mb["local_targets"].clone()
+                    valid_t = l_tgt >= 0
+                    l_tgt[valid_t] = remap[l_tgt[valid_t]]
+                    remapped_local_idx.append(l_idx)
+                    remapped_local_tgt.append(l_tgt)
+                self.queue.put({
+                    "micro_batches": micro_batches,
+                    "U_step": U_step,
+                    "remapped_local_idx": remapped_local_idx,
+                    "remapped_local_tgt": remapped_local_tgt,
+                })
+                first = None
+        except StopIteration:
+            pass
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+        return item
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
@@ -114,6 +172,8 @@ parser.add_argument("--sparse-untied-lm-head", action="store_true", help="keep l
 parser.add_argument("--sparse-profile", action="store_true", help="print sparse phase timings every N steps")
 parser.add_argument("--sparse-profile-every", type=int, default=20, help="emit sparse phase timings every N steps when --sparse-profile is enabled")
 parser.add_argument("--sparse-profile-sync", action="store_true", help="synchronize CUDA around profiled sparse phases for attribution accuracy")
+parser.add_argument("--sparse-loss-sync-every", type=int, default=0, help="materialize sparse train loss every N sparse steps (0 disables periodic sync; still syncs for profile/log checkpoints)")
+parser.add_argument("--sparse-log-row-norms", action="store_true", help="log sparse per-table grad/update row norms (adds extra GPU sync on logging steps)")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=2048, help="number of token positions processed per sparse logit chunk during training")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -606,6 +666,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+last_train_loss_f = 0.0
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -620,8 +681,19 @@ if args.sparse_mode:
     # Each sparse step drains (grad_accum_steps) batches from the queue per step.
     # Buffer 4× that depth so transient tokenizer hiccups (parquet reads, epoch
     # boundaries, GC) never drain the queue and stall the GPU.
+    use_sparse_step_prefetch = False
     if not args.no_sparse_prefetch:
         train_loader = AsyncBatchPrefetcher(train_loader, max_prefetch=max(32, (grad_accum_steps + 1) * 4))
+        first_sparse_batch = (x, y, dataloader_state_dict, sparse_context)
+        train_loader = AsyncSparseStepPrefetcher(
+            train_loader,
+            grad_accum_steps=grad_accum_steps,
+            initial_batch=first_sparse_batch,
+            max_prefetch=max(8, grad_accum_steps * 2),
+        )
+        use_sparse_step_prefetch = True
+else:
+    use_sparse_step_prefetch = False
 
 # Go!
 while True:
@@ -736,6 +808,7 @@ while True:
     # single training step
     # evaluate the gradient
     t0 = time.time()
+    collect_sparse_table_metrics = args.sparse_log_row_norms and (step % 100 == 0)
     data_wait_time = 0.0
     U_size_log = 0  # number of unique tokens in this step (logged for sparsity visibility)
     log_correction_f = 0.0  # scalar correction added by sparse objective: log(V/|U_step|)
@@ -743,6 +816,10 @@ while True:
     profile_this_step = False
     profile_sync = False
     t_phase_dense_step = 0.0
+    sparse_prefetch_hit = 0
+    sparse_prefetch_miss = 0
+    sparse_prefetch_evict = 0
+    t_phase_flush_wait = 0.0
     if args.sparse_mode:
         profile_this_step = args.sparse_profile and (step % max(args.sparse_profile_every, 1) == 0)
         profile_sync = profile_this_step and args.sparse_profile_sync and device_type == "cuda"
@@ -753,19 +830,26 @@ while True:
         t_phase_dense_step = 0.0
         t_phase_vocab_step = 0.0
 
-        # ---- 1. Collect ALL micro-batches for this optimizer step upfront. ----
-        # We start from the current (x, y, sc) and fetch grad_accum_steps-1 more.
-        # All data is on CPU at this point — no GPU work yet.
-        all_micro_batches = [(x, y, dataloader_state_dict, sparse_context)]
+        # ---- 1. Collect ALL micro-batches + CPU U_step for this optimizer step. ----
         t_data0 = time.time()
-        for _ in range(grad_accum_steps - 1):
-            all_micro_batches.append(next(train_loader))
+        if use_sparse_step_prefetch:
+            step_plan = next(train_loader)
+            all_micro_batches = step_plan["micro_batches"]
+            U_step = step_plan["U_step"]
+            step_plan_local_idx = step_plan.get("remapped_local_idx")
+            step_plan_local_tgt = step_plan.get("remapped_local_tgt")
+        else:
+            all_micro_batches = [(x, y, dataloader_state_dict, sparse_context)]
+            for _ in range(grad_accum_steps - 1):
+                all_micro_batches.append(next(train_loader))
+            all_U = torch.cat([mb[3]["U"] for mb in all_micro_batches])
+            U_step = torch.unique(all_U, sorted=True)
+            step_plan_local_idx = None
+            step_plan_local_tgt = None
         data_wait_time += (time.time() - t_data0)
 
-        # ---- 2. U_step = union of all per-micro-batch unique token sets (CPU). ----
+        # ---- 2. Finalize U_step for this rank (DDP union / negatives). ----
         t_union0 = time.time()
-        all_U = torch.cat([mb[3]["U"] for mb in all_micro_batches])
-        U_step = torch.unique(all_U, sorted=True)
         if model_config.sparse_ddp_union:
             U_step = _ddp_union_tokens(U_step)
         if args.sparse_extra_negatives > 0 and U_step.numel() < model_config.vocab_size:
@@ -778,11 +862,8 @@ while True:
         # Pre-compute as a GPU scalar tensor so Dynamo guards on its *shape* (always ())
         # rather than its *value*, preventing a guard miss — and therefore a recompile — every step.
         # Clamp to prevent overflow when U_size_log is very small
-        log_correction_t = torch.tensor(
-            math.log(model_config.vocab_size) - math.log(max(U_size_log, 1)),
-            dtype=torch.float32, device=device,
-        )
-        log_correction_f = float(log_correction_t.item())
+        log_correction_f = math.log(model_config.vocab_size) - math.log(max(U_size_log, 1))
+        log_correction_t = torch.tensor(log_correction_f, dtype=torch.float32, device=device)
 
         optimizer_uses_cuda = vocab_optimizer is not None and getattr(vocab_optimizer, "_device", device_type) == "cuda"
         optimizer_overlap_cache = optimizer_uses_cuda and bool(getattr(vocab_optimizer, "_overlap_cache", False))
@@ -830,6 +911,11 @@ while True:
         if optimizer_uses_cuda:
             prefetched_m_gpu, prefetched_v_gpu, prefetched_w_gpu = \
                 vocab_optimizer.prefetch_to_gpu(U_step, device, vocab_tables)
+            prefetch_stats = getattr(vocab_optimizer, "last_prefetch_stats", {}) or {}
+            sparse_prefetch_hit = int(prefetch_stats.get("hit_count", 0))
+            sparse_prefetch_miss = int(prefetch_stats.get("miss_count", 0))
+            sparse_prefetch_evict = int(prefetch_stats.get("evict_count", 0))
+            t_phase_flush_wait += float(prefetch_stats.get("flush_wait_ms", 0.0)) / 1000.0
         else:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
         if profile_sync:
@@ -858,21 +944,27 @@ while True:
         t_remap0 = time.time()
         mb_local_idx_gpu  = []
         mb_local_tgt_gpu  = []
-        for _x_pre, _y_pre, _st_pre, sc_micro in all_micro_batches:
-            U_micro  = sc_micro["U"]                             # CPU sorted
-            remap    = torch.searchsorted(U_step, U_micro)       # (|U_micro|,) CPU
-            l_idx    = sc_micro["local_idx"]                     # (B, T) CPU
-            l_tgt    = sc_micro["local_targets"].clone()         # (B, T) CPU
-            valid_t  = l_tgt >= 0
-            l_tgt[valid_t] = remap[l_tgt[valid_t]]
-            mb_local_idx_gpu.append(remap[l_idx].to(device, non_blocking=True))
-            mb_local_tgt_gpu.append(l_tgt.to(device, non_blocking=True))
+        if step_plan_local_idx is not None and step_plan_local_tgt is not None:
+            for l_idx_cpu, l_tgt_cpu in zip(step_plan_local_idx, step_plan_local_tgt):
+                mb_local_idx_gpu.append(l_idx_cpu.to(device, non_blocking=True))
+                mb_local_tgt_gpu.append(l_tgt_cpu.to(device, non_blocking=True))
+        else:
+            for _x_pre, _y_pre, _st_pre, sc_micro in all_micro_batches:
+                U_micro  = sc_micro["U"]                             # CPU sorted
+                remap    = torch.searchsorted(U_step, U_micro)       # (|U_micro|,) CPU
+                l_idx    = sc_micro["local_idx"]                     # (B, T) CPU
+                l_tgt    = sc_micro["local_targets"].clone()         # (B, T) CPU
+                valid_t  = l_tgt >= 0
+                l_tgt[valid_t] = remap[l_tgt[valid_t]]
+                mb_local_idx_gpu.append(remap[l_idx].to(device, non_blocking=True))
+                mb_local_tgt_gpu.append(l_tgt.to(device, non_blocking=True))
         if profile_this_step:
             t_phase_remap += (time.time() - t_remap0)
 
         # ---- 4b. Gradient-accumulation loop — purely GPU, zero CPU stalls. -----
         skip_sparse_step = False
         for i_mb, (x_mb, y_mb, _state, _sc_micro) in enumerate(all_micro_batches):
+            dataloader_state_dict = _state
             sparse_ctx_step = {
                 "W_U_wte":        W_U_wte,
                 "W_U_ve":         W_U_ve,
@@ -909,7 +1001,7 @@ while True:
             # while the final backward kernels are still executing on GPU.
             # Since next(train_loader) is a queue.get() it returns immediately
             # when the prefetch thread is keeping up, costing near-zero time.
-            if i_mb == len(all_micro_batches) - 1:
+            if (not use_sparse_step_prefetch) and i_mb == len(all_micro_batches) - 1:
                 t_data0 = time.time()
                 next_first = next(train_loader)
                 data_wait_time += (time.time() - t_data0)
@@ -917,10 +1009,13 @@ while True:
 
         if skip_sparse_step:
             model.zero_grad(set_to_none=True)
-            t_data0 = time.time()
-            next_first = next(train_loader)
-            data_wait_time += (time.time() - t_data0)
-            x, y, dataloader_state_dict, sparse_context = next_first
+            if not use_sparse_step_prefetch:
+                t_data0 = time.time()
+                next_first = next(train_loader)
+                data_wait_time += (time.time() - t_data0)
+                x, y, dataloader_state_dict, sparse_context = next_first
+            else:
+                x, y, dataloader_state_dict, sparse_context = all_micro_batches[-1]
             t1 = time.time()
             dt = t1 - t0
             update_peak_device_memory_used()
@@ -1012,7 +1107,7 @@ while True:
         
         # Record the max per-row grad norm across all vocab tables (post-clip).
         # Materialised via .item() in the logging block below alongside train_loss.item().
-        if vocab_grads:
+        if collect_sparse_table_metrics and vocab_grads:
             vocab_grad_max_t = torch.stack([g.norm(dim=-1).amax() for g in vocab_grads.values()]).amax()
             sparse_grad_norms = {k: float(g.norm(dim=-1).amax().item()) for k, g in vocab_grads.items()}
 
@@ -1024,12 +1119,13 @@ while True:
             prefetched_m=prefetched_m_gpu,
             prefetched_v=prefetched_v_gpu,
             prefetched_w=prefetched_w_gpu,
+            return_update_norms=collect_sparse_table_metrics,
         )
         if profile_sync:
             torch.cuda.synchronize()
         if profile_this_step:
             t_phase_vocab_step += (time.time() - t_vocab_step0)
-        if vocab_update_norms:
+        if collect_sparse_table_metrics and vocab_update_norms:
             vocab_update_max_t = torch.stack(list(vocab_update_norms.values())).amax()
             sparse_update_norms = {k: float(v.item()) for k, v in vocab_update_norms.items()}
         # Free GPU row tensors — they'll be re-created next step from updated master weights.
@@ -1037,7 +1133,21 @@ while True:
 
     model.zero_grad(set_to_none=True)
     train_loss = train_loss_sum / grad_accum_steps  # average over all micro-batches
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if args.sparse_mode:
+        loss_sync_every = args.sparse_loss_sync_every
+        periodic_loss_sync = (loss_sync_every > 0 and step % loss_sync_every == 0)
+        should_sync_loss = (
+            step < 10
+            or periodic_loss_sync
+            or profile_this_step
+        )
+    else:
+        should_sync_loss = True
+    if should_sync_loss:
+        train_loss_f = float(train_loss.item())  # .item() is a CPU-GPU sync point
+        last_train_loss_f = train_loss_f
+    else:
+        train_loss_f = last_train_loss_f
 
     t1 = time.time()
     dt = t1 - t0
@@ -1074,6 +1184,8 @@ while True:
             f" | sparse(ms): union={t_phase_union*1000:.1f} prefetch={t_phase_prefetch*1000:.1f}"
             f" remap={t_phase_remap*1000:.1f} fwdbwd={t_phase_fwdbwd*1000:.1f}"
             f" dense_step={t_phase_dense_step*1000:.1f} vocab_step={t_phase_vocab_step*1000:.1f}"
+            f" flush_wait={t_phase_flush_wait*1000:.1f}"
+            f" hm/ev={sparse_prefetch_hit}/{sparse_prefetch_miss}/{sparse_prefetch_evict}"
             f" gap={max(dt - t_known, 0.0)*1000:.1f}"
         )
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data_wait: {data_wait_time * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{sparse_info}{sparse_profile_info} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
@@ -1094,14 +1206,14 @@ while True:
             log_data["sparse/U_step_size"] = U_size_log
             log_data["sparse/log_correction"] = log_correction_f
             log_data["sparse/local_ce_avg_mb"] = local_train_loss_f  # avg across all micro-batches
-            if vocab_grad_max_t is not None:
+            if collect_sparse_table_metrics and vocab_grad_max_t is not None:
                 log_data["sparse/vocab_grad_norm_max"] = vocab_grad_max_t.item()
                 if "wte" in sparse_grad_norms:
                     log_data["sparse/wte_grad_norm"] = sparse_grad_norms["wte"]
                 ve_grad_keys = [k for k in sparse_grad_norms if k.startswith("ve_")]
                 if ve_grad_keys:
                     log_data["sparse/ve_grad_norm_max"] = max(sparse_grad_norms[k] for k in ve_grad_keys)
-            if vocab_update_max_t is not None:
+            if collect_sparse_table_metrics and vocab_update_max_t is not None:
                 log_data["sparse/vocab_row_update_norm_max"] = vocab_update_max_t.item()
                 if "wte" in sparse_update_norms:
                     log_data["sparse/wte_row_update_norm"] = sparse_update_norms["wte"]
