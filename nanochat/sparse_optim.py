@@ -71,9 +71,10 @@ class VocabRowAdamW:
         # pin_memory() allocations and halve CPU bandwidth for prefetch/writeback.
         # Full vocab-size buffers persist; only |U_step| rows are used each step.
         if device == "cuda":
-            self._pin_m: dict = {k: torch.zeros_like(w, pin_memory=True) for k, w in tables.items()}
-            self._pin_v: dict = {k: torch.zeros_like(w, pin_memory=True) for k, w in tables.items()}
-            self._pin_w: dict = {k: torch.zeros_like(w, pin_memory=True) for k, w in tables.items()}
+            self._pin_pack: dict = {k: torch.empty((3,) + tuple(w.shape), dtype=torch.float32, pin_memory=True) for k, w in tables.items()}
+            self._pin_m: dict = {k: self._pin_pack[k][0] for k in tables}
+            self._pin_v: dict = {k: self._pin_pack[k][1] for k in tables}
+            self._pin_w: dict = {k: self._pin_pack[k][2] for k in tables}
             # Dedicated D2H stream so the updated-row DMA back to CPU doesn't
             # stall the main compute stream.  A CUDA event lets us fence
             # the completion at the start of the *next* step.
@@ -90,6 +91,7 @@ class VocabRowAdamW:
             self._pending_overlap: list[dict] = []
             self._pending_overlap_limit: int = 2
             self.last_prefetch_stats: dict[str, float | int] = {}
+            self._last_fetch_rows_stats: dict[str, float] = {"cpu_gather_s": 0.0, "h2d_s": 0.0}
 
             # Overlap cache (GPU-resident active rows from previous step)
             self._cache_U: torch.Tensor | None = None  # CPU sorted global ids
@@ -118,11 +120,13 @@ class VocabRowAdamW:
         with shape (|U_step|, dim), ready for immediate use in ``step()``.
         """
         if self._overlap_cache:
+            t_prefetch0 = time.time()
             U_cpu = U_step.to(device="cpu")
             U_size = U_cpu.numel()
 
             if self._cache_U is None:
                 pm, pv, pw = self._fetch_rows_from_cpu(U_cpu, device, tables)
+                fetch_stats = self._last_fetch_rows_stats
                 self._cache_U = U_cpu.clone()
                 self._cache_m = pm
                 self._cache_v = pv
@@ -132,6 +136,8 @@ class VocabRowAdamW:
                     "miss_count": int(U_size),
                     "evict_count": 0,
                     "flush_wait_ms": 0.0,
+                    "cpu_gather_ms": float(fetch_stats.get("cpu_gather_s", 0.0)) * 1000.0,
+                    "h2d_ms": float(fetch_stats.get("h2d_s", 0.0)) * 1000.0,
                 }
                 return self._cache_m, self._cache_v, self._cache_w
 
@@ -162,8 +168,17 @@ class VocabRowAdamW:
                 self._write_back_evicted(evict_ids, evict_pos, tables)
 
             miss_m = miss_v = miss_w = None
+            miss_fetch_stats = {"cpu_gather_s": 0.0, "h2d_s": 0.0}
             if miss_count > 0:
                 miss_m, miss_v, miss_w = self._fetch_rows_from_cpu(miss_ids, device, tables)
+                miss_fetch_stats = self._last_fetch_rows_stats
+
+            hit_pos_new = hit_pos_old = miss_pos_new = None
+            if hit_count > 0:
+                hit_pos_new = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
+                hit_pos_old = new_pos_in_old[hit_mask]
+            if miss_count > 0:
+                miss_pos_new = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)
 
             old_cache_m = self._cache_m
             old_cache_v = self._cache_v
@@ -177,26 +192,26 @@ class VocabRowAdamW:
                 prev_m = old_cache_m.get(key)
                 prev_v = old_cache_v.get(key)
                 prev_w = old_cache_w.get(key)
-                rows_m = prev_m if (prev_m is not None and prev_m.size(0) == U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
-                rows_v = prev_v if (prev_v is not None and prev_v.size(0) == U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
-                rows_w = prev_w if (prev_w is not None and prev_w.size(0) == U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_m = prev_m if (prev_m is not None and prev_m.size(0) >= U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_v = prev_v if (prev_v is not None and prev_v.size(0) >= U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_w = prev_w if (prev_w is not None and prev_w.size(0) >= U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_m_u = rows_m[:U_size]
+                rows_v_u = rows_v[:U_size]
+                rows_w_u = rows_w[:U_size]
 
-                if hit_count > 0:
-                    hit_pos_new = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
-                    hit_pos_old = new_pos_in_old[hit_mask]
-                    rows_m[hit_pos_new] = old_cache_m[key][hit_pos_old]
-                    rows_v[hit_pos_new] = old_cache_v[key][hit_pos_old]
-                    rows_w[hit_pos_new] = old_cache_w[key][hit_pos_old]
+                if hit_count > 0 and hit_pos_new is not None and hit_pos_old is not None:
+                    rows_m_u[hit_pos_new] = old_cache_m[key][hit_pos_old]
+                    rows_v_u[hit_pos_new] = old_cache_v[key][hit_pos_old]
+                    rows_w_u[hit_pos_new] = old_cache_w[key][hit_pos_old]
 
-                if miss_count > 0 and miss_m is not None and miss_v is not None and miss_w is not None:
-                    miss_pos_new = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)
-                    rows_m[miss_pos_new] = miss_m[key]
-                    rows_v[miss_pos_new] = miss_v[key]
-                    rows_w[miss_pos_new] = miss_w[key]
+                if miss_count > 0 and miss_pos_new is not None and miss_m is not None and miss_v is not None and miss_w is not None:
+                    rows_m_u[miss_pos_new] = miss_m[key]
+                    rows_v_u[miss_pos_new] = miss_v[key]
+                    rows_w_u[miss_pos_new] = miss_w[key]
 
-                new_cache_m[key] = rows_m
-                new_cache_v[key] = rows_v
-                new_cache_w[key] = rows_w
+                new_cache_m[key] = rows_m_u
+                new_cache_v[key] = rows_v_u
+                new_cache_w[key] = rows_w_u
 
             self._cache_U = U_cpu.clone()
             self._cache_m = new_cache_m
@@ -207,22 +222,34 @@ class VocabRowAdamW:
                 "miss_count": miss_count,
                 "evict_count": evict_count,
                 "flush_wait_ms": float(flush_info.get("wait_s", 0.0)) * 1000.0,
+                "cpu_gather_ms": float(miss_fetch_stats.get("cpu_gather_s", 0.0)) * 1000.0,
+                "h2d_ms": float(miss_fetch_stats.get("h2d_s", 0.0)) * 1000.0,
             }
             return self._cache_m, self._cache_v, self._cache_w
 
         U_size = U_step.numel()
+        t_gather0 = time.time()
         for key in self._pin_m:
             torch.index_select(self._m[key],  0, U_step, out=self._pin_m[key][:U_size])
             torch.index_select(self._v[key],  0, U_step, out=self._pin_v[key][:U_size])
             torch.index_select(tables[key],   0, U_step, out=self._pin_w[key][:U_size])
-        pm = {k: self._pin_m[k][:U_size].to(device, non_blocking=True) for k in self._pin_m}
-        pv = {k: self._pin_v[k][:U_size].to(device, non_blocking=True) for k in self._pin_v}
-        pw = {k: self._pin_w[k][:U_size].to(device, non_blocking=True) for k in self._pin_w}
+        t_gather1 = time.time()
+        pm: dict[str, torch.Tensor] = {}
+        pv: dict[str, torch.Tensor] = {}
+        pw: dict[str, torch.Tensor] = {}
+        for key in self._pin_pack:
+            pack_gpu = self._pin_pack[key][:, :U_size].to(device, non_blocking=True)
+            pm[key] = pack_gpu[0]
+            pv[key] = pack_gpu[1]
+            pw[key] = pack_gpu[2]
+        t_h2d1 = time.time()
         self.last_prefetch_stats = {
             "hit_count": 0,
             "miss_count": int(U_size),
             "evict_count": 0,
             "flush_wait_ms": 0.0,
+            "cpu_gather_ms": (t_gather1 - t_gather0) * 1000.0,
+            "h2d_ms": (t_h2d1 - t_gather1) * 1000.0,
         }
         return pm, pv, pw
 
@@ -231,6 +258,7 @@ class VocabRowAdamW:
         out_m: dict[str, torch.Tensor] = {}
         out_v: dict[str, torch.Tensor] = {}
         out_w: dict[str, torch.Tensor] = {}
+        t_gather0 = time.time()
 
         for key in self._pin_m:
             if self._overlap_cache:
@@ -242,12 +270,21 @@ class VocabRowAdamW:
                 torch.index_select(self._m[key], 0, ids_cpu, out=self._pin_m[key][:n_rows])
                 torch.index_select(self._v[key], 0, ids_cpu, out=self._pin_v[key][:n_rows])
             torch.index_select(tables[key], 0, ids_cpu, out=self._pin_w[key][:n_rows])
-            out_m[key] = self._pin_m[key][:n_rows].to(device, non_blocking=True)
-            out_v[key] = self._pin_v[key][:n_rows].to(device, non_blocking=True)
-            out_w[key] = self._pin_w[key][:n_rows].to(device, non_blocking=True)
+        t_gather1 = time.time()
+
+        for key in self._pin_pack:
+            pack_gpu = self._pin_pack[key][:, :n_rows].to(device, non_blocking=True)
+            out_m[key] = pack_gpu[0]
+            out_v[key] = pack_gpu[1]
+            out_w[key] = pack_gpu[2]
+        t_h2d1 = time.time()
 
         if self._overlap_cache and self._last_seen_step.numel() > 0:
             self._last_seen_step[ids_cpu] = self._t
+        self._last_fetch_rows_stats = {
+            "cpu_gather_s": (t_gather1 - t_gather0),
+            "h2d_s": (t_h2d1 - t_gather1),
+        }
         return out_m, out_v, out_w
 
     def _write_back_evicted(self, evict_ids: torch.Tensor, evict_pos_cpu: torch.Tensor, tables: dict) -> None:

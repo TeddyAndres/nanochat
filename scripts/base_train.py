@@ -825,6 +825,8 @@ while True:
     sparse_prefetch_miss = 0
     sparse_prefetch_evict = 0
     t_phase_flush_wait = 0.0
+    t_phase_prefetch_gather = 0.0
+    t_phase_prefetch_h2d = 0.0
     if args.sparse_mode:
         profile_this_step = args.sparse_profile and (step % max(args.sparse_profile_every, 1) == 0)
         profile_sync = profile_this_step and args.sparse_profile_sync and device_type == "cuda"
@@ -932,6 +934,8 @@ while True:
             sparse_prefetch_miss = int(prefetch_stats.get("miss_count", 0))
             sparse_prefetch_evict = int(prefetch_stats.get("evict_count", 0))
             t_phase_flush_wait += float(prefetch_stats.get("flush_wait_ms", 0.0)) / 1000.0
+            t_phase_prefetch_gather += float(prefetch_stats.get("cpu_gather_ms", 0.0)) / 1000.0
+            t_phase_prefetch_h2d += float(prefetch_stats.get("h2d_ms", 0.0)) / 1000.0
         else:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
         if profile_sync:
@@ -1204,6 +1208,7 @@ while True:
             f" remap={t_phase_remap*1000:.1f} fwdbwd={t_phase_fwdbwd*1000:.1f}"
             f" dense_step={t_phase_dense_step*1000:.1f} vocab_step={t_phase_vocab_step*1000:.1f}"
             f" flush_wait={t_phase_flush_wait*1000:.1f}"
+            f" pf_g/h2d={t_phase_prefetch_gather*1000:.1f}/{t_phase_prefetch_h2d*1000:.1f}"
             f" hm/ev={sparse_prefetch_hit}/{sparse_prefetch_miss}/{sparse_prefetch_evict}"
             f" gap={max(dt - t_known, 0.0)*1000:.1f}"
         )
