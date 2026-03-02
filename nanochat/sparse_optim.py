@@ -157,22 +157,28 @@ class VocabRowAdamW:
             if miss_count > 0:
                 miss_m, miss_v, miss_w = self._fetch_rows_from_cpu(miss_ids, device, tables)
 
+            old_cache_m = self._cache_m
+            old_cache_v = self._cache_v
+            old_cache_w = self._cache_w
             new_cache_m: dict[str, torch.Tensor] = {}
             new_cache_v: dict[str, torch.Tensor] = {}
             new_cache_w: dict[str, torch.Tensor] = {}
 
             for key in self._pin_m:
-                dim = self._cache_m[key].size(1)
-                rows_m = torch.empty((U_size, dim), device=device, dtype=torch.float32)
-                rows_v = torch.empty((U_size, dim), device=device, dtype=torch.float32)
-                rows_w = torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                dim = old_cache_m[key].size(1)
+                prev_m = old_cache_m.get(key)
+                prev_v = old_cache_v.get(key)
+                prev_w = old_cache_w.get(key)
+                rows_m = prev_m if (prev_m is not None and prev_m.size(0) == U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_v = prev_v if (prev_v is not None and prev_v.size(0) == U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
+                rows_w = prev_w if (prev_w is not None and prev_w.size(0) == U_size) else torch.empty((U_size, dim), device=device, dtype=torch.float32)
 
                 if hit_count > 0:
                     hit_pos_new = torch.nonzero(hit_mask, as_tuple=False).squeeze(-1)
                     hit_pos_old = new_pos_in_old[hit_mask]
-                    rows_m[hit_pos_new] = self._cache_m[key][hit_pos_old]
-                    rows_v[hit_pos_new] = self._cache_v[key][hit_pos_old]
-                    rows_w[hit_pos_new] = self._cache_w[key][hit_pos_old]
+                    rows_m[hit_pos_new] = old_cache_m[key][hit_pos_old]
+                    rows_v[hit_pos_new] = old_cache_v[key][hit_pos_old]
+                    rows_w[hit_pos_new] = old_cache_w[key][hit_pos_old]
 
                 if miss_count > 0 and miss_m is not None and miss_v is not None and miss_w is not None:
                     miss_pos_new = torch.nonzero(miss_mask, as_tuple=False).squeeze(-1)

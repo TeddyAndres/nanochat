@@ -108,12 +108,13 @@ parser.add_argument("--sparse-fp32", action="store_true", help="disable autocast
 parser.add_argument("--no-sparse-compile", action="store_true", help="disable torch.compile(dynamic=True) for sparse mode")
 parser.add_argument("--sparse-optimizer-device", type=str, choices=["auto", "cpu", "cuda"], default="auto", help="device for sparse vocab optimizer arithmetic: auto uses current training device, cpu/cuda force a specific backend")
 parser.add_argument("--sparse-cuda-deferred-writeback", action="store_true", help="enable deferred CUDA D2H writeback in sparse vocab optimizer")
+parser.add_argument("--no-sparse-cuda-deferred-writeback", action="store_true", help="disable deferred CUDA D2H writeback in sparse vocab optimizer (forces synchronous writeback)")
 parser.add_argument("--no-sparse-overlap-cache", action="store_true", help="disable overlap cache that keeps intersecting U_step rows resident on GPU between sparse steps")
 parser.add_argument("--sparse-untied-lm-head", action="store_true", help="keep lm_head untied in sparse mode (default is tied)")
 parser.add_argument("--sparse-profile", action="store_true", help="print sparse phase timings every N steps")
 parser.add_argument("--sparse-profile-every", type=int, default=20, help="emit sparse phase timings every N steps when --sparse-profile is enabled")
 parser.add_argument("--sparse-profile-sync", action="store_true", help="synchronize CUDA around profiled sparse phases for attribution accuracy")
-parser.add_argument("--sparse-logit-chunk-size", type=int, default=4096, help="number of token positions processed per sparse logit chunk during training")
+parser.add_argument("--sparse-logit-chunk-size", type=int, default=2048, help="number of token positions processed per sparse logit chunk during training")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -463,6 +464,11 @@ if args.sparse_mode:
     if sparse_optimizer_device == "cuda" and device_type != "cuda":
         print0("Requested --sparse-optimizer-device=cuda without CUDA runtime; falling back to cpu")
         sparse_optimizer_device = "cpu"
+    defer_writeback = args.sparse_cuda_deferred_writeback
+    if sparse_optimizer_device == "cuda" and not args.no_sparse_cuda_deferred_writeback:
+        if not defer_writeback:
+            print0("Sparse mode: auto-enabling deferred CUDA writeback (use --no-sparse-cuda-deferred-writeback to opt out)")
+        defer_writeback = True
 
     vocab_optimizer = VocabRowAdamW(
         tables=vocab_tables,
@@ -471,12 +477,12 @@ if args.sparse_mode:
         eps=1e-10,
         weight_decay=0.0,  # embedding rows are not weight-decayed
         device=sparse_optimizer_device,
-        defer_writeback=args.sparse_cuda_deferred_writeback,
+        defer_writeback=defer_writeback,
         overlap_cache=not args.no_sparse_overlap_cache,
     )
     print0(
         f"VocabRowAdamW: {len(vocab_tables)} tables, vocab_size={vocab_size:,}, "
-        f"device={sparse_optimizer_device}, deferred_writeback={args.sparse_cuda_deferred_writeback}, "
+        f"device={sparse_optimizer_device}, deferred_writeback={defer_writeback}, "
         f"overlap_cache={not args.no_sparse_overlap_cache}"
     )
     print0(

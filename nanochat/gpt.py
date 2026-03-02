@@ -588,7 +588,7 @@ class GPT(nn.Module):
                 loss_flat = torch.empty_like(flat_targets, dtype=torch.float32)
                 for start in range(0, flat_x.size(0), chunk_size):
                     end = min(start + chunk_size, flat_x.size(0))
-                    logits_chunk = (flat_x[start:end] @ W_U_lm_head.T).float()
+                    logits_chunk = flat_x[start:end] @ W_U_lm_head.T
                     logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
                     #logits_chunk = logits_chunk.clamp_(-25.0, 25.0)
                     loss_flat[start:end] = F.cross_entropy(
@@ -601,7 +601,7 @@ class GPT(nn.Module):
             loss_sum = x.new_zeros((), dtype=torch.float32)
             for start in range(0, flat_x.size(0), chunk_size):
                 end = min(start + chunk_size, flat_x.size(0))
-                logits_chunk = (flat_x[start:end] @ W_U_lm_head.T).float()
+                logits_chunk = flat_x[start:end] @ W_U_lm_head.T
                 logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
                 loss_sum = loss_sum + F.cross_entropy(
                     logits_chunk, flat_targets[start:end],
