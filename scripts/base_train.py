@@ -174,6 +174,7 @@ parser.add_argument("--sparse-profile-every", type=int, default=20, help="emit s
 parser.add_argument("--sparse-profile-sync", action="store_true", help="synchronize CUDA around profiled sparse phases for attribution accuracy")
 parser.add_argument("--sparse-loss-sync-every", type=int, default=0, help="materialize sparse train loss every N sparse steps (0 disables periodic sync; still syncs for profile/log checkpoints)")
 parser.add_argument("--sparse-log-row-norms", action="store_true", help="log sparse per-table grad/update row norms (adds extra GPU sync on logging steps)")
+parser.add_argument("--sparse-exact-u-ratchet", action="store_true", help="ratchet sparse row-table capacity to running max U and pad smaller steps to that capacity")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=2048, help="number of token positions processed per sparse logit chunk during training")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -695,6 +696,10 @@ if args.sparse_mode:
 else:
     use_sparse_step_prefetch = False
 
+sparse_u_capacity = 0
+if args.sparse_mode and args.sparse_exact_u_ratchet:
+    print0("Sparse mode: enabling exact U ratchet (row-table capacity grows to running max U_step)")
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -864,6 +869,7 @@ while True:
         # Clamp to prevent overflow when U_size_log is very small
         log_correction_f = math.log(model_config.vocab_size) - math.log(max(U_size_log, 1))
         log_correction_t = torch.tensor(log_correction_f, dtype=torch.float32, device=device)
+        active_u_size_t = torch.tensor(U_size_log, dtype=torch.long, device=device)
 
         optimizer_uses_cuda = vocab_optimizer is not None and getattr(vocab_optimizer, "_device", device_type) == "cuda"
         optimizer_overlap_cache = optimizer_uses_cuda and bool(getattr(vocab_optimizer, "_overlap_cache", False))
@@ -878,29 +884,39 @@ while True:
             vocab_optimizer.flush_pending_writes()
 
         U_size = U_step.numel()
+        if args.sparse_exact_u_ratchet:
+            if U_size > sparse_u_capacity:
+                sparse_u_capacity = U_size
+            U_capacity = sparse_u_capacity
+        else:
+            U_capacity = U_size
         sparse_row_dtype = torch.float32 if args.sparse_fp32 else torch.bfloat16
+        def _to_model_rows(active_rows_gpu: torch.Tensor):
+            active_rows = active_rows_gpu.to(dtype=sparse_row_dtype)
+            if U_capacity == U_size:
+                rows_gpu = active_rows
+            else:
+                rows_gpu = torch.zeros((U_capacity, active_rows.size(1)), device=device, dtype=sparse_row_dtype)
+                rows_gpu[:U_size].copy_(active_rows)
+            rows_gpu.requires_grad_(True)
+            # In ratchet mode we intentionally keep this dim static between growth events.
+            if sparse_compile_enabled and (not args.sparse_exact_u_ratchet):
+                torch._dynamo.mark_dynamic(rows_gpu, 0)
+            return rows_gpu
+
         def _fetch_rows(master_w, pin_buf=None):
             if pin_buf is not None:
                 # Write gathered rows directly into pre-allocated pinned memory
                 # (one CPU copy instead of two; no per-step pinned allocation).
                 torch.index_select(master_w, 0, U_step, out=pin_buf[:U_size])
-                rows_gpu = pin_buf[:U_size].to(device, dtype=sparse_row_dtype, non_blocking=True)
+                rows_gpu = pin_buf[:U_size].to(device, non_blocking=True)
             else:
                 rows_cpu = master_w.index_select(0, U_step)      # CPU (pageable)
-                rows_gpu = rows_cpu.pin_memory().to(device, dtype=sparse_row_dtype, non_blocking=True)
-            rows_gpu.requires_grad_(True)
-            # Tell Dynamo that dim 0 (|U_step|) varies across steps so it never
-            # places a static size guard on it — prevents recompilation every step.
-            if sparse_compile_enabled:
-                torch._dynamo.mark_dynamic(rows_gpu, 0)
-            return rows_gpu
+                rows_gpu = rows_cpu.pin_memory().to(device, non_blocking=True)
+            return _to_model_rows(rows_gpu)
 
         def _rows_from_prefetched(prefetched_rows):
-            rows_gpu = prefetched_rows.to(dtype=sparse_row_dtype)
-            rows_gpu.requires_grad_(True)
-            if sparse_compile_enabled:
-                torch._dynamo.mark_dynamic(rows_gpu, 0)
-            return rows_gpu
+            return _to_model_rows(prefetched_rows)
 
         # ---- 3b. H2D: prefetch active _m/_v/weight rows for GPU-side Adam. ----
         # Uses pre-allocated pinned buffers inside VocabRowAdamW; fires all H2D
@@ -969,6 +985,7 @@ while True:
                 "W_U_wte":        W_U_wte,
                 "W_U_ve":         W_U_ve,
                 "W_U_lm_head":    W_U_lm_head,
+                "active_u_size_t": active_u_size_t,
                 "local_idx":      mb_local_idx_gpu[i_mb],
                 "local_targets":  mb_local_tgt_gpu[i_mb],
                 "log_correction": log_correction_t,
@@ -1111,11 +1128,13 @@ while True:
             vocab_grad_max_t = torch.stack([g.norm(dim=-1).amax() for g in vocab_grads.values()]).amax()
             sparse_grad_norms = {k: float(g.norm(dim=-1).amax().item()) for k, g in vocab_grads.items()}
 
+        vocab_grads_step = {k: g[:U_size] for k, g in vocab_grads.items()}
+
         t_vocab_step0 = time.time()
         if profile_sync:
             torch.cuda.synchronize()
         vocab_update_norms = vocab_optimizer.step(
-            U_step, vocab_grads, vocab_tables, lr_multiplier=lrm,
+            U_step, vocab_grads_step, vocab_tables, lr_multiplier=lrm,
             prefetched_m=prefetched_m_gpu,
             prefetched_v=prefetched_v_gpu,
             prefetched_w=prefetched_w_gpu,
@@ -1204,6 +1223,8 @@ while True:
         }
         if args.sparse_mode:
             log_data["sparse/U_step_size"] = U_size_log
+            if args.sparse_exact_u_ratchet:
+                log_data["sparse/U_capacity"] = sparse_u_capacity
             log_data["sparse/log_correction"] = log_correction_f
             log_data["sparse/local_ce_avg_mb"] = local_train_loss_f  # avg across all micro-batches
             if collect_sparse_table_metrics and vocab_grad_max_t is not None:

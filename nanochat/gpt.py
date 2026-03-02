@@ -549,6 +549,11 @@ class GPT(nn.Module):
             local_targets  = sparse_context["local_targets"]
             log_correction = sparse_context["log_correction"]  # () float32 GPU scalar
             logit_chunk_size = int(sparse_context.get("logit_chunk_size", 4096))
+            active_u_size_t = sparse_context.get("active_u_size_t", None)
+            if active_u_size_t is None:
+                active_u_size_t = torch.tensor(W_U_lm_head.size(0), device=W_U_lm_head.device, dtype=torch.long)
+            active_u_size_t = active_u_size_t.to(device=W_U_lm_head.device, dtype=torch.long)
+            vocab_pad_mask = torch.arange(W_U_lm_head.size(0), device=W_U_lm_head.device, dtype=torch.long) >= active_u_size_t
 
             x = F.embedding(local_idx, W_U_wte)
         else:
@@ -590,6 +595,7 @@ class GPT(nn.Module):
                     end = min(start + chunk_size, flat_x.size(0))
                     logits_chunk = flat_x[start:end] @ W_U_lm_head.T
                     logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                    logits_chunk = logits_chunk.masked_fill(vocab_pad_mask.unsqueeze(0), -1e9)
                     #logits_chunk = logits_chunk.clamp_(-25.0, 25.0)
                     loss_flat[start:end] = F.cross_entropy(
                         logits_chunk, flat_targets[start:end],
@@ -603,6 +609,7 @@ class GPT(nn.Module):
                 end = min(start + chunk_size, flat_x.size(0))
                 logits_chunk = flat_x[start:end] @ W_U_lm_head.T
                 logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                logits_chunk = logits_chunk.masked_fill(vocab_pad_mask.unsqueeze(0), -1e9)
                 loss_sum = loss_sum + F.cross_entropy(
                     logits_chunk, flat_targets[start:end],
                     ignore_index=-1, reduction='sum',
