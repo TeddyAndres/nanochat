@@ -161,6 +161,7 @@ parser.add_argument("--sparse-mode", action="store_true", help="enable dynamic l
 parser.add_argument("--sparse-ddp-union", action="store_true", help="when sparse mode is enabled, synchronize local token sets across DDP ranks")
 parser.add_argument("--tie-embeddings", action="store_true", help="tie wte and lm_head weights (recommended for sparse mode)")
 parser.add_argument("--no-sparse-prefetch", action="store_true", help="disable AsyncBatchPrefetcher in sparse mode")
+parser.add_argument("--sparse-step-prefetch-depth", type=int, default=16, help="queue depth (in sparse steps) for AsyncSparseStepPrefetcher")
 parser.add_argument("--sparse-extra-negatives", type=int, default=0, help="number of random non-batch token rows to add to U_step each sparse step (0 = disable)")
 parser.add_argument("--sparse-fp32", action="store_true", help="disable autocast in sparse mode to avoid bf16 gradient underflow")
 parser.add_argument("--no-sparse-compile", action="store_true", help="disable torch.compile(dynamic=True) for sparse mode")
@@ -172,7 +173,7 @@ parser.add_argument("--sparse-untied-lm-head", action="store_true", help="keep l
 parser.add_argument("--sparse-profile", action="store_true", help="print sparse phase timings every N steps")
 parser.add_argument("--sparse-profile-every", type=int, default=20, help="emit sparse phase timings every N steps when --sparse-profile is enabled")
 parser.add_argument("--sparse-profile-sync", action="store_true", help="synchronize CUDA around profiled sparse phases for attribution accuracy")
-parser.add_argument("--sparse-loss-sync-every", type=int, default=0, help="materialize sparse train loss every N sparse steps (0 disables periodic sync; still syncs for profile/log checkpoints)")
+parser.add_argument("--sparse-loss-sync-every", type=int, default=1, help="materialize sparse train loss every N sparse steps (set 0 to disable periodic sync; still syncs for profile/log checkpoints)")
 parser.add_argument("--sparse-log-row-norms", action="store_true", help="log sparse per-table grad/update row norms (adds extra GPU sync on logging steps)")
 parser.add_argument("--sparse-exact-u-ratchet", action="store_true", help="ratchet sparse row-table capacity to running max U and pad smaller steps to that capacity")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=2048, help="number of token positions processed per sparse logit chunk during training")
@@ -208,11 +209,38 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
-user_config = vars(args).copy()  # for logging
 
 if args.sparse_mode and (not args.tie_embeddings) and (not args.sparse_untied_lm_head):
     args.tie_embeddings = True
     print("Sparse mode: auto-enabling --tie-embeddings (use --sparse-untied-lm-head to opt out)")
+
+# Sparse mode default calibration.
+# Legacy dense defaults (embedding_lr=0.05, tied_embedding_lr=0.028, etc.) are
+# too aggressive for row-sparse vocab updates and can cause early loss plateaus.
+# When the user enables sparse mode and leaves all sparse-vocab optimizer knobs
+# at their parser defaults, switch to calibrated sparse-safe defaults.
+def _using_default(name: str) -> bool:
+    return getattr(args, name) == parser.get_default(name)
+
+if args.sparse_mode:
+    sparse_lr_defaults_untouched = (
+        _using_default("embedding_lr")
+        and _using_default("tied_embedding_lr")
+        and _using_default("unembedding_lr")
+        and args.value_embed_lr is None
+    )
+    if sparse_lr_defaults_untouched:
+        args.embedding_lr = 0.05
+        args.tied_embedding_lr = 0.05
+        args.unembedding_lr = 0.05
+        args.value_embed_lr = 0.006
+        print(
+            "Sparse mode: applying calibrated vocab LR defaults "
+            "(wte/tied/unembed=0.05, value_embed=0.006)."
+        )
+    if _using_default("vocab_max_grad_norm"):
+        args.vocab_max_grad_norm = 0.3
+        print("Sparse mode: applying default per-row vocab grad clip --vocab-max-grad-norm=0.3")
 
 # SDPA fallback (no FA3) performs poorly with alternating sliding-window patterns.
 # Keep user CLI overrides intact, but choose a faster default on non-FA3 systems.
@@ -221,6 +249,7 @@ if (not HAS_FA3
     and args.window_pattern != "L"):
     args.window_pattern = "L"
     print(f"No Flash Attention 3 detected: auto-adjusting --window-pattern to '{args.window_pattern}' (override with CLI flag)")
+user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -546,6 +575,7 @@ if args.sparse_mode:
         f"device={sparse_optimizer_device}, deferred_writeback={defer_writeback}, "
         f"overlap_cache={not args.no_sparse_overlap_cache}"
     )
+    print0("VocabRowAdamW math/state dtype: fp32 (grads may arrive bf16; upcast before Adam update)")
     print0(
         f"Sparse table LRs (scaled): wte={vocab_emb_lr:.6g}, "
         f"lm_head={'tied@' + format(vocab_tied_lr, '.6g') if model_config.tie_embeddings else f'{vocab_unemb_lr:.6g}'}, "
@@ -690,7 +720,7 @@ if args.sparse_mode:
             train_loader,
             grad_accum_steps=grad_accum_steps,
             initial_batch=first_sparse_batch,
-            max_prefetch=max(8, grad_accum_steps * 2),
+            max_prefetch=max(args.sparse_step_prefetch_depth, grad_accum_steps * 2),
         )
         use_sparse_step_prefetch = True
 else:
@@ -825,8 +855,6 @@ while True:
     sparse_prefetch_miss = 0
     sparse_prefetch_evict = 0
     t_phase_flush_wait = 0.0
-    t_phase_prefetch_gather = 0.0
-    t_phase_prefetch_h2d = 0.0
     if args.sparse_mode:
         profile_this_step = args.sparse_profile and (step % max(args.sparse_profile_every, 1) == 0)
         profile_sync = profile_this_step and args.sparse_profile_sync and device_type == "cuda"
@@ -934,8 +962,6 @@ while True:
             sparse_prefetch_miss = int(prefetch_stats.get("miss_count", 0))
             sparse_prefetch_evict = int(prefetch_stats.get("evict_count", 0))
             t_phase_flush_wait += float(prefetch_stats.get("flush_wait_ms", 0.0)) / 1000.0
-            t_phase_prefetch_gather += float(prefetch_stats.get("cpu_gather_ms", 0.0)) / 1000.0
-            t_phase_prefetch_h2d += float(prefetch_stats.get("h2d_ms", 0.0)) / 1000.0
         else:
             prefetched_m_gpu = prefetched_v_gpu = prefetched_w_gpu = None
         if profile_sync:
@@ -1208,7 +1234,6 @@ while True:
             f" remap={t_phase_remap*1000:.1f} fwdbwd={t_phase_fwdbwd*1000:.1f}"
             f" dense_step={t_phase_dense_step*1000:.1f} vocab_step={t_phase_vocab_step*1000:.1f}"
             f" flush_wait={t_phase_flush_wait*1000:.1f}"
-            f" pf_g/h2d={t_phase_prefetch_gather*1000:.1f}/{t_phase_prefetch_h2d*1000:.1f}"
             f" hm/ev={sparse_prefetch_hit}/{sparse_prefetch_miss}/{sparse_prefetch_evict}"
             f" gap={max(dt - t_known, 0.0)*1000:.1f}"
         )
