@@ -23,8 +23,49 @@ def _get_valid_targets_and_num_bytes(targets, token_bytes):
     return targets_safe, num_bytes, valid
 
 
+def _can_chunk_logits(model):
+    return hasattr(model, "forward_features") and hasattr(model, "compute_logits")
+
+
+def _accumulate_bpb_and_ece_from_logits(logits, targets, token_bytes, total_nats, total_bytes, bin_counts, bin_confidence_sums, bin_correct_sums):
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+    if valid.any():
+        flat_logits = flat_logits[valid]
+        targets_safe = targets_safe[valid]
+        num_bytes = num_bytes[valid]
+        log_denom = torch.logsumexp(flat_logits, dim=-1)
+        target_logits = flat_logits.gather(1, targets_safe.unsqueeze(1)).squeeze(1)
+        total_nats += (log_denom - target_logits).sum()
+        total_bytes += num_bytes.sum()
+
+        max_logits, predictions = flat_logits.max(dim=-1)
+        confidences = torch.exp(max_logits - log_denom)
+        correctness = (predictions == targets_safe).to(torch.float64)
+        num_bins = bin_counts.numel()
+        bin_indices = torch.clamp((confidences * num_bins).to(torch.long), max=num_bins - 1)
+        bin_counts += torch.bincount(bin_indices, minlength=num_bins).to(torch.float64)
+        bin_confidence_sums += torch.bincount(bin_indices, weights=confidences.to(torch.float64), minlength=num_bins)
+        bin_correct_sums += torch.bincount(bin_indices, weights=correctness, minlength=num_bins)
+
+
+def _accumulate_bpb_from_logits(logits, targets, token_bytes, total_nats, total_bytes):
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+    if valid.any():
+        flat_logits = flat_logits[valid]
+        targets_safe = targets_safe[valid]
+        num_bytes = num_bytes[valid]
+        log_denom = torch.logsumexp(flat_logits, dim=-1)
+        target_logits = flat_logits.gather(1, targets_safe.unsqueeze(1)).squeeze(1)
+        total_nats += (log_denom - target_logits).sum()
+        total_bytes += num_bytes.sum()
+
+
 @torch.no_grad()
-def evaluate_bpb_and_ece(model, batches, steps, token_bytes, num_bins=15, token_chunk_size=4096):
+def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64, num_bins=15):
     """
     Evaluate validation bits-per-byte and token-level expected calibration error.
 
@@ -41,35 +82,37 @@ def evaluate_bpb_and_ece(model, batches, steps, token_bytes, num_bins=15, token_
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        logits = model(x)
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = y.view(-1)
-        targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
-
-        for start in range(0, flat_targets.numel(), token_chunk_size):
-            end = min(start + token_chunk_size, flat_targets.numel())
-            chunk_valid = valid[start:end]
-            if not chunk_valid.any():
-                continue
-
-            chunk_logits = flat_logits[start:end][chunk_valid]
-            chunk_targets = targets_safe[start:end][chunk_valid]
-            chunk_num_bytes = num_bytes[start:end][chunk_valid]
-
-            log_denom = torch.logsumexp(chunk_logits, dim=-1)
-            target_logits = chunk_logits.gather(1, chunk_targets.unsqueeze(1)).squeeze(1)
-            total_nats += (log_denom - target_logits).sum()
-            total_bytes += chunk_num_bytes.sum()
-
-            max_logits, predictions = chunk_logits.max(dim=-1)
-            confidences = torch.exp(max_logits - log_denom)
-            correctness = (predictions == chunk_targets).to(torch.float64)
-            bin_indices = torch.clamp((confidences * num_bins).to(torch.long), max=num_bins - 1)
-            bin_counts += torch.bincount(bin_indices, minlength=num_bins).to(torch.float64)
-            bin_confidence_sums += torch.bincount(bin_indices, weights=confidences.to(torch.float64), minlength=num_bins)
-            bin_correct_sums += torch.bincount(bin_indices, weights=correctness, minlength=num_bins)
-
-        del logits
+        if _can_chunk_logits(model):
+            features = model.forward_features(x)
+            for start in range(0, x.size(1), token_chunk_size):
+                end = min(start + token_chunk_size, x.size(1))
+                logits = model.compute_logits(features[:, start:end])
+                _accumulate_bpb_and_ece_from_logits(
+                    logits,
+                    y[:, start:end],
+                    token_bytes,
+                    total_nats,
+                    total_bytes,
+                    bin_counts,
+                    bin_confidence_sums,
+                    bin_correct_sums,
+                )
+                del logits
+            del features
+        else:
+            logits = model(x)
+            _accumulate_bpb_and_ece_from_logits(
+                logits,
+                y,
+                token_bytes,
+                total_nats,
+                total_bytes,
+                bin_counts,
+                bin_confidence_sums,
+                bin_correct_sums,
+            )
+            del logits
+        del x, y
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:
@@ -124,12 +167,23 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
-        loss2d = loss2d.view(-1) # flatten
-        y = y.view(-1) # flatten
-        _, num_bytes2d, valid = _get_valid_targets_and_num_bytes(y, token_bytes)
-        total_nats += (loss2d * valid).sum()
-        total_bytes += num_bytes2d.sum()
+        if _can_chunk_logits(model):
+            features = model.forward_features(x)
+            for start in range(0, x.size(1), 64):
+                end = min(start + 64, x.size(1))
+                logits = model.compute_logits(features[:, start:end])
+                _accumulate_bpb_from_logits(logits, y[:, start:end], token_bytes, total_nats, total_bytes)
+                del logits
+            del features
+        else:
+            loss2d = model(x, y, loss_reduction='none') # (B, T)
+            loss2d = loss2d.view(-1) # flatten
+            y = y.view(-1) # flatten
+            _, num_bytes2d, valid = _get_valid_targets_and_num_bytes(y, token_bytes)
+            total_nats += (loss2d * valid).sum()
+            total_bytes += num_bytes2d.sum()
+            del loss2d
+        del x, y
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:

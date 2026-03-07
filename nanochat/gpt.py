@@ -393,7 +393,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward_features(self, idx, kv_cache=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -414,13 +414,20 @@ class GPT(nn.Module):
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
+        return x
 
+    def compute_logits(self, x):
         # Forward the lm_head (compute logits)
         softcap = 20 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        return logits
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        x = self.forward_features(idx, kv_cache=kv_cache)
+        logits = self.compute_logits(x)
 
         if targets is not None:
             # training: given the targets, compute and return the loss

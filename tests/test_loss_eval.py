@@ -33,6 +33,14 @@ class DummyEvalModel(torch.nn.Module):
         return loss
 
 
+class ChunkedEvalModel(DummyEvalModel):
+    def forward_features(self, idx, kv_cache=None):
+        return self._logits[:idx.size(0), :idx.size(1)]
+
+    def compute_logits(self, x):
+        return x
+
+
 def test_evaluate_bpb_and_ece_perfectly_calibrated_bucket():
     conf = 0.8
     other = 0.2
@@ -70,3 +78,40 @@ def test_evaluate_bpb_and_ece_excludes_ignored_and_special_tokens():
     assert math.isclose(bpb, expected_bpb, rel_tol=1e-6)
     assert math.isclose(legacy_bpb, expected_bpb, rel_tol=1e-6)
     assert math.isclose(ece, 1.0 - valid_conf, rel_tol=1e-6)
+
+
+def test_chunked_eval_path_matches_fallback_path():
+    torch.manual_seed(0)
+    logits = torch.randn(2, 7, 5, dtype=torch.float32)
+    targets = torch.tensor([
+        [0, 1, 2, 3, 4, -1, 1],
+        [4, 3, 2, 1, 0, 2, 3],
+    ], dtype=torch.long)
+    inputs = torch.zeros_like(targets)
+    token_bytes = torch.tensor([1, 1, 1, 0, 1], dtype=torch.int64)
+
+    fallback_model = DummyEvalModel(logits)
+    chunked_model = ChunkedEvalModel(logits)
+
+    fallback_bpb, fallback_ece = evaluate_bpb_and_ece(
+        fallback_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+        token_chunk_size=3,
+        num_bins=20,
+    )
+    chunked_bpb, chunked_ece = evaluate_bpb_and_ece(
+        chunked_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+        token_chunk_size=3,
+        num_bins=20,
+    )
+    fallback_bpb_only = evaluate_bpb(fallback_model, [(inputs, targets)], steps=1, token_bytes=token_bytes)
+    chunked_bpb_only = evaluate_bpb(chunked_model, [(inputs, targets)], steps=1, token_bytes=token_bytes)
+
+    assert math.isclose(chunked_bpb, fallback_bpb, rel_tol=1e-6)
+    assert math.isclose(chunked_ece, fallback_ece, rel_tol=1e-6)
+    assert math.isclose(chunked_bpb_only, fallback_bpb_only, rel_tol=1e-6)

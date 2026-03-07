@@ -382,6 +382,14 @@ def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
 
+def release_eval_memory():
+    """Drop cached eval allocations so training memory settles back down."""
+    if device_type == "cuda":
+        synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 @torch.no_grad()
 def compute_global_grad_norm(optimizer):
     """Compute the global L2 norm of the averaged gradient without mutating optimizer grads."""
@@ -438,8 +446,9 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
-            val_bpb, val_ece = evaluate_bpb_and_ece(model, val_loader, eval_steps, token_bytes)
+        with torch.inference_mode():
+            with disable_fp8(orig_model):
+                val_bpb, val_ece = evaluate_bpb_and_ece(orig_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} | ECE: {val_ece:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -451,6 +460,8 @@ while True:
             "val/ece": val_ece,
         })
         model.train()
+        del val_loader
+        release_eval_memory()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -458,8 +469,9 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        with torch.inference_mode():
+            with disable_fp8(orig_model):
+                results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -468,6 +480,7 @@ while True:
             "centered_results": results["centered_results"],
         })
         model.train()
+        release_eval_memory()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
@@ -485,10 +498,12 @@ while True:
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            with torch.inference_mode():
+                with disable_fp8(orig_model):
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
+        release_eval_memory()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
