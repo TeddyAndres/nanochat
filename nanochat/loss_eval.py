@@ -5,6 +5,100 @@ import math
 import torch
 import torch.distributed as dist
 
+
+def _get_valid_targets_and_num_bytes(targets, token_bytes):
+    """Return safe targets, byte counts, and a mask of valid non-special tokens."""
+    if (targets.int() < 0).any():  # mps does not currently have kernel for < 0 for int64, only int32
+        valid = targets >= 0
+        targets_safe = torch.where(valid, targets, torch.zeros_like(targets))
+    else:
+        valid = torch.ones_like(targets, dtype=torch.bool)
+        targets_safe = targets
+    num_bytes = torch.where(
+        valid,
+        token_bytes[targets_safe],
+        torch.zeros_like(targets, dtype=token_bytes.dtype),
+    )
+    valid = valid & (num_bytes > 0)
+    return targets_safe, num_bytes, valid
+
+
+@torch.no_grad()
+def evaluate_bpb_and_ece(model, batches, steps, token_bytes, num_bins=15, token_chunk_size=4096):
+    """
+    Evaluate validation bits-per-byte and token-level expected calibration error.
+
+    ECE is computed over next-token predictions using the same token masking semantics
+    as BPB: ignore_index targets and zero-byte special tokens are excluded.
+    """
+    device = model.get_device()
+    total_nats = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+    bin_counts = torch.zeros(num_bins, dtype=torch.float64, device=device)
+    bin_confidence_sums = torch.zeros(num_bins, dtype=torch.float64, device=device)
+    bin_correct_sums = torch.zeros(num_bins, dtype=torch.float64, device=device)
+
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y = next(batch_iter)
+        logits = model(x)
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_targets = y.view(-1)
+        targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+
+        for start in range(0, flat_targets.numel(), token_chunk_size):
+            end = min(start + token_chunk_size, flat_targets.numel())
+            chunk_valid = valid[start:end]
+            if not chunk_valid.any():
+                continue
+
+            chunk_logits = flat_logits[start:end][chunk_valid]
+            chunk_targets = targets_safe[start:end][chunk_valid]
+            chunk_num_bytes = num_bytes[start:end][chunk_valid]
+
+            log_denom = torch.logsumexp(chunk_logits, dim=-1)
+            target_logits = chunk_logits.gather(1, chunk_targets.unsqueeze(1)).squeeze(1)
+            total_nats += (log_denom - target_logits).sum()
+            total_bytes += chunk_num_bytes.sum()
+
+            max_logits, predictions = chunk_logits.max(dim=-1)
+            confidences = torch.exp(max_logits - log_denom)
+            correctness = (predictions == chunk_targets).to(torch.float64)
+            bin_indices = torch.clamp((confidences * num_bins).to(torch.long), max=num_bins - 1)
+            bin_counts += torch.bincount(bin_indices, minlength=num_bins).to(torch.float64)
+            bin_confidence_sums += torch.bincount(bin_indices, weights=confidences.to(torch.float64), minlength=num_bins)
+            bin_correct_sums += torch.bincount(bin_indices, weights=correctness, minlength=num_bins)
+
+        del logits
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if world_size > 1:
+        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bin_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bin_confidence_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bin_correct_sums, op=dist.ReduceOp.SUM)
+
+    total_nats = total_nats.item()
+    total_bytes = total_bytes.item()
+    if total_bytes == 0:
+        return float('inf'), float('nan')
+
+    bpb = total_nats / (math.log(2) * total_bytes)
+
+    total_count = bin_counts.sum().item()
+    if total_count == 0:
+        ece = float('nan')
+    else:
+        nonzero = bin_counts > 0
+        avg_confidence = torch.zeros_like(bin_confidence_sums)
+        avg_accuracy = torch.zeros_like(bin_correct_sums)
+        avg_confidence[nonzero] = bin_confidence_sums[nonzero] / bin_counts[nonzero]
+        avg_accuracy[nonzero] = bin_correct_sums[nonzero] / bin_counts[nonzero]
+        ece = ((avg_accuracy[nonzero] - avg_confidence[nonzero]).abs() * (bin_counts[nonzero] / total_count)).sum().item()
+
+    return bpb, ece
+
 @torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
     """
@@ -33,24 +127,9 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         loss2d = model(x, y, loss_reduction='none') # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
-        if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32
-            # slightly more complex code path if some target tokens are ignore_index (e.g. -1)
-            # any target token < 0 is to be ignored: do NOT index token_bytes with negatives
-            valid = y >= 0
-            y_safe = torch.where(valid, y, torch.zeros_like(y))
-            # map valid targets to their byte length; ignored targets contribute 0 bytes
-            num_bytes2d = torch.where(
-                valid,
-                token_bytes[y_safe],
-                torch.zeros_like(y, dtype=token_bytes.dtype)
-            )
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
-            total_bytes += num_bytes2d.sum()
-        else:
-            # fast path: no ignored targets, safe to index directly
-            num_bytes2d = token_bytes[y]
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
-            total_bytes += num_bytes2d.sum()
+        _, num_bytes2d, valid = _get_valid_targets_and_num_bytes(y, token_bytes)
+        total_nats += (loss2d * valid).sum()
+        total_bytes += num_bytes2d.sum()
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:
