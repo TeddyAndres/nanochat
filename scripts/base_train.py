@@ -12,7 +12,11 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+if os.environ.get("NANOCHAT_ENABLE_EXPANDABLE_SEGMENTS", "0") == "1":
+    alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF", "")
+    if "expandable_segments" not in alloc_conf:
+        alloc_conf = f"{alloc_conf},expandable_segments:True" if alloc_conf else "expandable_segments:True"
+        os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
 import gc
 import json
 import time
@@ -70,6 +74,8 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
+parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="in sparse mode, call torch.cuda.empty_cache() every N steps after writeback (0 disables)")
+parser.add_argument("--sparse-max-reserved-mib", type=float, default=8192.0, help="in sparse mode, if current CUDA reserved memory exceeds this threshold after a step, trim the cache with torch.cuda.empty_cache() (0 disables)")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -102,6 +108,7 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+print0(f"PYTORCH_ALLOC_CONF: {os.environ.get('PYTORCH_ALLOC_CONF', '<unset>')}")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -738,6 +745,16 @@ while True:
         sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
         sparse_step_ctx = None
     model.zero_grad(set_to_none=True)
+    should_trim_sparse_cache = False
+    if (
+        args.sparse_mode and
+        device_type == "cuda"
+    ):
+        over_step_interval = args.sparse_empty_cache_every > 0 and ((step + 1) % args.sparse_empty_cache_every == 0)
+        over_reserved_limit = args.sparse_max_reserved_mib > 0 and torch.cuda.memory_reserved() > args.sparse_max_reserved_mib * 1024 * 1024
+        should_trim_sparse_cache = over_step_interval or over_reserved_limit
+        if should_trim_sparse_cache:
+            torch.cuda.empty_cache()
     if device_type == "cuda":
         assert step_gpu_end is not None
         step_gpu_end.record()
@@ -800,17 +817,17 @@ while True:
             f" | sync: {sparse_metrics.d2h_sync_ms:.2f}ms"
             f" | gpu: {step_gpu_ms:.2f}ms"
             f" | fw+bw: {fw_bw_gpu_ms:.2f}ms"
-            f" | dense_opt: {dense_opt_gpu_ms:.2f}ms"
+            f" | trunk_opt: {dense_opt_gpu_ms:.2f}ms"
             f" | sparse_tail_gpu: {sparse_tail_gpu_ms:.2f}ms"
             f" | host_gap: {host_gap_ms:.2f}ms"
             f" | item: {item_ms:.2f}ms"
             f" | train_mem: {step_peak_memory / 1024 / 1024:.2f}MiB"
             f" | resv_fw: {(fw_bw_memory_stats['reserved'] if fw_bw_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
-            f" | resv_opt: {(dense_opt_memory_stats['reserved'] if dense_opt_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
+            f" | resv_trunk_opt: {(dense_opt_memory_stats['reserved'] if dense_opt_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
             f" | resv: {step_memory_stats['reserved'] / 1024 / 1024:.2f}MiB"
             f" | peak_resv: {step_peak_reserved / 1024 / 1024:.2f}MiB"
             f" | drv_fw: {(fw_bw_memory_stats['driver_used'] if fw_bw_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
-            f" | drv_opt: {(dense_opt_memory_stats['driver_used'] if dense_opt_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
+            f" | drv_trunk_opt: {(dense_opt_memory_stats['driver_used'] if dense_opt_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
             f" | drv: {step_driver_used / 1024 / 1024:.2f}MiB"
         )
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
@@ -838,7 +855,7 @@ while True:
                 "train/sparse_optimizer_ms": sparse_metrics.optimizer_ms,
                 "train/gpu_step_ms": step_gpu_ms,
                 "train/gpu_fw_bw_ms": fw_bw_gpu_ms,
-                "train/gpu_dense_optimizer_ms": dense_opt_gpu_ms,
+                "train/gpu_trunk_optimizer_ms": dense_opt_gpu_ms,
                 "train/gpu_sparse_tail_ms": sparse_tail_gpu_ms,
                 "train/host_gap_ms": host_gap_ms,
                 "train/loss_item_ms": item_ms,
@@ -853,10 +870,11 @@ while True:
                 "train/cuda_reserved_mib": step_memory_stats["reserved"] / 1024 / 1024,
                 "train/cuda_peak_reserved_mib": step_peak_reserved / 1024 / 1024,
                 "train/cuda_driver_used_mib": step_driver_used / 1024 / 1024,
+                "train/sparse_cache_trimmed": float(should_trim_sparse_cache),
                 "train/cuda_fw_bw_reserved_mib": 0.0 if fw_bw_memory_stats is None else fw_bw_memory_stats["reserved"] / 1024 / 1024,
                 "train/cuda_fw_bw_driver_used_mib": 0.0 if fw_bw_memory_stats is None else fw_bw_memory_stats["driver_used"] / 1024 / 1024,
-                "train/cuda_dense_opt_reserved_mib": 0.0 if dense_opt_memory_stats is None else dense_opt_memory_stats["reserved"] / 1024 / 1024,
-                "train/cuda_dense_opt_driver_used_mib": 0.0 if dense_opt_memory_stats is None else dense_opt_memory_stats["driver_used"] / 1024 / 1024,
+                "train/cuda_trunk_opt_reserved_mib": 0.0 if dense_opt_memory_stats is None else dense_opt_memory_stats["reserved"] / 1024 / 1024,
+                "train/cuda_trunk_opt_driver_used_mib": 0.0 if dense_opt_memory_stats is None else dense_opt_memory_stats["driver_used"] / 1024 / 1024,
             })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm
@@ -887,7 +905,7 @@ while True:
 print0(f"Peak memory usage: {peak_memory_usage / 1024 / 1024:.2f}MiB")
 print0(f"Peak training-step memory usage: {peak_training_memory_usage / 1024 / 1024:.2f}MiB")
 print0(f"Peak training-step reserved memory usage: {peak_training_reserved_memory_usage / 1024 / 1024:.2f}MiB")
-print0(f"Peak training-step driver memory usage: {peak_training_driver_memory_usage / 1024 / 1024:.2f}MiB")
+print0(f"Peak post-step driver memory usage: {peak_training_driver_memory_usage / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
@@ -920,7 +938,7 @@ get_report().log(section="Base model training", data=[
         "Peak memory usage": f"{peak_memory_usage / 1024 / 1024:.2f}MiB",
         "Peak training-step memory usage": f"{peak_training_memory_usage / 1024 / 1024:.2f}MiB",
         "Peak training-step reserved memory usage": f"{peak_training_reserved_memory_usage / 1024 / 1024:.2f}MiB",
-        "Peak training-step driver memory usage": f"{peak_training_driver_memory_usage / 1024 / 1024:.2f}MiB",
+        "Peak post-step driver memory usage": f"{peak_training_driver_memory_usage / 1024 / 1024:.2f}MiB",
     }
 ])
 
