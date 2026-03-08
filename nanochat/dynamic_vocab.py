@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import time
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -99,6 +100,26 @@ class DynamicVocabRuntime:
             state["step"] = int(table_state["step"])
             state["exp_avg"].copy_(table_state["exp_avg"].to("cpu"))
             state["exp_avg_sq"].copy_(table_state["exp_avg_sq"].to("cpu"))
+
+    @contextmanager
+    def materialize_dense_params(self):
+        """Temporarily move full vocab tables to the model device for dense eval/inference."""
+        original_data = {}
+        try:
+            for spec in self.table_specs.values():
+                param = spec["param"]
+                original_data[param] = param.data
+                param.data = param.data.to(self.device, non_blocking=self.use_cuda)
+            if self.use_cuda:
+                torch.cuda.synchronize(self.device)
+            yield self.model
+        finally:
+            for spec in self.table_specs.values():
+                param = spec["param"]
+                param.data = original_data[param]
+            if self.use_cuda:
+                torch.cuda.synchronize(self.device)
+                torch.cuda.empty_cache()
 
     def _stage_rows_to_gpu(self, cpu_tensor_map):
         gpu_tensor_map = {}

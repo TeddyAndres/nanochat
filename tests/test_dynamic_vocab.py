@@ -96,3 +96,20 @@ def test_dynamic_vocab_runtime_state_dict_round_trip():
         assert runtime_state["step"] == restored_state["step"]
         assert torch.allclose(runtime_state["exp_avg"], restored_state["exp_avg"])
         assert torch.allclose(runtime_state["exp_avg_sq"], restored_state["exp_avg_sq"])
+
+
+def test_dynamic_vocab_dense_materialization_round_trip():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(model, device="cpu", embedding_lr=0.05, value_embedding_lr=0.04, unembedding_lr=0.03)
+    idx = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+
+    wte_before = runtime.table_specs["wte"]["param"].data
+    logits_before = None
+    with runtime.materialize_dense_params() as dense_model:
+        logits_before = dense_model(idx)
+        assert runtime.table_specs["wte"]["param"].device.type == "cpu"
+        assert logits_before.shape[-1] == model.config.vocab_size
+
+    assert runtime.table_specs["wte"]["param"].data.device.type == "cpu"
+    assert runtime.table_specs["wte"]["param"].data.data_ptr() == wte_before.data_ptr()

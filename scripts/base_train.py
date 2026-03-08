@@ -164,7 +164,7 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if args.sparse_mode:
     assert not ddp, "Sparse mode is single-GPU only for now"
-    print0("Sparse mode first pass: in-run eval/sample paths are disabled; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
+    print0("Sparse mode first pass: dense eval/sample paths use temporary full-vocab materialization; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     optimizer_device = "cpu" if args.sparse_mode else None
@@ -484,15 +484,21 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
     sparse_metrics = None
+    dense_eval_model = orig_model
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if (not args.sparse_mode) and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with torch.inference_mode():
-            with disable_fp8(orig_model):
-                val_bpb, val_ece = evaluate_bpb_and_ece(orig_model, val_loader, eval_steps, token_bytes)
+            if args.sparse_mode:
+                with dynamic_vocab.materialize_dense_params():
+                    with disable_fp8(orig_model):
+                        val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes)
+            else:
+                with disable_fp8(orig_model):
+                    val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} | ECE: {val_ece:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -511,11 +517,16 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if (not args.sparse_mode) and args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with torch.inference_mode():
-            with disable_fp8(orig_model):
-                results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+            if args.sparse_mode:
+                with dynamic_vocab.materialize_dense_params():
+                    with disable_fp8(orig_model):
+                        results = evaluate_core(dense_eval_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+            else:
+                with disable_fp8(orig_model):
+                    results = evaluate_core(dense_eval_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -528,7 +539,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if (not args.sparse_mode) and args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -539,13 +550,23 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with torch.inference_mode():
-                with disable_fp8(orig_model):
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        if args.sparse_mode:
+            with dynamic_vocab.materialize_dense_params():
+                engine = Engine(dense_eval_model, tokenizer) # use orig_model to avoid recompilation
+                for prompt in prompts:
+                    tokens = tokenizer(prompt, prepend="<|bos|>")
+                    with torch.inference_mode():
+                        with disable_fp8(orig_model):
+                            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    print0(tokenizer.decode(sample[0]))
+        else:
+            engine = Engine(dense_eval_model, tokenizer) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with torch.inference_mode():
+                    with disable_fp8(orig_model):
+                        sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
         model.train()
         release_eval_memory()
 
