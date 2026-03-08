@@ -333,6 +333,19 @@ if batch_ratio != 1.0:
     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
 
+sparse_vocab_lr_scale = 1.0
+if args.sparse_mode and hybrid_sparse:
+    u_max = int(sparse_manifest["u_max"])
+    sparse_vocab_lr_scale = min((u_max / vocab_size) ** 0.5, 1.0)
+    print0(
+        f"Scaling sparse vocab-table LRs by {sparse_vocab_lr_scale:.4f} "
+        f"for U_max={u_max:,} vs vocab={vocab_size:,}"
+    )
+
+sparse_embedding_lr = args.embedding_lr * batch_lr_scale * sparse_vocab_lr_scale
+sparse_value_embedding_lr = (args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale * sparse_vocab_lr_scale
+sparse_unembedding_lr = args.unembedding_lr * batch_lr_scale * sparse_vocab_lr_scale
+
 # 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
 # We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
 # Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
@@ -364,9 +377,9 @@ if args.sparse_mode:
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,
-        embedding_lr=args.embedding_lr * batch_lr_scale,
-        value_embedding_lr=(args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale,
-        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=sparse_embedding_lr,
+        value_embedding_lr=sparse_value_embedding_lr,
+        unembedding_lr=sparse_unembedding_lr,
         fixed_u_max=(None if not hybrid_sparse else int(sparse_manifest["u_max"])),
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
@@ -786,7 +799,8 @@ while True:
     should_print_step = (step == 0) or (step == num_iterations - 1) or (args.log_every > 0 and step % args.log_every == 0)
     if should_print_step:
         print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    should_log_wandb_step = should_print_step or grad_norm is not None
+    if should_log_wandb_step:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -806,13 +820,6 @@ while True:
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm
         wandb_run.log(log_data)
-    elif grad_norm is not None:
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/grad_norm": grad_norm,
-        })
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
