@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
+from nanochat.sparse_manifest import load_sparse_manifest, validate_sparse_manifest
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
@@ -188,3 +189,167 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(*args, **k
     kwargs["return_active_vocab"] = True
     for inputs, targets, active_ids, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets, active_ids, state_dict
+
+
+def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
+    tokenizer, B, T, split,
+    manifest_path,
+    tokenizer_threads=4, tokenizer_batch_size=128,
+    device="cuda", resume_state_dict=None,
+    buffer_size=1000,
+    vocab_size=None,
+):
+    """Manifest-driven sparse loader with fixed logical U slots.
+
+    The live BOS best-fit batch construction stays unchanged, but vocab remapping and
+    overlap transitions are driven by a precomputed sparse-manifest JSON.
+    """
+    assert vocab_size is not None, "vocab_size is required for manifest sparse loader"
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    manifest = load_sparse_manifest(manifest_path)
+    validate_sparse_manifest(
+        manifest,
+        split=split,
+        vocab_size=vocab_size,
+        device_batch_size=B,
+        max_seq_len=T,
+        grad_accum_steps=1,
+        ddp_world_size=ddp_world_size,
+    )
+
+    manifest_steps = manifest["steps"]
+    u_max = int(manifest["u_max"])
+    if u_max <= 0:
+        raise ValueError("Sparse manifest must define a positive u_max")
+
+    base_resume_state = None if resume_state_dict is None else {
+        key: value
+        for key, value in resume_state_dict.items()
+        if key != "manifest_step"
+    }
+    manifest_step = 0 if resume_state_dict is None else int(resume_state_dict.get("manifest_step", 0))
+    if manifest_step < 0 or manifest_step >= len(manifest_steps):
+        raise ValueError(
+            f"Sparse manifest step {manifest_step} is out of range for {len(manifest_steps)} stored steps"
+        )
+
+    base_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        B,
+        T,
+        split,
+        tokenizer_threads=tokenizer_threads,
+        tokenizer_batch_size=tokenizer_batch_size,
+        device="cpu",
+        resume_state_dict=base_resume_state,
+        buffer_size=buffer_size,
+    )
+
+    use_cuda = torch.device(device).type == "cuda"
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
+
+    slot_to_global = torch.full((u_max,), -1, dtype=torch.long)
+    global_to_slot = torch.full((vocab_size,), -1, dtype=torch.long)
+
+    def apply_next_transition(step_entry):
+        next_leaving_ids = torch.tensor(step_entry["next_leaving_ids"], dtype=torch.long)
+        next_new_ids = torch.tensor(step_entry["next_new_ids"], dtype=torch.long)
+        if next_leaving_ids.numel() > 0:
+            leaving_slots = global_to_slot[next_leaving_ids]
+            if (leaving_slots < 0).any():
+                raise ValueError("Sparse manifest leaving ids are not present in the current slot map")
+            slot_to_global[leaving_slots] = -1
+            global_to_slot[next_leaving_ids] = -1
+        else:
+            leaving_slots = torch.empty(0, dtype=torch.long)
+        if next_new_ids.numel() == 0:
+            return next_new_ids, next_new_ids
+        reusable_slots = leaving_slots.tolist()
+        reusable_slots.extend(torch.nonzero(slot_to_global < 0, as_tuple=False).flatten().tolist())
+        assigned_slots = []
+        seen = set()
+        for slot in reusable_slots:
+            if slot in seen:
+                continue
+            seen.add(slot)
+            assigned_slots.append(int(slot))
+            if len(assigned_slots) == next_new_ids.numel():
+                break
+        if len(assigned_slots) < next_new_ids.numel():
+            raise ValueError(
+                f"Sparse manifest overflow: need {next_new_ids.numel()} new slots, only found {len(assigned_slots)} free slots out of U_max={u_max}"
+            )
+        assigned_slots_tensor = torch.tensor(assigned_slots, dtype=torch.long)
+        slot_to_global[assigned_slots_tensor] = next_new_ids
+        global_to_slot[next_new_ids] = assigned_slots_tensor
+        return next_new_ids, assigned_slots_tensor
+
+    first_active_ids = torch.tensor(manifest_steps[0]["active_ids"], dtype=torch.long)
+    if first_active_ids.numel() > u_max:
+        raise ValueError(
+            f"Sparse manifest first step exceeds U_max: {first_active_ids.numel()} > {u_max}"
+        )
+    first_slots = torch.arange(first_active_ids.numel(), dtype=torch.long)
+    slot_to_global[first_slots] = first_active_ids
+    global_to_slot[first_active_ids] = first_slots
+    current_new_ids = first_active_ids.clone()
+    current_new_slots = first_slots.clone()
+    for replay_step in range(manifest_step):
+        current_new_ids, current_new_slots = apply_next_transition(manifest_steps[replay_step])
+
+    while True:
+        if manifest_step >= len(manifest_steps):
+            raise StopIteration
+        step_entry = manifest_steps[manifest_step]
+        base_inputs, base_targets, base_state_dict = next(base_loader)
+        cpu_inputs.copy_(base_inputs)
+        cpu_targets.copy_(base_targets)
+        remapped_inputs = global_to_slot[cpu_inputs]
+        remapped_targets = global_to_slot[cpu_targets]
+        if (remapped_inputs < 0).any() or (remapped_targets < 0).any():
+            raise ValueError(
+                f"Sparse manifest mismatch at step {manifest_step}: live batch contains tokens missing from manifest active_ids"
+            )
+        cpu_inputs.copy_(remapped_inputs)
+        cpu_targets.copy_(remapped_targets)
+
+        active_mask_cpu = slot_to_global >= 0
+        active_slot_ids_cpu = torch.nonzero(active_mask_cpu, as_tuple=False).flatten()
+        active_ids_cpu = slot_to_global[active_slot_ids_cpu]
+        current_leaving_ids = torch.tensor(step_entry["next_leaving_ids"], dtype=torch.long)
+        if current_leaving_ids.numel() > 0:
+            current_leaving_slots = global_to_slot[current_leaving_ids]
+            if (current_leaving_slots < 0).any():
+                raise ValueError("Sparse manifest leaving ids are not present in the current slot map")
+        else:
+            current_leaving_slots = torch.empty(0, dtype=torch.long)
+
+        step_meta = {
+            "mode": "fixed-u",
+            "active_ids_cpu": active_ids_cpu.clone(),
+            "active_slot_ids_cpu": active_slot_ids_cpu.clone(),
+            "active_mask_cpu": active_mask_cpu.clone(),
+            "slot_to_global_cpu": slot_to_global.clone(),
+            "stage_ids_cpu": current_new_ids.clone(),
+            "stage_slot_ids_cpu": current_new_slots.clone(),
+            "writeback_ids_cpu": current_leaving_ids.clone(),
+            "writeback_slot_ids_cpu": current_leaving_slots.clone(),
+            "is_last_step": manifest_step == len(manifest_steps) - 1,
+        }
+
+        state_dict = dict(base_state_dict)
+        state_dict["manifest_step"] = manifest_step
+
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        yield inputs, targets, step_meta, state_dict
+
+        if manifest_step == len(manifest_steps) - 1:
+            manifest_step += 1
+            continue
+        current_new_ids, current_new_slots = apply_next_transition(step_entry)
+        manifest_step += 1

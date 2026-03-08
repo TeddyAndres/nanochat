@@ -30,7 +30,7 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic, tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -38,6 +38,7 @@ from nanochat.dynamic_vocab import DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
+from nanochat.sparse_manifest import load_sparse_manifest, validate_sparse_manifest
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -73,6 +74,7 @@ parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate 
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
+parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="in sparse mode, call torch.cuda.empty_cache() every N steps after writeback (0 disables)")
 parser.add_argument("--sparse-max-reserved-mib", type=float, default=8192.0, help="in sparse mode, if current CUDA reserved memory exceeds this threshold after a step, trim the cache with torch.cuda.empty_cache() (0 disables)")
@@ -170,13 +172,25 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+sparse_manifest = None
+hybrid_sparse = args.sparse_mode and args.sparse_manifest != ""
+if hybrid_sparse:
+    sparse_manifest = load_sparse_manifest(args.sparse_manifest)
 if args.sparse_mode:
     assert not ddp, "Sparse mode is single-GPU only for now"
-    print0("Sparse mode first pass: dense eval/sample paths use temporary full-vocab materialization; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
+    if hybrid_sparse:
+        print0("Sparse hybrid mode: fixed-U manifest path enabled; dense eval/sample paths materialize from CPU masters and training uses manifest-driven overlap reuse")
+    else:
+        print0("Sparse mode first pass: dense eval/sample paths use temporary full-vocab materialization; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     optimizer_device = "cpu" if args.sparse_mode else None
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank, optimizer_device=optimizer_device)
+    if hybrid_sparse:
+        checkpoint_manifest = meta_data.get("sparse_manifest", "")
+        assert checkpoint_manifest == args.sparse_manifest, (
+            f"Sparse manifest mismatch on resume: checkpoint uses '{checkpoint_manifest}', current run uses '{args.sparse_manifest}'"
+        )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -261,7 +275,7 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-if args.sparse_mode:
+if args.sparse_mode and not hybrid_sparse:
     print0("Sparse mode enabled: skipping torch.compile in first-pass dynamic vocab path")
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
@@ -352,6 +366,7 @@ if args.sparse_mode:
         embedding_lr=args.embedding_lr * batch_lr_scale,
         value_embedding_lr=(args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale,
         unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        fixed_u_max=(None if not hybrid_sparse else int(sparse_manifest["u_max"])),
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
@@ -379,12 +394,24 @@ if args.sparse_mode:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 if args.sparse_mode:
-    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, vocab_size=vocab_size)
+    if hybrid_sparse:
+        train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
+            tokenizer,
+            args.device_batch_size,
+            args.max_seq_len,
+            split="train",
+            manifest_path=args.sparse_manifest,
+            device=device,
+            resume_state_dict=dataloader_resume_state_dict,
+            vocab_size=vocab_size,
+        )
+    else:
+        train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, vocab_size=vocab_size)
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 if args.sparse_mode:
-    x, y, active_ids_cpu, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
+    x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
 else:
     x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -526,10 +553,24 @@ if args.sparse_mode:
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+if hybrid_sparse:
+    assert sparse_manifest is not None
+    validate_sparse_manifest(
+        sparse_manifest,
+        split="train",
+        vocab_size=vocab_size,
+        device_batch_size=args.device_batch_size,
+        max_seq_len=args.max_seq_len,
+        grad_accum_steps=grad_accum_steps,
+        ddp_world_size=ddp_world_size,
+        num_iterations=num_iterations,
+    )
+    print0(f"Sparse hybrid manifest: {args.sparse_manifest} | U_max={int(sparse_manifest['u_max']):,}")
 
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    final_train_step = step == num_iterations - 1
     flops_so_far = num_flops_per_token * total_batch_size * step
     sparse_metrics = None
     dense_eval_model = orig_model
@@ -628,6 +669,8 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if hybrid_sparse:
+            dynamic_vocab.flush_active_to_cpu()
         optimizer_payload = optimizer.state_dict()
         if args.sparse_mode:
             optimizer_payload = {
@@ -644,6 +687,7 @@ while True:
                 "val_bpb": val_bpb, # loss at last step
                 "val_ece": val_ece,
                 "sparse_mode": args.sparse_mode,
+                "sparse_manifest": (args.sparse_manifest if hybrid_sparse else ""),
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
@@ -690,7 +734,7 @@ while True:
         step_gpu_start.record()
     for micro_step in range(grad_accum_steps):
         if args.sparse_mode:
-            sparse_step_ctx = dynamic_vocab.prepare_step(active_ids_cpu)
+            sparse_step_ctx = dynamic_vocab.prepare_step(sparse_batch_meta)
             sparse_metrics = sparse_step_ctx
             loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab)
         else:
@@ -701,10 +745,11 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        if args.sparse_mode:
-            x, y, active_ids_cpu, dataloader_state_dict = next(train_loader) # prefetch the next sparse batch while GPU is busy with backward
-        else:
-            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if not final_train_step:
+            if args.sparse_mode:
+                x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # prefetch the next sparse batch while GPU is busy with backward
+            else:
+                x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     if device_type == "cuda":
         assert fw_bw_end is not None
         fw_bw_end.record()

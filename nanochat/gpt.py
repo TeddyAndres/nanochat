@@ -442,6 +442,9 @@ class GPT(nn.Module):
             logits = F.linear(x, active_vocab["lm_head"].to(dtype=x.dtype))
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        if active_vocab is not None and "logit_mask" in active_vocab:
+            logit_mask = active_vocab["logit_mask"].to(device=logits.device, dtype=torch.bool)
+            logits = logits.masked_fill(~logit_mask.view(1, 1, -1), -1e9)
         return logits
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None):

@@ -27,6 +27,25 @@ def build_tiny_model(vocab_size=8):
     return model
 
 
+def build_fixed_step_meta(slot_to_global, stage_slots, stage_ids, writeback_slots, writeback_ids, is_last_step=False):
+    slot_to_global = torch.tensor(slot_to_global, dtype=torch.long)
+    active_mask = slot_to_global >= 0
+    active_slot_ids = torch.nonzero(active_mask, as_tuple=False).flatten()
+    active_ids = slot_to_global[active_slot_ids]
+    return {
+        "mode": "fixed-u",
+        "active_ids_cpu": active_ids,
+        "active_slot_ids_cpu": active_slot_ids,
+        "active_mask_cpu": active_mask,
+        "slot_to_global_cpu": slot_to_global,
+        "stage_ids_cpu": torch.tensor(stage_ids, dtype=torch.long),
+        "stage_slot_ids_cpu": torch.tensor(stage_slots, dtype=torch.long),
+        "writeback_ids_cpu": torch.tensor(writeback_ids, dtype=torch.long),
+        "writeback_slot_ids_cpu": torch.tensor(writeback_slots, dtype=torch.long),
+        "is_last_step": is_last_step,
+    }
+
+
 def test_dynamic_vocab_forward_matches_dense_when_u_equals_v():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -122,3 +141,95 @@ def test_dynamic_vocab_dense_materialization_round_trip():
 
     assert runtime.table_specs["wte"]["param"].data.device.type == "cpu"
     assert runtime.table_specs["wte"]["param"].data.data_ptr() == wte_before.data_ptr()
+
+
+def test_fixed_u_runtime_delays_common_writeback_until_final_step():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+    wte = model.transformer["wte"]
+    original_rows = wte.weight[[1, 3, 7]].clone()
+
+    step0 = build_fixed_step_meta(
+        slot_to_global=[1, 3, 7, -1, -1, -1],
+        stage_slots=[0, 1, 2],
+        stage_ids=[1, 3, 7],
+        writeback_slots=[0],
+        writeback_ids=[1],
+        is_last_step=False,
+    )
+    step0_ctx = runtime.prepare_step(step0)
+    active_slots0 = step0_ctx.active_slot_ids_cpu
+    assert active_slots0 is not None
+    step0_ctx.active_vocab["wte"].grad = torch.zeros_like(step0_ctx.active_vocab["wte"])
+    step0_ctx.active_vocab["wte"].grad[active_slots0] = 1
+    step0_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step0_ctx.active_vocab["lm_head"])
+    step0_ctx.active_vocab["lm_head"].grad[active_slots0] = 2
+    for value_embed in step0_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+        value_embed.grad[active_slots0] = 3
+    runtime.step(step0_ctx)
+
+    assert not torch.allclose(wte.weight[1], original_rows[0])
+    assert torch.allclose(wte.weight[3], original_rows[1])
+    assert torch.allclose(wte.weight[7], original_rows[2])
+
+    step1 = build_fixed_step_meta(
+        slot_to_global=[-1, 3, 7, -1, -1, -1],
+        stage_slots=[],
+        stage_ids=[],
+        writeback_slots=[],
+        writeback_ids=[],
+        is_last_step=True,
+    )
+    step1_ctx = runtime.prepare_step(step1)
+    active_slots1 = step1_ctx.active_slot_ids_cpu
+    assert active_slots1 is not None
+    step1_ctx.active_vocab["wte"].grad = torch.zeros_like(step1_ctx.active_vocab["wte"])
+    step1_ctx.active_vocab["wte"].grad[active_slots1] = 1
+    step1_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step1_ctx.active_vocab["lm_head"])
+    step1_ctx.active_vocab["lm_head"].grad[active_slots1] = 2
+    for value_embed in step1_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+        value_embed.grad[active_slots1] = 3
+    runtime.step(step1_ctx)
+
+    assert not torch.allclose(wte.weight[3], original_rows[1])
+    assert not torch.allclose(wte.weight[7], original_rows[2])
+
+
+def test_fixed_u_masked_logits_hide_inactive_slots():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=6,
+    )
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2, 3, -1, -1],
+        stage_slots=[0, 1, 2, 3],
+        stage_ids=[0, 1, 2, 3],
+        writeback_slots=[0, 1, 2, 3],
+        writeback_ids=[0, 1, 2, 3],
+        is_last_step=True,
+    )
+    step_ctx = runtime.prepare_step(step_meta)
+    idx = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    targets = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+
+    logits = model(idx, active_vocab=step_ctx.active_vocab)
+    loss = model(idx, targets, active_vocab=step_ctx.active_vocab)
+
+    assert torch.isfinite(loss)
+    assert torch.all(logits[..., 4:] < -1e8)
