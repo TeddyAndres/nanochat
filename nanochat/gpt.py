@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
+        self.ve_gate_channels = min(32, self.n_embd)
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -295,7 +295,7 @@ class GPT(nn.Module):
         return window_sizes
 
     def get_device(self):
-        return self.transformer.wte.weight.device
+        return self.cos.device
 
     def estimate_flops(self):
         """
@@ -353,9 +353,10 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, value_embedding_lr=None, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, include_vocab_tables=True):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
+        value_embedding_lr = embedding_lr if value_embedding_lr is None else value_embedding_lr
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
@@ -364,7 +365,10 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        managed_param_count = len(matrix_params) + len(resid_params) + len(x0_params)
+        if include_vocab_tables:
+            managed_param_count += len(embedding_params) + len(lm_head_params) + len(value_embeds_params)
+        assert len(list(self.parameters())) >= managed_param_count
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -373,12 +377,15 @@ class GPT(nn.Module):
         # Build param_groups with all required fields explicit
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        if include_vocab_tables:
+            param_groups = [
+                dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+                dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+                dict(kind='adamw', params=value_embeds_params, lr=value_embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            ] + param_groups
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -393,7 +400,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward_features(self, idx, kv_cache=None):
+    def forward_features(self, idx, kv_cache=None, active_vocab=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -405,29 +412,41 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx) # embed current token
+        if active_vocab is None:
+            x = self.transformer.wte(idx) # embed current token
+        else:
+            x = F.embedding(idx, active_vocab["wte"])
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            if str(i) in self.value_embeds:
+                if active_vocab is None:
+                    ve = self.value_embeds[str(i)](idx).to(x.dtype)
+                else:
+                    ve = F.embedding(idx, active_vocab["value_embeds"][str(i)]).to(x.dtype)
+            else:
+                ve = None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
         return x
 
-    def compute_logits(self, x):
+    def compute_logits(self, x, active_vocab=None):
         # Forward the lm_head (compute logits)
         softcap = 20 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        if active_vocab is None:
+            logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+            logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        else:
+            logits = F.linear(x, active_vocab["lm_head"].to(dtype=x.dtype))
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
         return logits
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        x = self.forward_features(idx, kv_cache=kv_cache)
-        logits = self.compute_logits(x)
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None):
+        x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
+        logits = self.compute_logits(x, active_vocab=active_vocab)
 
         if targets is not None:
             # training: given the targets, compute and return the loss

@@ -26,10 +26,11 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.dynamic_vocab import DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -60,12 +61,15 @@ parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help=
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--value-embed-lr", type=float, default=-1.0, help="learning rate for value embedding parameters (Adam). -1 reuses --embedding-lr")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
+parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
+parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -158,9 +162,13 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+if args.sparse_mode:
+    assert not ddp, "Sparse mode is single-GPU only for now"
+    print0("Sparse mode first pass: in-run eval/sample paths are disabled; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    optimizer_device = "cpu" if args.sparse_mode else None
+    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank, optimizer_device=optimizer_device)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -245,7 +253,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.sparse_mode:
+    print0("Sparse mode enabled: skipping torch.compile in first-pass dynamic vocab path")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -311,15 +322,37 @@ optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
+    value_embedding_lr=(args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    include_vocab_tables=not args.sparse_mode,
 )
 
+dynamic_vocab = None
+optimizer_data_sparse = None
+if args.sparse_mode:
+    dynamic_vocab = DynamicVocabRuntime(
+        orig_model,
+        device=device,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        value_embedding_lr=(args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale,
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        adam_betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=0.0,
+    )
+    if resuming:
+        optimizer.load_state_dict(optimizer_data["base_optimizer"])
+        optimizer_data_sparse = optimizer_data["dynamic_vocab"]
+        dynamic_vocab.load_state_dict(optimizer_data_sparse)
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+
 if resuming:
-    optimizer.load_state_dict(optimizer_data)
+    if not args.sparse_mode:
+        optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
 # -----------------------------------------------------------------------------
@@ -327,13 +360,21 @@ if resuming:
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
+if args.sparse_mode:
+    assert scaler is None, "Sparse mode does not support fp16 GradScaler yet; use bf16/fp32"
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+if args.sparse_mode:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, vocab_size=vocab_size)
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+if args.sparse_mode:
+    x, y, active_ids_cpu, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
+else:
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -432,6 +473,8 @@ tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per itera
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+if args.sparse_mode:
+    assert grad_accum_steps == 1, f"Sparse mode requires grad_accum_steps == 1, got {grad_accum_steps}"
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -440,9 +483,10 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    sparse_metrics = None
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if (not args.sparse_mode) and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -467,7 +511,7 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if (not args.sparse_mode) and args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with torch.inference_mode():
             with disable_fp8(orig_model):
@@ -484,7 +528,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    if (not args.sparse_mode) and args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -507,15 +551,22 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        optimizer_payload = optimizer.state_dict()
+        if args.sparse_mode:
+            optimizer_payload = {
+                "base_optimizer": optimizer_payload,
+                "dynamic_vocab": dynamic_vocab.state_dict(),
+            }
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            optimizer_payload, # optimizer state
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "val_ece": val_ece,
+                "sparse_mode": args.sparse_mode,
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
@@ -541,14 +592,22 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        if args.sparse_mode:
+            sparse_step_ctx = dynamic_vocab.prepare_step(active_ids_cpu)
+            sparse_metrics = sparse_step_ctx
+            loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab)
+        else:
+            loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if args.sparse_mode:
+            x, y, active_ids_cpu, dataloader_state_dict = next(train_loader) # prefetch the next sparse batch while GPU is busy with backward
+        else:
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -576,6 +635,8 @@ while True:
         if should_log_grad_norm:
             grad_norm = compute_global_grad_norm(optimizer)
         optimizer.step()
+    if args.sparse_mode:
+        sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -604,7 +665,10 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     grad_norm_str = "" if grad_norm is None else f" | grad_norm: {grad_norm:.4f}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    sparse_str = ""
+    if sparse_metrics is not None:
+        sparse_str = f" | U: {sparse_metrics.unique_count:,} | h2d: {sparse_metrics.h2d_ms:.2f}ms | d2h: {sparse_metrics.d2h_ms:.2f}ms"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -617,6 +681,14 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if sparse_metrics is not None:
+            log_data.update({
+                "train/u": sparse_metrics.unique_count,
+                "train/h2d_ms": sparse_metrics.h2d_ms,
+                "train/d2h_ms": sparse_metrics.d2h_ms,
+                "train/h2d_bytes": sparse_metrics.bytes_h2d,
+                "train/d2h_bytes": sparse_metrics.bytes_d2h,
+            })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm
         wandb_run.log(log_data)

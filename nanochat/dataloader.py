@@ -75,7 +75,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000,
+    return_active_vocab=False,
+    vocab_size=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -110,7 +112,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
+    use_cuda = torch.device(device).type == "cuda"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
@@ -118,6 +120,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
+    if return_active_vocab:
+        assert vocab_size is not None, "vocab_size is required when return_active_vocab=True"
+        global_to_local = torch.full((vocab_size,), -1, dtype=torch.long)
 
     while True:
         for row_idx in range(B):
@@ -153,14 +158,33 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         # Copy to pinned CPU buffer, then single HtoD transfer
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
+        active_ids = None
+        if return_active_vocab:
+            active_ids = torch.unique(cpu_buffer, sorted=True)
+            global_to_local.fill_(-1)
+            global_to_local[active_ids] = torch.arange(active_ids.numel(), dtype=torch.long)
+            cpu_inputs.copy_(global_to_local[cpu_inputs])
+            cpu_targets.copy_(global_to_local[cpu_targets])
+            if use_cuda:
+                active_ids = active_ids.pin_memory()
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        yield inputs, targets, state_dict
+        if return_active_vocab:
+            yield inputs, targets, active_ids, state_dict
+        else:
+            yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+def tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(*args, **kwargs):
+    """Dynamic-vocab variant that also returns active vocab ids for each batch."""
+    kwargs["return_active_vocab"] = True
+    for inputs, targets, active_ids, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
+        yield inputs, targets, active_ids, state_dict
