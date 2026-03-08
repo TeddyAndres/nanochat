@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import time
 from contextlib import contextmanager
 from typing import Optional
 
@@ -13,8 +12,8 @@ class DynamicVocabStep:
     active_vocab: Optional[dict]
     optimizer_state: Optional[dict]
     unique_count: int
-    bytes_h2d: int
-    h2d_ms: float
+    bytes_h2d: int = 0
+    h2d_ms: float = 0.0
     bytes_d2h: int = 0
     d2h_ms: float = 0.0
     optimizer_ms: float = 0.0
@@ -189,13 +188,11 @@ class DynamicVocabRuntime:
         global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         if global_ids_cpu.numel() == 0:
-            return 0, 0.0, 0.0, 0.0
+            return
         slot_ids_device = slot_ids_cpu.to(self.device)
         cpu_rows = {}
         cpu_exp_avg = {}
         cpu_exp_avg_sq = {}
-        bytes_d2h = 0
-        t_launch = time.perf_counter()
         for name, spec in self.table_specs.items():
             active_param = self.fixed_params[name]
             active_state = self.fixed_optimizer_state[name]
@@ -211,25 +208,14 @@ class DynamicVocabRuntime:
             cpu_rows[name] = row_buffer
             cpu_exp_avg[name] = exp_avg_buffer
             cpu_exp_avg_sq[name] = exp_avg_sq_buffer
-            bytes_d2h += row_buffer.numel() * row_buffer.element_size()
-            bytes_d2h += exp_avg_buffer.numel() * exp_avg_buffer.element_size()
-            bytes_d2h += exp_avg_sq_buffer.numel() * exp_avg_sq_buffer.element_size()
-        d2h_launch_ms = (time.perf_counter() - t_launch) * 1000.0
-
-        t_sync = time.perf_counter()
         if self.use_cuda:
             torch.cuda.synchronize(self.device)
-        d2h_sync_ms = (time.perf_counter() - t_sync) * 1000.0
-
-        t_writeback = time.perf_counter()
         for name, spec in self.table_specs.items():
             param = spec["param"]
             state = self.state[param]
             param.index_copy_(0, global_ids_cpu, cpu_rows[name])
             state["exp_avg"].index_copy_(0, global_ids_cpu, cpu_exp_avg[name])
             state["exp_avg_sq"].index_copy_(0, global_ids_cpu, cpu_exp_avg_sq[name])
-        cpu_writeback_ms = (time.perf_counter() - t_writeback) * 1000.0
-        return bytes_d2h, d2h_launch_ms, d2h_sync_ms, cpu_writeback_ms
 
     @torch.no_grad()
     def flush_active_to_cpu(self):
@@ -266,9 +252,6 @@ class DynamicVocabRuntime:
 
     def _prepare_dynamic_step(self, active_ids_cpu: torch.Tensor) -> DynamicVocabStep:
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        bytes_h2d = 0
-        active_param_bytes = 0
-        active_optimizer_bytes = 0
         cpu_rows = {}
         cpu_exp_avg = {}
         cpu_exp_avg_sq = {}
@@ -281,20 +264,10 @@ class DynamicVocabRuntime:
             cpu_rows[name] = rows
             cpu_exp_avg[name] = exp_avg
             cpu_exp_avg_sq[name] = exp_avg_sq
-            bytes_h2d += rows.numel() * rows.element_size()
-            bytes_h2d += exp_avg.numel() * exp_avg.element_size()
-            bytes_h2d += exp_avg_sq.numel() * exp_avg_sq.element_size()
-            active_param_bytes += rows.numel() * rows.element_size()
-            active_optimizer_bytes += exp_avg.numel() * exp_avg.element_size()
-            active_optimizer_bytes += exp_avg_sq.numel() * exp_avg_sq.element_size()
 
-        t0 = time.perf_counter()
         gpu_rows = self._stage_rows_to_gpu(cpu_rows)
         gpu_exp_avg = self._stage_rows_to_gpu(cpu_exp_avg)
         gpu_exp_avg_sq = self._stage_rows_to_gpu(cpu_exp_avg_sq)
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
-        h2d_ms = (time.perf_counter() - t0) * 1000.0
 
         active_vocab = {
             "wte": nn.Parameter(gpu_rows["wte"], requires_grad=True),
@@ -317,10 +290,6 @@ class DynamicVocabRuntime:
             active_vocab=active_vocab,
             optimizer_state=optimizer_state,
             unique_count=active_ids_cpu.numel(),
-            bytes_h2d=bytes_h2d,
-            h2d_ms=h2d_ms,
-            active_param_bytes=active_param_bytes,
-            active_optimizer_bytes=active_optimizer_bytes,
             u_capacity=active_ids_cpu.numel(),
             stage_count=active_ids_cpu.numel(),
         )
@@ -346,11 +315,7 @@ class DynamicVocabRuntime:
             stage_ids_cpu = active_ids_cpu
             stage_slot_ids_cpu = active_slot_ids_cpu
 
-        bytes_h2d = 0
-        active_param_bytes = 0
-        active_optimizer_bytes = 0
         self._clear_fixed_grads()
-        t0 = time.perf_counter()
         if stage_ids_cpu.numel() > 0:
             stage_slot_ids_device = stage_slot_ids_cpu.to(self.device)
             for name, spec in self.table_specs.items():
@@ -365,20 +330,6 @@ class DynamicVocabRuntime:
                 self.fixed_params[name].data.index_copy_(0, stage_slot_ids_device, rows_gpu)
                 self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
                 self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
-                bytes_h2d += rows.numel() * rows.element_size()
-                bytes_h2d += exp_avg.numel() * exp_avg.element_size()
-                bytes_h2d += exp_avg_sq.numel() * exp_avg_sq.element_size()
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
-        h2d_ms = (time.perf_counter() - t0) * 1000.0
-
-        for name, spec in self.table_specs.items():
-            param = spec["param"]
-            state = self.state[param]
-            row_numel = param[0].numel()
-            active_param_bytes += active_ids_cpu.numel() * row_numel * param.element_size()
-            active_optimizer_bytes += active_ids_cpu.numel() * row_numel * state["exp_avg"].element_size()
-            active_optimizer_bytes += active_ids_cpu.numel() * row_numel * state["exp_avg_sq"].element_size()
 
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         self.fixed_active_mask_cpu.copy_(active_mask_cpu)
@@ -390,10 +341,6 @@ class DynamicVocabRuntime:
             active_vocab=self.fixed_active_vocab,
             optimizer_state=self.fixed_optimizer_state,
             unique_count=active_ids_cpu.numel(),
-            bytes_h2d=bytes_h2d,
-            h2d_ms=h2d_ms,
-            active_param_bytes=active_param_bytes,
-            active_optimizer_bytes=active_optimizer_bytes,
             u_capacity=self.fixed_u_max,
             stage_count=stage_ids_cpu.numel(),
             active_slot_ids_cpu=active_slot_ids_cpu,
@@ -460,9 +407,6 @@ class DynamicVocabRuntime:
         assert step_ctx.optimizer_state is not None
         if step_ctx.fixed_u_mode:
             assert step_ctx.active_slot_ids_cpu is not None
-            if self.use_cuda:
-                torch.cuda.synchronize(self.device)
-            t_opt = time.perf_counter()
             self._adamw_update_("wte", self.fixed_params["wte"], self.fixed_optimizer_state["wte"], slot_ids_cpu=step_ctx.active_slot_ids_cpu)
             self._adamw_update_("lm_head", self.fixed_params["lm_head"], self.fixed_optimizer_state["lm_head"], slot_ids_cpu=step_ctx.active_slot_ids_cpu)
             for layer_name in step_ctx.active_vocab["value_embeds"]:
@@ -473,9 +417,6 @@ class DynamicVocabRuntime:
                     self.fixed_optimizer_state[param_name],
                     slot_ids_cpu=step_ctx.active_slot_ids_cpu,
                 )
-            if self.use_cuda:
-                torch.cuda.synchronize(self.device)
-            step_ctx.optimizer_ms = (time.perf_counter() - t_opt) * 1000.0
 
             writeback_ids_cpu = step_ctx.active_ids_cpu if step_ctx.is_last_step else step_ctx.writeback_ids_cpu
             writeback_slot_ids_cpu = step_ctx.active_slot_ids_cpu if step_ctx.is_last_step else step_ctx.writeback_slot_ids_cpu
@@ -487,45 +428,20 @@ class DynamicVocabRuntime:
             writeback_slot_ids_cpu = writeback_slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
             step_ctx.writeback_count = writeback_ids_cpu.numel()
 
-            bytes_d2h, d2h_launch_ms, d2h_sync_ms, cpu_writeback_ms = self._writeback_fixed_rows_(
-                writeback_ids_cpu,
-                writeback_slot_ids_cpu,
-            )
-            active_grad_bytes = 0
-            for name in self.fixed_params:
-                grad = self.fixed_params[name].grad
-                if grad is None or step_ctx.active_slot_ids_cpu.numel() == 0:
-                    continue
-                active_grad_bytes += grad.index_select(0, step_ctx.active_slot_ids_cpu.to(grad.device)).numel() * grad.element_size()
-
-            step_ctx.bytes_d2h = bytes_d2h
-            step_ctx.d2h_launch_ms = d2h_launch_ms
-            step_ctx.d2h_sync_ms = d2h_sync_ms
-            step_ctx.cpu_writeback_ms = cpu_writeback_ms
-            step_ctx.d2h_ms = d2h_launch_ms + d2h_sync_ms
-            step_ctx.active_grad_bytes = active_grad_bytes
+            self._writeback_fixed_rows_(writeback_ids_cpu, writeback_slot_ids_cpu)
             self._clear_fixed_grads()
             return step_ctx
 
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
-        t_opt = time.perf_counter()
         self._adamw_update_("wte", step_ctx.active_vocab["wte"], step_ctx.optimizer_state["wte"])
         self._adamw_update_("lm_head", step_ctx.active_vocab["lm_head"], step_ctx.optimizer_state["lm_head"])
         for layer_name, active_param in step_ctx.active_vocab["value_embeds"].items():
             param_name = f"value_embeds.{layer_name}"
             self._adamw_update_(param_name, active_param, step_ctx.optimizer_state[param_name])
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
-        step_ctx.optimizer_ms = (time.perf_counter() - t_opt) * 1000.0
         step_ctx.writeback_count = step_ctx.active_ids_cpu.numel()
 
         cpu_rows = {}
         cpu_exp_avg = {}
         cpu_exp_avg_sq = {}
-        bytes_d2h = 0
-        active_grad_bytes = 0
-        t_launch = time.perf_counter()
         for name, spec in self.table_specs.items():
             if name == "wte":
                 active_param = step_ctx.active_vocab["wte"]
@@ -547,29 +463,14 @@ class DynamicVocabRuntime:
             cpu_rows[name] = rows
             cpu_exp_avg[name] = exp_avg
             cpu_exp_avg_sq[name] = exp_avg_sq
-            bytes_d2h += rows.numel() * rows.element_size()
-            bytes_d2h += exp_avg.numel() * exp_avg.element_size()
-            bytes_d2h += exp_avg_sq.numel() * exp_avg_sq.element_size()
-            if active_param.grad is not None:
-                active_grad_bytes += active_param.grad.numel() * active_param.grad.element_size()
-        step_ctx.d2h_launch_ms = (time.perf_counter() - t_launch) * 1000.0
-        t_sync = time.perf_counter()
         if self.use_cuda:
             torch.cuda.synchronize(self.device)
-        step_ctx.d2h_sync_ms = (time.perf_counter() - t_sync) * 1000.0
-
-        t_writeback = time.perf_counter()
         for name, spec in self.table_specs.items():
             param = spec["param"]
             state = self.state[param]
             param.index_copy_(0, step_ctx.active_ids_cpu, cpu_rows[name])
             state["exp_avg"].index_copy_(0, step_ctx.active_ids_cpu, cpu_exp_avg[name])
             state["exp_avg_sq"].index_copy_(0, step_ctx.active_ids_cpu, cpu_exp_avg_sq[name])
-        step_ctx.cpu_writeback_ms = (time.perf_counter() - t_writeback) * 1000.0
-
-        step_ctx.bytes_d2h = bytes_d2h
-        step_ctx.active_grad_bytes = active_grad_bytes
-        step_ctx.d2h_ms = step_ctx.d2h_launch_ms + step_ctx.d2h_sync_ms
         step_ctx.active_vocab = None
         step_ctx.optimizer_state = None
         return step_ctx

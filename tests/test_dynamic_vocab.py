@@ -84,17 +84,8 @@ def test_dynamic_vocab_runtime_updates_only_active_rows():
 
     runtime.step(step_ctx)
 
-    assert step_ctx.bytes_h2d > 0
-    assert step_ctx.bytes_d2h > 0
-    assert step_ctx.h2d_ms >= 0.0
-    assert step_ctx.d2h_ms >= 0.0
-    assert step_ctx.optimizer_ms >= 0.0
-    assert step_ctx.d2h_launch_ms >= 0.0
-    assert step_ctx.d2h_sync_ms >= 0.0
-    assert step_ctx.cpu_writeback_ms >= 0.0
-    assert step_ctx.active_param_bytes > 0
-    assert step_ctx.active_optimizer_bytes > 0
-    assert step_ctx.active_grad_bytes > 0
+    assert step_ctx.active_vocab is None
+    assert step_ctx.optimizer_state is None
     assert not torch.allclose(wte.weight[active_ids], original_wte_active)
     assert torch.allclose(wte.weight[inactive_id], original_wte_inactive)
 
