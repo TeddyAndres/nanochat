@@ -47,6 +47,7 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--log-every", type=int, default=1, help="print the training step log every N steps (1 = every step)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -278,6 +279,7 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 if args.sparse_mode and not hybrid_sparse:
     print0("Sparse mode enabled: skipping torch.compile in first-pass dynamic vocab path")
 else:
+    print0("Compiling model with torch.compile(dynamic=False)")
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
@@ -851,11 +853,17 @@ while True:
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     grad_norm_str = "" if grad_norm is None else f" | grad_norm: {grad_norm:.4f}"
     sparse_str = ""
+    u_capacity = 0
+    u_utilization = 0.0
     if sparse_metrics is not None:
         h2d_gbps = sparse_metrics.bytes_h2d / max(sparse_metrics.h2d_ms, 1e-9) / 1e6
         d2h_gbps = sparse_metrics.bytes_d2h / max(sparse_metrics.d2h_ms, 1e-9) / 1e6
+        u_capacity = sparse_metrics.u_capacity if sparse_metrics.u_capacity > 0 else sparse_metrics.unique_count
+        u_utilization = 100.0 * sparse_metrics.unique_count / max(u_capacity, 1)
         sparse_str = (
-            f" | U: {sparse_metrics.unique_count:,}"
+            f" | U: {sparse_metrics.unique_count:,}/{u_capacity:,} ({u_utilization:.1f}%)"
+            f" | stage: {sparse_metrics.stage_count:,}"
+            f" | wb: {sparse_metrics.writeback_count:,}"
             f" | h2d: {sparse_metrics.h2d_ms:.2f}ms ({h2d_gbps:.2f} GB/s)"
             f" | d2h: {sparse_metrics.d2h_ms:.2f}ms ({d2h_gbps:.2f} GB/s)"
             f" | opt: {sparse_metrics.optimizer_ms:.2f}ms"
@@ -875,7 +883,9 @@ while True:
             f" | drv_trunk_opt: {(dense_opt_memory_stats['driver_used'] if dense_opt_memory_stats is not None else 0) / 1024 / 1024:.2f}MiB"
             f" | drv: {step_driver_used / 1024 / 1024:.2f}MiB"
         )
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    should_print_step = (step == 0) or (step == num_iterations - 1) or (args.log_every > 0 and step % args.log_every == 0)
+    if should_print_step:
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -892,6 +902,10 @@ while True:
         if sparse_metrics is not None:
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
+                "train/u_capacity": u_capacity,
+                "train/u_utilization_pct": u_utilization,
+                "train/stage_count": sparse_metrics.stage_count,
+                "train/writeback_count": sparse_metrics.writeback_count,
                 "train/h2d_ms": sparse_metrics.h2d_ms,
                 "train/d2h_ms": sparse_metrics.d2h_ms,
                 "train/d2h_launch_ms": sparse_metrics.d2h_launch_ms,
