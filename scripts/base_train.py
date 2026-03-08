@@ -94,6 +94,7 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+reset_peak_memory = torch.cuda.reset_peak_memory_stats if device_type == "cuda" else lambda: None
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
@@ -435,6 +436,10 @@ def release_eval_memory():
         torch.cuda.empty_cache()
 
 
+def capture_peak_memory_bytes():
+    return get_max_memory() if device_type == "cuda" else 0
+
+
 @torch.no_grad()
 def compute_global_grad_norm(optimizer):
     """Compute the global L2 norm of the averaged gradient without mutating optimizer grads."""
@@ -472,6 +477,9 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
+peak_memory_usage = capture_peak_memory_bytes()
+peak_training_memory_usage = 0
+
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -493,10 +501,13 @@ while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
     sparse_metrics = None
     dense_eval_model = orig_model
+    h2d_gbps = 0.0
+    d2h_gbps = 0.0
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
+        reset_peak_memory()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with torch.inference_mode():
@@ -518,6 +529,7 @@ while True:
             "val/ece": val_ece,
         })
         model.train()
+        peak_memory_usage = max(peak_memory_usage, capture_peak_memory_bytes())
         del val_loader
         release_eval_memory()
 
@@ -527,6 +539,7 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
+        reset_peak_memory()
         with torch.inference_mode():
             if args.sparse_mode:
                 with dynamic_vocab.materialize_dense_params():
@@ -543,12 +556,14 @@ while True:
             "centered_results": results["centered_results"],
         })
         model.train()
+        peak_memory_usage = max(peak_memory_usage, capture_peak_memory_bytes())
         release_eval_memory()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
+        reset_peak_memory()
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -576,6 +591,7 @@ while True:
                         sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 print0(tokenizer.decode(sample[0]))
         model.train()
+        peak_memory_usage = max(peak_memory_usage, capture_peak_memory_bytes())
         release_eval_memory()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -619,6 +635,7 @@ while True:
     # single training step
     # evaluate the gradient
     synchronize()
+    reset_peak_memory()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         if args.sparse_mode:
@@ -666,11 +683,15 @@ while True:
         optimizer.step()
     if args.sparse_mode:
         sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
+        sparse_step_ctx = None
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    step_peak_memory = capture_peak_memory_bytes()
+    peak_training_memory_usage = max(peak_training_memory_usage, step_peak_memory)
+    peak_memory_usage = max(peak_memory_usage, step_peak_memory)
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -696,7 +717,16 @@ while True:
     grad_norm_str = "" if grad_norm is None else f" | grad_norm: {grad_norm:.4f}"
     sparse_str = ""
     if sparse_metrics is not None:
-        sparse_str = f" | U: {sparse_metrics.unique_count:,} | h2d: {sparse_metrics.h2d_ms:.2f}ms | d2h: {sparse_metrics.d2h_ms:.2f}ms"
+        h2d_gbps = sparse_metrics.bytes_h2d / max(sparse_metrics.h2d_ms, 1e-9) / 1e6
+        d2h_gbps = sparse_metrics.bytes_d2h / max(sparse_metrics.d2h_ms, 1e-9) / 1e6
+        sparse_str = (
+            f" | U: {sparse_metrics.unique_count:,}"
+            f" | h2d: {sparse_metrics.h2d_ms:.2f}ms ({h2d_gbps:.2f} GB/s)"
+            f" | d2h: {sparse_metrics.d2h_ms:.2f}ms ({d2h_gbps:.2f} GB/s)"
+            f" | opt: {sparse_metrics.optimizer_ms:.2f}ms"
+            f" | sync: {sparse_metrics.d2h_sync_ms:.2f}ms"
+            f" | train_mem: {step_peak_memory / 1024 / 1024:.2f}MiB"
+        )
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
@@ -709,14 +739,24 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/step_peak_memory_mib": step_peak_memory / 1024 / 1024,
         }
         if sparse_metrics is not None:
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
                 "train/h2d_ms": sparse_metrics.h2d_ms,
                 "train/d2h_ms": sparse_metrics.d2h_ms,
+                "train/d2h_launch_ms": sparse_metrics.d2h_launch_ms,
+                "train/d2h_sync_ms": sparse_metrics.d2h_sync_ms,
+                "train/cpu_writeback_ms": sparse_metrics.cpu_writeback_ms,
+                "train/sparse_optimizer_ms": sparse_metrics.optimizer_ms,
                 "train/h2d_bytes": sparse_metrics.bytes_h2d,
                 "train/d2h_bytes": sparse_metrics.bytes_d2h,
+                "train/h2d_gbps": h2d_gbps,
+                "train/d2h_gbps": d2h_gbps,
+                "train/active_param_mib": sparse_metrics.active_param_bytes / 1024 / 1024,
+                "train/active_grad_mib": sparse_metrics.active_grad_bytes / 1024 / 1024,
+                "train/active_optimizer_mib": sparse_metrics.active_optimizer_bytes / 1024 / 1024,
             })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm
@@ -744,7 +784,8 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+print0(f"Peak memory usage: {peak_memory_usage / 1024 / 1024:.2f}MiB")
+print0(f"Peak training-step memory usage: {peak_training_memory_usage / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
@@ -774,7 +815,8 @@ get_report().log(section="Base model training", data=[
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
-        "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+        "Peak memory usage": f"{peak_memory_usage / 1024 / 1024:.2f}MiB",
+        "Peak training-step memory usage": f"{peak_training_memory_usage / 1024 / 1024:.2f}MiB",
     }
 ])
 

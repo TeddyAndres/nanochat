@@ -57,6 +57,7 @@ def test_dynamic_vocab_runtime_updates_only_active_rows():
     original_wte_active = wte.weight[active_ids].clone()
 
     step_ctx = runtime.prepare_step(active_ids)
+    assert step_ctx.active_vocab is not None
     step_ctx.active_vocab["wte"].grad = torch.ones_like(step_ctx.active_vocab["wte"])
     step_ctx.active_vocab["lm_head"].grad = 2 * torch.ones_like(step_ctx.active_vocab["lm_head"])
     for value_embed in step_ctx.active_vocab["value_embeds"].values():
@@ -68,6 +69,13 @@ def test_dynamic_vocab_runtime_updates_only_active_rows():
     assert step_ctx.bytes_d2h > 0
     assert step_ctx.h2d_ms >= 0.0
     assert step_ctx.d2h_ms >= 0.0
+    assert step_ctx.optimizer_ms >= 0.0
+    assert step_ctx.d2h_launch_ms >= 0.0
+    assert step_ctx.d2h_sync_ms >= 0.0
+    assert step_ctx.cpu_writeback_ms >= 0.0
+    assert step_ctx.active_param_bytes > 0
+    assert step_ctx.active_optimizer_bytes > 0
+    assert step_ctx.active_grad_bytes > 0
     assert not torch.allclose(wte.weight[active_ids], original_wte_active)
     assert torch.allclose(wte.weight[inactive_id], original_wte_inactive)
 
@@ -78,6 +86,7 @@ def test_dynamic_vocab_runtime_state_dict_round_trip():
     runtime = DynamicVocabRuntime(model, device="cpu", embedding_lr=0.05, value_embedding_lr=0.04, unembedding_lr=0.03)
     active_ids = torch.tensor([1, 3, 7], dtype=torch.long)
     step_ctx = runtime.prepare_step(active_ids)
+    assert step_ctx.active_vocab is not None
     step_ctx.active_vocab["wte"].grad = torch.ones_like(step_ctx.active_vocab["wte"])
     step_ctx.active_vocab["lm_head"].grad = torch.ones_like(step_ctx.active_vocab["lm_head"])
     for value_embed in step_ctx.active_vocab["value_embeds"].values():
