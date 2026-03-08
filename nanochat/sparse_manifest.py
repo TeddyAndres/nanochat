@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
 
 SPARSE_MANIFEST_VERSION = 1
+
+
+def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
+    version = int(payload.get("version", -1))
+    if version != SPARSE_MANIFEST_VERSION:
+        raise ValueError(
+            f"Unsupported sparse manifest version {version}; expected {SPARSE_MANIFEST_VERSION}"
+        )
+    return payload
 
 
 def tensor_ids_to_list(ids: torch.Tensor) -> list[int]:
@@ -73,16 +82,100 @@ def save_sparse_manifest(path: str | Path, payload: dict[str, Any]) -> None:
         json.dump(payload, f)
 
 
+def load_sparse_manifest_header(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    marker = '"steps"'
+    with path.open("r", encoding="utf-8") as f:
+        buffer = ""
+        while True:
+            chunk = f.read(1 << 16)
+            if chunk == "":
+                raise ValueError("Sparse manifest is missing the steps array")
+            buffer += chunk
+            marker_idx = buffer.find(marker)
+            if marker_idx < 0:
+                continue
+            colon_idx = buffer.find(":", marker_idx + len(marker))
+            bracket_idx = buffer.find("[", colon_idx + 1)
+            if colon_idx < 0 or bracket_idx < 0:
+                continue
+            header_text = buffer[:marker_idx].rstrip()
+            if header_text.endswith(","):
+                header_text = header_text[:-1]
+            payload = json.loads(header_text + "}")
+            return _validate_manifest_version(payload)
+
+
+def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Iterator[dict[str, Any]]:
+    path = Path(path)
+    if start_step < 0:
+        raise ValueError(f"Sparse manifest start_step must be non-negative, got {start_step}")
+
+    marker = '"steps"'
+    decoder = json.JSONDecoder()
+
+    with path.open("r", encoding="utf-8") as f:
+        buffer = ""
+        while True:
+            chunk = f.read(1 << 16)
+            if chunk == "":
+                raise ValueError("Sparse manifest is missing the steps array")
+            buffer += chunk
+            marker_idx = buffer.find(marker)
+            if marker_idx < 0:
+                continue
+            colon_idx = buffer.find(":", marker_idx + len(marker))
+            bracket_idx = buffer.find("[", colon_idx + 1)
+            if colon_idx < 0 or bracket_idx < 0:
+                continue
+            header_text = buffer[:marker_idx].rstrip()
+            if header_text.endswith(","):
+                header_text = header_text[:-1]
+            _validate_manifest_version(json.loads(header_text + "}"))
+            buffer = buffer[bracket_idx + 1:]
+            break
+
+        step_idx = 0
+        while True:
+            while True:
+                stripped = buffer.lstrip()
+                consumed = len(buffer) - len(stripped)
+                if consumed > 0:
+                    buffer = stripped
+                    continue
+                if buffer.startswith(","):
+                    buffer = buffer[1:]
+                    continue
+                if buffer.startswith("]"):
+                    return
+                if buffer:
+                    break
+                chunk = f.read(1 << 16)
+                if chunk == "":
+                    raise ValueError("Sparse manifest ended unexpectedly while reading steps")
+                buffer += chunk
+
+            while True:
+                try:
+                    step_entry, end_idx = decoder.raw_decode(buffer)
+                    break
+                except json.JSONDecodeError:
+                    chunk = f.read(1 << 16)
+                    if chunk == "":
+                        raise ValueError("Sparse manifest ended unexpectedly while decoding a step entry")
+                    buffer += chunk
+
+            buffer = buffer[end_idx:]
+            if step_idx >= start_step:
+                yield step_entry
+            step_idx += 1
+
+
 def load_sparse_manifest(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
-    version = int(payload.get("version", -1))
-    if version != SPARSE_MANIFEST_VERSION:
-        raise ValueError(
-            f"Unsupported sparse manifest version {version}; expected {SPARSE_MANIFEST_VERSION}"
-        )
-    return payload
+    return _validate_manifest_version(payload)
 
 
 def validate_sparse_manifest(
@@ -119,6 +212,9 @@ def validate_sparse_manifest(
     u_max = int(payload.get("u_max", 0))
     if u_max <= 0:
         raise ValueError("Sparse manifest must define a positive u_max")
-    steps = payload.get("steps", [])
-    if len(steps) != int(payload.get("num_steps", -1)):
+    num_steps = int(payload.get("num_steps", -1))
+    if num_steps <= 0:
+        raise ValueError("Sparse manifest must define a positive num_steps")
+    steps = payload.get("steps")
+    if steps is not None and len(steps) != num_steps:
         raise ValueError("Sparse manifest num_steps does not match the number of stored steps")

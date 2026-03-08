@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
-from nanochat.sparse_manifest import load_sparse_manifest, validate_sparse_manifest
+from nanochat.sparse_manifest import load_sparse_manifest_header, stream_sparse_manifest_steps, validate_sparse_manifest
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
@@ -206,7 +206,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     """
     assert vocab_size is not None, "vocab_size is required for manifest sparse loader"
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    manifest = load_sparse_manifest(manifest_path)
+    manifest = load_sparse_manifest_header(manifest_path)
     validate_sparse_manifest(
         manifest,
         split=split,
@@ -217,8 +217,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         ddp_world_size=ddp_world_size,
     )
 
-    manifest_steps = manifest["steps"]
     u_max = int(manifest["u_max"])
+    num_manifest_steps = int(manifest["num_steps"])
     if u_max <= 0:
         raise ValueError("Sparse manifest must define a positive u_max")
 
@@ -228,9 +228,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         if key != "manifest_step"
     }
     manifest_step = 0 if resume_state_dict is None else int(resume_state_dict.get("manifest_step", 0))
-    if manifest_step < 0 or manifest_step >= len(manifest_steps):
+    if manifest_step < 0 or manifest_step >= num_manifest_steps:
         raise ValueError(
-            f"Sparse manifest step {manifest_step} is out of range for {len(manifest_steps)} stored steps"
+            f"Sparse manifest step {manifest_step} is out of range for {num_manifest_steps} stored steps"
         )
 
     base_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
@@ -289,7 +289,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         global_to_slot[next_new_ids] = assigned_slots_tensor
         return next_new_ids, assigned_slots_tensor
 
-    first_active_ids = torch.tensor(manifest_steps[0]["active_ids"], dtype=torch.long)
+    manifest_iter = stream_sparse_manifest_steps(manifest_path)
+    try:
+        current_step_entry = next(manifest_iter)
+    except StopIteration as exc:
+        raise ValueError("Sparse manifest contains no step entries") from exc
+
+    first_active_ids = torch.tensor(current_step_entry["active_ids"], dtype=torch.long)
     if first_active_ids.numel() > u_max:
         raise ValueError(
             f"Sparse manifest first step exceeds U_max: {first_active_ids.numel()} > {u_max}"
@@ -300,12 +306,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     current_new_ids = first_active_ids.clone()
     current_new_slots = first_slots.clone()
     for replay_step in range(manifest_step):
-        current_new_ids, current_new_slots = apply_next_transition(manifest_steps[replay_step])
+        current_new_ids, current_new_slots = apply_next_transition(current_step_entry)
+        try:
+            current_step_entry = next(manifest_iter)
+        except StopIteration as exc:
+            raise ValueError(
+                f"Sparse manifest ended before requested resume step {manifest_step}"
+            ) from exc
 
     while True:
-        if manifest_step >= len(manifest_steps):
+        if manifest_step >= num_manifest_steps:
             raise StopIteration
-        step_entry = manifest_steps[manifest_step]
         base_inputs, base_targets, base_state_dict = next(base_loader)
         cpu_inputs.copy_(base_inputs)
         cpu_targets.copy_(base_targets)
@@ -321,7 +332,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         active_mask_cpu = slot_to_global >= 0
         active_slot_ids_cpu = torch.nonzero(active_mask_cpu, as_tuple=False).flatten()
         active_ids_cpu = slot_to_global[active_slot_ids_cpu]
-        current_leaving_ids = torch.tensor(step_entry["next_leaving_ids"], dtype=torch.long)
+        current_leaving_ids = torch.tensor(current_step_entry["next_leaving_ids"], dtype=torch.long)
         if current_leaving_ids.numel() > 0:
             current_leaving_slots = global_to_slot[current_leaving_ids]
             if (current_leaving_slots < 0).any():
@@ -339,7 +350,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             "stage_slot_ids_cpu": current_new_slots.clone(),
             "writeback_ids_cpu": current_leaving_ids.clone(),
             "writeback_slot_ids_cpu": current_leaving_slots.clone(),
-            "is_last_step": manifest_step == len(manifest_steps) - 1,
+            "is_last_step": manifest_step == num_manifest_steps - 1,
         }
 
         state_dict = dict(base_state_dict)
@@ -348,8 +359,14 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, step_meta, state_dict
 
-        if manifest_step == len(manifest_steps) - 1:
+        if manifest_step == num_manifest_steps - 1:
             manifest_step += 1
             continue
-        current_new_ids, current_new_slots = apply_next_transition(step_entry)
+        current_new_ids, current_new_slots = apply_next_transition(current_step_entry)
         manifest_step += 1
+        try:
+            current_step_entry = next(manifest_iter)
+        except StopIteration as exc:
+            raise ValueError(
+                f"Sparse manifest ended early after step {manifest_step - 1}; expected {num_manifest_steps} total steps"
+            ) from exc

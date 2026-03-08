@@ -38,7 +38,7 @@ from nanochat.dynamic_vocab import DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
-from nanochat.sparse_manifest import load_sparse_manifest, validate_sparse_manifest
+from nanochat.sparse_manifest import load_sparse_manifest_header, validate_sparse_manifest
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -176,7 +176,7 @@ resuming = args.resume_from_step != -1
 sparse_manifest = None
 hybrid_sparse = args.sparse_mode and args.sparse_manifest != ""
 if hybrid_sparse:
-    sparse_manifest = load_sparse_manifest(args.sparse_manifest)
+    sparse_manifest = load_sparse_manifest_header(args.sparse_manifest)
 if args.sparse_mode:
     assert not ddp, "Sparse mode is single-GPU only for now"
     if hybrid_sparse:

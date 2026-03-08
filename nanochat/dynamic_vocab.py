@@ -237,14 +237,17 @@ class DynamicVocabRuntime:
 
     def _get_cpu_receive_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype):
         buffer = self._cpu_receive_buffers.get(name)
+        is_inference_buffer = bool(buffer is not None and getattr(buffer, "is_inference", lambda: False)())
         needs_new = (
             buffer is None or
+            is_inference_buffer or
             buffer.dtype != dtype or
             buffer.dim() != len(shape) or
             any(buffer.size(dim) < shape_dim for dim, shape_dim in enumerate(shape))
         )
         if needs_new:
-            buffer = torch.empty(shape, dtype=dtype, pin_memory=self.use_cuda)
+            with torch.inference_mode(False):
+                buffer = torch.empty(shape, dtype=dtype, pin_memory=self.use_cuda)
             self._cpu_receive_buffers[name] = buffer
         assert buffer is not None
         slices = tuple(slice(0, dim) for dim in shape)

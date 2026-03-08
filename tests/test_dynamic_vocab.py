@@ -224,3 +224,52 @@ def test_fixed_u_masked_logits_hide_inactive_slots():
 
     assert torch.isfinite(loss)
     assert torch.all(logits[..., 4:] < -1e8)
+
+
+def test_fixed_u_runtime_survives_inference_mode_materialization():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=6,
+    )
+
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2, 3, -1, -1],
+        stage_slots=[0, 1, 2, 3],
+        stage_ids=[0, 1, 2, 3],
+        writeback_slots=[0, 1, 2, 3],
+        writeback_ids=[0, 1, 2, 3],
+        is_last_step=False,
+    )
+    step_ctx = runtime.prepare_step(step_meta)
+    active_slots = step_ctx.active_slot_ids_cpu
+    assert active_slots is not None
+    step_ctx.active_vocab["wte"].grad = torch.zeros_like(step_ctx.active_vocab["wte"])
+    step_ctx.active_vocab["wte"].grad[active_slots] = 1
+    step_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step_ctx.active_vocab["lm_head"])
+    step_ctx.active_vocab["lm_head"].grad[active_slots] = 1
+    for value_embed in step_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+        value_embed.grad[active_slots] = 1
+    runtime.step(step_ctx)
+
+    with torch.inference_mode():
+        with runtime.materialize_dense_params():
+            _ = model(torch.tensor([[0, 1, 2, 3]], dtype=torch.long))
+
+    next_ctx = runtime.prepare_step(step_meta)
+    next_active_slots = next_ctx.active_slot_ids_cpu
+    assert next_active_slots is not None
+    next_ctx.active_vocab["wte"].grad = torch.zeros_like(next_ctx.active_vocab["wte"])
+    next_ctx.active_vocab["wte"].grad[next_active_slots] = 1
+    next_ctx.active_vocab["lm_head"].grad = torch.zeros_like(next_ctx.active_vocab["lm_head"])
+    next_ctx.active_vocab["lm_head"].grad[next_active_slots] = 1
+    for value_embed in next_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+        value_embed.grad[next_active_slots] = 1
+    runtime.step(next_ctx)
