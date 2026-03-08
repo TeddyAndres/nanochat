@@ -285,12 +285,16 @@ target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal
 d12_ref = build_model_meta(12) # creates the model on meta device
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
+sparse_step_tokens = args.device_batch_size * args.max_seq_len * ddp_world_size
 
 # 2) Now that we have the token horizon, we can calculate the optimal batch size
 # We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
 # The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
 total_batch_size = args.total_batch_size # user-provided override is possible
-if total_batch_size == -1:
+if args.sparse_mode and total_batch_size == -1:
+    total_batch_size = sparse_step_tokens
+    print0(f"Sparse mode forcing total batch size to one micro-batch: {total_batch_size:,} tokens")
+elif total_batch_size == -1:
     batch_size_ratio = target_tokens / D_REF
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
@@ -474,7 +478,11 @@ world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per 
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 if args.sparse_mode:
-    assert grad_accum_steps == 1, f"Sparse mode requires grad_accum_steps == 1, got {grad_accum_steps}"
+    assert grad_accum_steps == 1, (
+        f"Sparse mode requires grad_accum_steps == 1, got {grad_accum_steps}. "
+        f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
+        f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
+    )
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
