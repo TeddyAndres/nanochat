@@ -439,12 +439,22 @@ class GPT(nn.Module):
             logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
             logits = logits[..., :self.config.vocab_size] # slice to remove padding
         else:
-            logits = F.linear(x, active_vocab["lm_head"].to(dtype=x.dtype))
+            active_lm_head = active_vocab["lm_head"].to(dtype=x.dtype)
+            logits = F.linear(x, active_lm_head)
+            if "lm_head_negatives" in active_vocab:
+                negative_lm_head = active_vocab["lm_head_negatives"].to(dtype=x.dtype)
+                negative_logits = F.linear(x, negative_lm_head)
+                logits = torch.cat((logits, negative_logits), dim=-1)
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
         if active_vocab is not None and "logit_mask" in active_vocab:
             logit_mask = active_vocab["logit_mask"].to(device=logits.device, dtype=torch.bool)
-            logits = logits.masked_fill(~logit_mask.view(1, 1, -1), -1e9)
+            active_width = active_vocab["lm_head"].size(0)
+            active_logits = logits[..., :active_width].masked_fill(~logit_mask.view(1, 1, -1), -1e9)
+            if logits.size(-1) == active_width:
+                logits = active_logits
+            else:
+                logits = torch.cat((active_logits, logits[..., active_width:]), dim=-1)
         return logits
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None):

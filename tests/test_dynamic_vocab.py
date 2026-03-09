@@ -273,3 +273,76 @@ def test_fixed_u_runtime_survives_inference_mode_materialization():
         value_embed.grad = torch.zeros_like(value_embed)
         value_embed.grad[next_active_slots] = 1
     runtime.step(next_ctx)
+
+
+def test_dynamic_vocab_sampled_cold_negatives_extend_logits_and_update_rows():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        sampled_negative_count=2,
+    )
+    active_ids = torch.tensor([0, 2, 4], dtype=torch.long)
+    step_ctx = runtime.prepare_step(active_ids)
+
+    sampled_ids = step_ctx.sampled_negative_ids_cpu
+    assert sampled_ids is not None
+    assert sampled_ids.numel() == 2
+    assert not torch.isin(sampled_ids, active_ids).any()
+    assert step_ctx.active_vocab is not None
+    assert "lm_head_negatives" in step_ctx.active_vocab
+
+    idx = torch.tensor([[0, 1, 2, 0]], dtype=torch.long)
+    targets = torch.tensor([[1, 2, 0, 1]], dtype=torch.long)
+    logits = model(idx, active_vocab=step_ctx.active_vocab)
+    assert logits.shape[-1] == active_ids.numel() + sampled_ids.numel()
+
+    lm_head_param = runtime.table_specs["lm_head"]["param"]
+    original_sampled_rows = lm_head_param[sampled_ids].clone()
+    step_ctx.active_vocab["wte"].grad = torch.zeros_like(step_ctx.active_vocab["wte"])
+    step_ctx.active_vocab["lm_head"].grad = torch.ones_like(step_ctx.active_vocab["lm_head"])
+    step_ctx.active_vocab["lm_head_negatives"].grad = torch.ones_like(step_ctx.active_vocab["lm_head_negatives"])
+    for value_embed in step_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+
+    runtime.step(step_ctx)
+
+    assert runtime.state[lm_head_param]["step"] == 1
+    assert not torch.allclose(lm_head_param[sampled_ids], original_sampled_rows)
+
+
+def test_fixed_u_sampled_cold_negatives_append_after_masked_slots():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=6,
+        sampled_negative_count=2,
+    )
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2, 3, -1, -1],
+        stage_slots=[0, 1, 2, 3],
+        stage_ids=[0, 1, 2, 3],
+        writeback_slots=[0, 1, 2, 3],
+        writeback_ids=[0, 1, 2, 3],
+        is_last_step=True,
+    )
+    step_ctx = runtime.prepare_step(step_meta)
+    sampled_ids = step_ctx.sampled_negative_ids_cpu
+    assert sampled_ids is not None
+    assert sampled_ids.numel() == 2
+
+    idx = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    logits = model(idx, active_vocab=step_ctx.active_vocab)
+
+    assert logits.shape[-1] == 8
+    assert torch.all(logits[..., 4:6] < -1e8)
+    assert torch.all(torch.isfinite(logits[..., 6:]))

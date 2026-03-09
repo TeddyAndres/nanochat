@@ -76,6 +76,7 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
+parser.add_argument("--sparse-cold-negative-count", type=int, default=0, help="number of sampled cold lm_head rows to append to sparse training logits for normalization correction (0 disables)")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="in sparse mode, call torch.cuda.empty_cache() every N steps after writeback (0 disables)")
 parser.add_argument("--sparse-max-reserved-mib", type=float, default=8192.0, help="in sparse mode, if current CUDA reserved memory exceeds this threshold after a step, trim the cache with torch.cuda.empty_cache() (0 disables)")
@@ -333,18 +334,9 @@ if batch_ratio != 1.0:
     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
 
-sparse_vocab_lr_scale = 1.0
-if args.sparse_mode and hybrid_sparse:
-    u_max = int(sparse_manifest["u_max"])
-    sparse_vocab_lr_scale = min((u_max / vocab_size) ** 0.5, 1.0)
-    print0(
-        f"Scaling sparse vocab-table LRs by {sparse_vocab_lr_scale:.4f} "
-        f"for U_max={u_max:,} vs vocab={vocab_size:,}"
-    )
-
-sparse_embedding_lr = args.embedding_lr * batch_lr_scale * sparse_vocab_lr_scale
-sparse_value_embedding_lr = (args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale * sparse_vocab_lr_scale
-sparse_unembedding_lr = args.unembedding_lr * batch_lr_scale * sparse_vocab_lr_scale
+sparse_embedding_lr = args.embedding_lr * batch_lr_scale
+sparse_value_embedding_lr = (args.embedding_lr if args.value_embed_lr < 0 else args.value_embed_lr) * batch_lr_scale
+sparse_unembedding_lr = args.unembedding_lr * batch_lr_scale
 
 # 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
 # We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
@@ -374,6 +366,9 @@ optimizer = model.setup_optimizer(
 dynamic_vocab = None
 optimizer_data_sparse = None
 if args.sparse_mode:
+    assert args.sparse_cold_negative_count >= 0, "--sparse-cold-negative-count must be non-negative"
+    if args.sparse_cold_negative_count > 0:
+        print0(f"Sparse normalization fix: adding {args.sparse_cold_negative_count:,} sampled cold lm_head negatives per step")
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,
@@ -381,6 +376,7 @@ if args.sparse_mode:
         value_embedding_lr=sparse_value_embedding_lr,
         unembedding_lr=sparse_unembedding_lr,
         fixed_u_max=(None if not hybrid_sparse else int(sparse_manifest["u_max"])),
+        sampled_negative_count=args.sparse_cold_negative_count,
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
