@@ -61,6 +61,7 @@ class DynamicVocabRuntime:
         embedding_lr,
         unembedding_lr,
         fixed_u_max=None,
+        grad_accum_u_max=None,
         sampled_negative_count=0,
         value_embedding_lr=None,
         adam_betas=(0.8, 0.95),
@@ -75,6 +76,14 @@ class DynamicVocabRuntime:
         self.weight_decay = weight_decay
         self.fixed_u_max = 0 if fixed_u_max is None else int(fixed_u_max)
         self.fixed_u_mode = self.fixed_u_max > 0
+        default_grad_accum_u_max = self.fixed_u_max if self.fixed_u_mode else 0
+        self.grad_accum_u_max = default_grad_accum_u_max if grad_accum_u_max is None else int(grad_accum_u_max)
+        if self.grad_accum_u_max < 0:
+            raise ValueError(f"grad_accum_u_max must be non-negative, got {self.grad_accum_u_max}")
+        if self.fixed_u_mode and self.grad_accum_u_max < self.fixed_u_max:
+            raise ValueError(
+                f"grad_accum_u_max must be at least fixed_u_max in fixed-U sparse mode, got grad_accum_u_max={self.grad_accum_u_max}, fixed_u_max={self.fixed_u_max}"
+            )
         self.sampled_negative_count = int(sampled_negative_count)
         if self.sampled_negative_count < 0:
             raise ValueError(f"sampled_negative_count must be non-negative, got {self.sampled_negative_count}")
@@ -119,6 +128,7 @@ class DynamicVocabRuntime:
         self._grad_accum_ids_cpu = None
         self._grad_accum_global_to_local_cpu = None
         self._grad_accum_buffers = None
+        self._grad_accum_count = 0
         self._grad_accum_live = False
         self._grad_accum_stage_count = 0
         self._grad_accum_pending_transfers = []
@@ -220,8 +230,32 @@ class DynamicVocabRuntime:
         self._grad_accum_pending_transfers = []
         self._grad_accum_ids_cpu = None
         self._grad_accum_global_to_local_cpu = None
-        self._grad_accum_buffers = None
+        self._grad_accum_count = 0
         self._grad_accum_live = False
+
+    def _ensure_grad_accum_buffers(self, capacity: int) -> None:
+        needs_new = self._grad_accum_buffers is None
+        if not needs_new:
+            assert self._grad_accum_buffers is not None
+            for name, spec in self.table_specs.items():
+                param = spec["param"]
+                buffer = self._grad_accum_buffers.get(name)
+                expected_rank = param.dim()
+                if (
+                    buffer is None or
+                    buffer.dtype != param.dtype or
+                    buffer.dim() != expected_rank or
+                    buffer.size(0) < capacity or
+                    any(buffer.size(dim) != param.size(dim) for dim in range(1, expected_rank))
+                ):
+                    needs_new = True
+                    break
+        if needs_new:
+            self._grad_accum_buffers = {}
+            for name, spec in self.table_specs.items():
+                param = spec["param"]
+                shape = (capacity,) + tuple(param.shape[1:])
+                self._grad_accum_buffers[name] = torch.zeros(shape, dtype=param.dtype, device="cpu")
 
     def _flush_pending_grad_accum_transfers(self, wait: bool) -> None:
         if not self._grad_accum_pending_transfers:
@@ -287,16 +321,23 @@ class DynamicVocabRuntime:
 
     def _start_grad_accum_window(self, grad_accum_ids_cpu: torch.Tensor):
         grad_accum_ids_cpu = grad_accum_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        grad_accum_count = int(grad_accum_ids_cpu.numel())
+        capacity = self.grad_accum_u_max if self.grad_accum_u_max > 0 else grad_accum_count
+        if grad_accum_count > capacity:
+            raise ValueError(
+                f"Sparse grad accumulation overflow: need {grad_accum_count} rows, capacity is {capacity}"
+            )
         self._grad_accum_ids_cpu = grad_accum_ids_cpu
+        self._grad_accum_count = grad_accum_count
         global_to_local = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-        if grad_accum_ids_cpu.numel() > 0:
-            global_to_local[grad_accum_ids_cpu] = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        if grad_accum_count > 0:
+            global_to_local[grad_accum_ids_cpu] = torch.arange(grad_accum_count, dtype=torch.long)
         self._grad_accum_global_to_local_cpu = global_to_local
-        self._grad_accum_buffers = {}
-        for name, spec in self.table_specs.items():
-            param = spec["param"]
-            shape = (grad_accum_ids_cpu.numel(),) + tuple(param.shape[1:])
-            self._grad_accum_buffers[name] = torch.zeros(shape, dtype=param.dtype, device="cpu")
+        self._ensure_grad_accum_buffers(capacity)
+        assert self._grad_accum_buffers is not None
+        for buffer in self._grad_accum_buffers.values():
+            if grad_accum_count > 0:
+                buffer[:grad_accum_count].zero_()
         self._grad_accum_live = True
         self._grad_accum_stage_count = 0
 
@@ -686,6 +727,7 @@ class DynamicVocabRuntime:
         self._flush_pending_grad_accum_transfers(wait=True)
 
         grad_accum_ids_cpu = self._grad_accum_ids_cpu
+        grad_accum_count = self._grad_accum_count
         cpu_rows = {}
         cpu_exp_avg = {}
         cpu_exp_avg_sq = {}
@@ -715,7 +757,7 @@ class DynamicVocabRuntime:
             for name in gpu_rows
         }
         for name in self.table_specs:
-            active_params[name].grad = self._grad_accum_buffers[name].to(self.device, non_blocking=self.use_cuda)
+            active_params[name].grad = self._grad_accum_buffers[name][:grad_accum_count].to(self.device, non_blocking=self.use_cuda)
             self._adamw_update_(name, active_params[name], optimizer_state[name])
 
         live_count = int(grad_accum_ids_cpu.numel())
@@ -769,7 +811,7 @@ class DynamicVocabRuntime:
             optimizer_state=None,
             unique_count=int(grad_accum_ids_cpu.numel()),
             live_count=live_count,
-            u_capacity=self.fixed_u_max if self.fixed_u_mode else int(grad_accum_ids_cpu.numel()),
+            u_capacity=self.grad_accum_u_max if self.grad_accum_u_max > 0 else int(grad_accum_ids_cpu.numel()),
             stage_count=int(self._grad_accum_stage_count),
             writeback_count=int(grad_accum_ids_cpu.numel()),
             fixed_u_mode=self.fixed_u_mode,

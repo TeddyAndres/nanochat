@@ -126,5 +126,6 @@ def test_sparse_manifest_v2_accumulation_windows(tmp_path):
 
     assert header["version"] == 2
     assert header["u_max"] == 3
+    assert header["grad_accum_u_max"] == 4
     assert header["num_steps"] == 1
     assert list(stream_sparse_manifest_steps(manifest_path)) == steps

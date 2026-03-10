@@ -59,6 +59,7 @@ def build_manifest_payload(
 ) -> dict[str, Any]:
     first_step = steps[0] if steps else None
     version = 1
+    grad_accum_u_max = 0
     if first_step is not None and "microsteps" in first_step:
         version = 2
         u_max = max(
@@ -69,8 +70,13 @@ def build_manifest_payload(
             ),
             default=0,
         )
+        grad_accum_u_max = max(
+            (int(step.get("grad_accum_u_size", 0)) for step in steps),
+            default=u_max,
+        )
     else:
         u_max = max((int(step["u_size"]) for step in steps), default=0)
+        grad_accum_u_max = u_max
     return {
         "version": version,
         "split": split,
@@ -85,6 +91,7 @@ def build_manifest_payload(
         "tokenizer_threads": int(tokenizer_threads),
         "buffer_size": int(buffer_size),
         "u_max": int(u_max),
+        "grad_accum_u_max": int(grad_accum_u_max),
         "steps": steps,
     }
 
@@ -226,6 +233,11 @@ def validate_sparse_manifest(
     u_max = int(payload.get("u_max", 0))
     if u_max <= 0:
         raise ValueError("Sparse manifest must define a positive u_max")
+    grad_accum_u_max = int(payload.get("grad_accum_u_max", u_max))
+    if grad_accum_u_max < u_max:
+        raise ValueError(
+            f"Sparse manifest grad_accum_u_max must be at least u_max, found grad_accum_u_max={grad_accum_u_max}, u_max={u_max}"
+        )
     num_steps = int(payload.get("num_steps", -1))
     if num_steps <= 0:
         raise ValueError("Sparse manifest must define a positive num_steps")
@@ -244,4 +256,13 @@ def validate_sparse_manifest(
             if not isinstance(grad_accum_ids, list) or len(grad_accum_ids) == 0:
                 raise ValueError(
                     f"Sparse manifest step {step_idx} must define a non-empty grad_accum_active_ids list"
+                )
+            grad_accum_u_size = int(step_entry.get("grad_accum_u_size", len(grad_accum_ids)))
+            if grad_accum_u_size != len(grad_accum_ids):
+                raise ValueError(
+                    f"Sparse manifest step {step_idx} grad_accum_u_size mismatch: expected {grad_accum_u_size}, found {len(grad_accum_ids)} ids"
+                )
+            if grad_accum_u_size > grad_accum_u_max:
+                raise ValueError(
+                    f"Sparse manifest step {step_idx} grad_accum_u_size exceeds grad_accum_u_max: {grad_accum_u_size} > {grad_accum_u_max}"
                 )

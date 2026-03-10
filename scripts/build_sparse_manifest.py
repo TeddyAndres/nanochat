@@ -160,7 +160,9 @@ def main() -> None:
     )
     save_sparse_manifest(args.output, payload)
     print0(
-        f"Saved sparse manifest to {args.output} | u_max={payload['u_max']:,} | steps={payload['num_steps']:,} | grad_accum_steps={grad_accum_steps:,}"
+        f"Saved sparse manifest to {args.output} | u_max={payload['u_max']:,} | "
+        f"grad_accum_u_max={payload.get('grad_accum_u_max', payload['u_max']):,} | "
+        f"steps={payload['num_steps']:,} | grad_accum_steps={grad_accum_steps:,}"
     )
 
 

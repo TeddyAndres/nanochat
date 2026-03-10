@@ -391,7 +391,8 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         embedding_lr=0.05,
         value_embedding_lr=0.04,
         unembedding_lr=0.03,
-        fixed_u_max=6,
+        fixed_u_max=3,
+        grad_accum_u_max=4,
     )
     reference_runtime = DynamicVocabRuntime(
         reference_model,
@@ -403,7 +404,7 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
     union_ids = [1, 3, 7, 9]
 
     step0 = build_fixed_step_meta(
-        slot_to_global=[1, 3, 7, -1, -1, -1],
+        slot_to_global=[1, 3, 7],
         stage_slots=[0, 1, 2],
         stage_ids=[1, 3, 7],
         writeback_slots=[0],
@@ -436,7 +437,7 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
     assert runtime.state[wte_param]["step"] == 0
 
     step1 = build_fixed_step_meta(
-        slot_to_global=[3, 7, 9, -1, -1, -1],
+        slot_to_global=[3, 7, 9],
         stage_slots=[2],
         stage_ids=[9],
         writeback_slots=[0],
@@ -505,12 +506,13 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
         embedding_lr=0.05,
         value_embedding_lr=0.04,
         unembedding_lr=0.03,
-        fixed_u_max=6,
+        fixed_u_max=3,
+        grad_accum_u_max=4,
     )
 
     union_ids = [1, 3, 7, 9]
     step0 = build_fixed_step_meta(
-        slot_to_global=[1, 3, 7, -1, -1, -1],
+        slot_to_global=[1, 3, 7],
         stage_slots=[0, 1, 2],
         stage_ids=[1, 3, 7],
         writeback_slots=[0],
@@ -530,7 +532,7 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
     runtime.accumulate_gradients(step0_ctx)
 
     step1 = build_fixed_step_meta(
-        slot_to_global=[3, 7, 9, -1, -1, -1],
+        slot_to_global=[3, 7, 9],
         stage_slots=[2],
         stage_ids=[9],
         writeback_slots=[0],
@@ -555,9 +557,10 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
     assert torch.equal(runtime.fixed_slot_to_global_cpu[:3], torch.tensor([3, 7, 9], dtype=torch.long))
     assert metrics.live_count == 3
     assert metrics.unique_count == 4
+    assert metrics.u_capacity == 4
 
     next_step = build_fixed_step_meta(
-        slot_to_global=[7, 9, 5, -1, -1, -1],
+        slot_to_global=[7, 9, 5],
         stage_slots=[2],
         stage_ids=[5],
         writeback_slots=[0],

@@ -369,13 +369,20 @@ if args.sparse_mode:
     assert args.sparse_cold_negative_count >= 0, "--sparse-cold-negative-count must be non-negative"
     if args.sparse_cold_negative_count > 0:
         print0(f"Sparse normalization fix: adding {args.sparse_cold_negative_count:,} importance-corrected sampled cold lm_head negatives per step")
+    sparse_fixed_u_max = None
+    sparse_grad_accum_u_max = None
+    if hybrid_sparse:
+        assert sparse_manifest is not None
+        sparse_fixed_u_max = int(sparse_manifest["u_max"])
+        sparse_grad_accum_u_max = int(sparse_manifest.get("grad_accum_u_max", sparse_manifest["u_max"]))
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,
         embedding_lr=sparse_embedding_lr,
         value_embedding_lr=sparse_value_embedding_lr,
         unembedding_lr=sparse_unembedding_lr,
-        fixed_u_max=(None if not hybrid_sparse else int(sparse_manifest["u_max"])),
+        fixed_u_max=sparse_fixed_u_max,
+        grad_accum_u_max=sparse_grad_accum_u_max,
         sampled_negative_count=args.sparse_cold_negative_count,
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
@@ -551,7 +558,11 @@ if hybrid_sparse:
         ddp_world_size=ddp_world_size,
         num_iterations=num_iterations,
     )
-    print0(f"Sparse hybrid manifest: {args.sparse_manifest} | U_max={int(sparse_manifest['u_max']):,}")
+    print0(
+        f"Sparse hybrid manifest: {args.sparse_manifest} | "
+        f"U_max={int(sparse_manifest['u_max']):,} | "
+        f"grad_accum_U_max={int(sparse_manifest.get('grad_accum_u_max', sparse_manifest['u_max'])):,}"
+    )
 
 # Go!
 while True:
