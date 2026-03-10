@@ -13,6 +13,7 @@ class DynamicVocabStep:
     active_vocab: Optional[dict]
     optimizer_state: Optional[dict]
     unique_count: int
+    live_count: int = 0
     bytes_h2d: int = 0
     h2d_ms: float = 0.0
     bytes_d2h: int = 0
@@ -48,7 +49,7 @@ class DynamicVocabRuntime:
 
     First-pass constraints:
     - single GPU only
-    - grad_accum_steps == 1
+    - grad_accum_steps == 1 for the non-manifest first-pass sparse path
     - vocab tables are offloaded to CPU masters between optimizer steps
     - optimizer moments for vocab tables live on CPU and are staged to GPU only for active rows
     """
@@ -119,6 +120,7 @@ class DynamicVocabRuntime:
         self._grad_accum_global_to_local_cpu = None
         self._grad_accum_buffers = None
         self._grad_accum_live = False
+        self._grad_accum_stage_count = 0
         if self.fixed_u_mode:
             self.fixed_slot_to_global_cpu = torch.full((self.fixed_u_max,), -1, dtype=torch.long)
             self.fixed_active_mask_cpu = torch.zeros(self.fixed_u_max, dtype=torch.bool)
@@ -231,6 +233,7 @@ class DynamicVocabRuntime:
             shape = (grad_accum_ids_cpu.numel(),) + tuple(param.shape[1:])
             self._grad_accum_buffers[name] = torch.zeros(shape, dtype=param.dtype, device="cpu")
         self._grad_accum_live = True
+        self._grad_accum_stage_count = 0
 
     def _writeback_fixed_rows_(self, global_ids_cpu: torch.Tensor, slot_ids_cpu: torch.Tensor):
         global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
@@ -417,6 +420,7 @@ class DynamicVocabRuntime:
             active_vocab=active_vocab,
             optimizer_state=optimizer_state,
             unique_count=active_ids_cpu.numel(),
+            live_count=active_ids_cpu.numel(),
             u_capacity=active_ids_cpu.numel(),
             stage_count=active_ids_cpu.numel(),
             sampled_negative_ids_cpu=sampled_negative_ids_cpu,
@@ -493,6 +497,7 @@ class DynamicVocabRuntime:
             active_vocab=step_active_vocab,
             optimizer_state=step_optimizer_state,
             unique_count=active_ids_cpu.numel(),
+            live_count=active_ids_cpu.numel(),
             u_capacity=self.fixed_u_max,
             stage_count=stage_ids_cpu.numel(),
             active_slot_ids_cpu=active_slot_ids_cpu,
@@ -600,7 +605,9 @@ class DynamicVocabRuntime:
         self._clear_fixed_grads()
         step_ctx.active_vocab = None
         step_ctx.optimizer_state = None
+        self._grad_accum_stage_count += int(step_ctx.stage_count)
         step_ctx.unique_count = int(step_ctx.grad_accum_ids_cpu.numel())
+        step_ctx.live_count = int(step_ctx.active_ids_cpu.numel())
         return step_ctx
 
     @torch.no_grad()
@@ -641,6 +648,36 @@ class DynamicVocabRuntime:
             active_params[name].grad = self._grad_accum_buffers[name].to(self.device, non_blocking=self.use_cuda)
             self._adamw_update_(name, active_params[name], optimizer_state[name])
 
+        live_count = int(grad_accum_ids_cpu.numel())
+        if self.fixed_u_mode and self._fixed_live_state:
+            assert self.fixed_slot_to_global_cpu is not None
+            live_slot_ids_cpu = torch.nonzero(self.fixed_slot_to_global_cpu >= 0, as_tuple=False).flatten()
+            live_count = int(live_slot_ids_cpu.numel())
+            if live_slot_ids_cpu.numel() > 0:
+                assert self._grad_accum_global_to_local_cpu is not None
+                live_global_ids_cpu = self.fixed_slot_to_global_cpu[live_slot_ids_cpu]
+                live_union_row_ids_cpu = self._grad_accum_global_to_local_cpu[live_global_ids_cpu]
+                if (live_union_row_ids_cpu < 0).any():
+                    raise ValueError("Sparse grad accumulation map is missing live fixed-U rows")
+                live_slot_ids = live_slot_ids_cpu.to(self.device)
+                live_union_row_ids = live_union_row_ids_cpu.to(self.device)
+                for name in self.table_specs:
+                    self.fixed_params[name].data.index_copy_(
+                        0,
+                        live_slot_ids,
+                        active_params[name].detach().index_select(0, live_union_row_ids),
+                    )
+                    self.fixed_optimizer_state[name]["exp_avg"].index_copy_(
+                        0,
+                        live_slot_ids,
+                        optimizer_state[name]["exp_avg"].detach().index_select(0, live_union_row_ids),
+                    )
+                    self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(
+                        0,
+                        live_slot_ids,
+                        optimizer_state[name]["exp_avg_sq"].detach().index_select(0, live_union_row_ids),
+                    )
+
         for name, spec in self.table_specs.items():
             param = spec["param"]
             state = self.state[param]
@@ -661,12 +698,13 @@ class DynamicVocabRuntime:
             active_vocab=None,
             optimizer_state=None,
             unique_count=int(grad_accum_ids_cpu.numel()),
+            live_count=live_count,
             u_capacity=self.fixed_u_max if self.fixed_u_mode else int(grad_accum_ids_cpu.numel()),
-            stage_count=int(grad_accum_ids_cpu.numel()),
+            stage_count=int(self._grad_accum_stage_count),
             writeback_count=int(grad_accum_ids_cpu.numel()),
             fixed_u_mode=self.fixed_u_mode,
         )
-        self._invalidate_fixed_live_state()
+        self._clear_fixed_grads()
         self._clear_grad_accum_window()
         return metrics
 

@@ -494,3 +494,79 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         reference_param = reference_runtime.table_specs[name]["param"]
         assert torch.allclose(runtime_param[union_ids_tensor], reference_param[union_ids_tensor])
         assert runtime.state[runtime_param]["step"] == reference_runtime.state[reference_param]["step"]
+
+
+def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+
+    union_ids = [1, 3, 7, 9]
+    step0 = build_fixed_step_meta(
+        slot_to_global=[1, 3, 7, -1, -1, -1],
+        stage_slots=[0, 1, 2],
+        stage_ids=[1, 3, 7],
+        writeback_slots=[0],
+        writeback_ids=[1],
+        is_last_step=False,
+        grad_accum_ids=union_ids,
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+    )
+    step0_ctx = runtime.prepare_step(step0)
+    slots0 = step0_ctx.active_slot_ids_cpu
+    assert slots0 is not None
+    for name, param in runtime.fixed_params.items():
+        param.grad = torch.zeros_like(param)
+        param.grad[slots0] = 1
+    runtime.accumulate_gradients(step0_ctx)
+
+    step1 = build_fixed_step_meta(
+        slot_to_global=[3, 7, 9, -1, -1, -1],
+        stage_slots=[2],
+        stage_ids=[9],
+        writeback_slots=[0],
+        writeback_ids=[3],
+        is_last_step=False,
+        grad_accum_ids=union_ids,
+        grad_accum_steps=2,
+        grad_accum_micro_step=1,
+        is_grad_accum_boundary=True,
+    )
+    step1_ctx = runtime.prepare_step(step1)
+    slots1 = step1_ctx.active_slot_ids_cpu
+    assert slots1 is not None
+    for name, param in runtime.fixed_params.items():
+        param.grad = torch.zeros_like(param)
+        param.grad[slots1] = 2
+    runtime.accumulate_gradients(step1_ctx)
+    metrics = runtime.apply_accumulated_gradients()
+
+    assert runtime._fixed_live_state
+    assert runtime.fixed_slot_to_global_cpu is not None
+    assert torch.equal(runtime.fixed_slot_to_global_cpu[:3], torch.tensor([3, 7, 9], dtype=torch.long))
+    assert metrics.live_count == 3
+    assert metrics.unique_count == 4
+
+    next_step = build_fixed_step_meta(
+        slot_to_global=[7, 9, 5, -1, -1, -1],
+        stage_slots=[2],
+        stage_ids=[5],
+        writeback_slots=[0],
+        writeback_ids=[3],
+        is_last_step=False,
+        grad_accum_ids=[5, 7, 9],
+        grad_accum_steps=1,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=True,
+    )
+    next_ctx = runtime.prepare_step(next_step)
+    assert next_ctx.stage_count == 1

@@ -701,6 +701,7 @@ while True:
     t0 = time.time()
     sparse_step_ctx = None
     sparse_window_metrics = None
+    train_loss_accum = None
     for micro_step in range(grad_accum_steps):
         if args.sparse_mode:
             sparse_step_ctx = dynamic_vocab.prepare_step(sparse_batch_meta)
@@ -708,7 +709,8 @@ while True:
             loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab)
         else:
             loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        micro_loss = loss.detach()
+        train_loss_accum = micro_loss if train_loss_accum is None else (train_loss_accum + micro_loss)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -769,7 +771,8 @@ while True:
         should_trim_sparse_cache = over_step_interval or over_reserved_limit
         if should_trim_sparse_cache:
             torch.cuda.empty_cache()
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    assert train_loss_accum is not None
+    train_loss_f = (train_loss_accum / grad_accum_steps).item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -801,7 +804,11 @@ while True:
     grad_norm_str = "" if grad_norm is None else f" | grad_norm: {grad_norm:.4f}"
     sparse_str = ""
     if sparse_metrics is not None:
-        sparse_str = f" | U: {sparse_metrics.unique_count:,}"
+        live_u = sparse_metrics.live_count if sparse_metrics.live_count > 0 else sparse_metrics.unique_count
+        if sparse_metrics.unique_count != live_u:
+            sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
+        else:
+            sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
     should_print_step = (step == 0) or (step == num_iterations - 1) or (args.log_every > 0 and step % args.log_every == 0)
     if should_print_step:
         print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
@@ -822,6 +829,9 @@ while True:
         if sparse_metrics is not None:
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
+                "train/u_live": sparse_metrics.live_count if sparse_metrics.live_count > 0 else sparse_metrics.unique_count,
+                "train/u_stage": sparse_metrics.stage_count,
+                "train/u_writeback": sparse_metrics.writeback_count,
             })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm
