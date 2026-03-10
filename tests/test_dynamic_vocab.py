@@ -5,6 +5,8 @@ Run:
 python -m pytest tests/test_dynamic_vocab.py -v
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -278,6 +280,8 @@ def test_fixed_u_runtime_survives_inference_mode_materialization():
 def test_dynamic_vocab_sampled_cold_negatives_extend_logits_and_update_rows():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
+    for param in model.parameters():
+        param.data.zero_()
     runtime = DynamicVocabRuntime(
         model,
         device="cpu",
@@ -295,11 +299,16 @@ def test_dynamic_vocab_sampled_cold_negatives_extend_logits_and_update_rows():
     assert not torch.isin(sampled_ids, active_ids).any()
     assert step_ctx.active_vocab is not None
     assert "lm_head_negatives" in step_ctx.active_vocab
+    expected_bias = math.log((model.config.vocab_size - active_ids.numel()) / sampled_ids.numel())
+    assert math.isclose(step_ctx.active_vocab["lm_head_negative_logit_bias"].item(), expected_bias, rel_tol=0.0, abs_tol=1e-6)
 
     idx = torch.tensor([[0, 1, 2, 0]], dtype=torch.long)
     targets = torch.tensor([[1, 2, 0, 1]], dtype=torch.long)
     logits = model(idx, active_vocab=step_ctx.active_vocab)
     assert logits.shape[-1] == active_ids.numel() + sampled_ids.numel()
+    expected_negative_logit = 20.0 * math.tanh(expected_bias / 20.0)
+    assert torch.allclose(logits[..., :active_ids.numel()], torch.zeros_like(logits[..., :active_ids.numel()]), atol=2e-3, rtol=0.0)
+    assert torch.allclose(logits[..., -sampled_ids.numel():], torch.full_like(logits[..., -sampled_ids.numel():], expected_negative_logit), atol=2e-3, rtol=0.0)
 
     lm_head_param = runtime.table_specs["lm_head"]["param"]
     original_sampled_rows = lm_head_param[sampled_ids].clone()
@@ -318,6 +327,8 @@ def test_dynamic_vocab_sampled_cold_negatives_extend_logits_and_update_rows():
 def test_fixed_u_sampled_cold_negatives_append_after_masked_slots():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
+    for param in model.parameters():
+        param.data.zero_()
     runtime = DynamicVocabRuntime(
         model,
         device="cpu",
@@ -339,10 +350,13 @@ def test_fixed_u_sampled_cold_negatives_append_after_masked_slots():
     sampled_ids = step_ctx.sampled_negative_ids_cpu
     assert sampled_ids is not None
     assert sampled_ids.numel() == 2
+    expected_bias = math.log((model.config.vocab_size - step_ctx.active_ids_cpu.numel()) / sampled_ids.numel())
+    assert math.isclose(step_ctx.active_vocab["lm_head_negative_logit_bias"].item(), expected_bias, rel_tol=0.0, abs_tol=1e-6)
 
     idx = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
     logits = model(idx, active_vocab=step_ctx.active_vocab)
 
     assert logits.shape[-1] == 8
     assert torch.all(logits[..., 4:6] < -1e8)
-    assert torch.all(torch.isfinite(logits[..., 6:]))
+    expected_negative_logit = 20.0 * math.tanh(expected_bias / 20.0)
+    assert torch.allclose(logits[..., 6:], torch.full_like(logits[..., 6:], expected_negative_logit), atol=2e-3, rtol=0.0)

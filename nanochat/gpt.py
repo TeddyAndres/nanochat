@@ -444,6 +444,9 @@ class GPT(nn.Module):
             if "lm_head_negatives" in active_vocab:
                 negative_lm_head = active_vocab["lm_head_negatives"].to(dtype=x.dtype)
                 negative_logits = F.linear(x, negative_lm_head)
+                negative_logit_bias = active_vocab.get("lm_head_negative_logit_bias")
+                if negative_logit_bias is not None:
+                    negative_logits = negative_logits + negative_logit_bias.to(device=x.device, dtype=x.dtype)
                 logits = torch.cat((logits, negative_logits), dim=-1)
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits

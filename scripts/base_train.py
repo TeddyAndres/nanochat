@@ -368,7 +368,7 @@ optimizer_data_sparse = None
 if args.sparse_mode:
     assert args.sparse_cold_negative_count >= 0, "--sparse-cold-negative-count must be non-negative"
     if args.sparse_cold_negative_count > 0:
-        print0(f"Sparse normalization fix: adding {args.sparse_cold_negative_count:,} sampled cold lm_head negatives per step")
+        print0(f"Sparse normalization fix: adding {args.sparse_cold_negative_count:,} importance-corrected sampled cold lm_head negatives per step")
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,

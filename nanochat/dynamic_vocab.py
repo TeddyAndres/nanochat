@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Optional
@@ -276,6 +277,15 @@ class DynamicVocabRuntime:
             },
         )
 
+    def _compute_sampled_negative_logit_bias(self, active_ids_cpu: torch.Tensor, sampled_ids_cpu: torch.Tensor) -> float:
+        sampled_count = int(sampled_ids_cpu.numel())
+        if sampled_count == 0:
+            return 0.0
+        cold_count = int(self.model.config.vocab_size) - int(active_ids_cpu.numel())
+        if cold_count <= sampled_count:
+            return 0.0
+        return math.log(cold_count / sampled_count)
+
     def _writeback_sampled_negative_rows_(self, sampled_ids_cpu: torch.Tensor, sampled_param: nn.Parameter, sampled_state: dict):
         sampled_ids_cpu = sampled_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         if sampled_ids_cpu.numel() == 0:
@@ -352,6 +362,11 @@ class DynamicVocabRuntime:
         sampled_negative_param, sampled_negative_state = self._stage_sampled_negative_state(sampled_negative_ids_cpu)
         if sampled_negative_param is not None and sampled_negative_state is not None:
             active_vocab["lm_head_negatives"] = sampled_negative_param
+            active_vocab["lm_head_negative_logit_bias"] = torch.tensor(
+                self._compute_sampled_negative_logit_bias(active_ids_cpu, sampled_negative_ids_cpu),
+                device=self.device,
+                dtype=gpu_rows["lm_head"].dtype,
+            )
             optimizer_state["lm_head_negatives"] = sampled_negative_state
         return DynamicVocabStep(
             active_ids_cpu=active_ids_cpu,
@@ -416,6 +431,11 @@ class DynamicVocabRuntime:
         }
         if sampled_negative_param is not None and sampled_negative_state is not None:
             step_active_vocab["lm_head_negatives"] = sampled_negative_param
+            step_active_vocab["lm_head_negative_logit_bias"] = torch.tensor(
+                self._compute_sampled_negative_logit_bias(active_ids_cpu, sampled_negative_ids_cpu),
+                device=self.device,
+                dtype=self.fixed_params["lm_head"].dtype,
+            )
             step_optimizer_state["lm_head_negatives"] = sampled_negative_state
 
         return DynamicVocabStep(
