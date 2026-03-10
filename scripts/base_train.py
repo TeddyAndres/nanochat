@@ -530,11 +530,12 @@ world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per 
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 if args.sparse_mode:
-    assert grad_accum_steps == 1, (
-        f"Sparse mode requires grad_accum_steps == 1, got {grad_accum_steps}. "
-        f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
-        f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
-    )
+    if not hybrid_sparse:
+        assert grad_accum_steps == 1, (
+            f"First-pass dynamic sparse mode requires grad_accum_steps == 1, got {grad_accum_steps}. "
+            f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
+            f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
+        )
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -699,6 +700,7 @@ while True:
     reset_peak_memory()
     t0 = time.time()
     sparse_step_ctx = None
+    sparse_window_metrics = None
     for micro_step in range(grad_accum_steps):
         if args.sparse_mode:
             sparse_step_ctx = dynamic_vocab.prepare_step(sparse_batch_meta)
@@ -712,6 +714,10 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        if args.sparse_mode and grad_accum_steps > 1:
+            assert sparse_step_ctx is not None
+            sparse_window_metrics = dynamic_vocab.accumulate_gradients(sparse_step_ctx)
+            sparse_step_ctx = None
         if not final_train_step:
             if args.sparse_mode:
                 x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # prefetch the next sparse batch while GPU is busy with backward
@@ -745,9 +751,13 @@ while True:
             grad_norm = compute_global_grad_norm(optimizer)
         optimizer.step()
     if args.sparse_mode:
-        assert sparse_step_ctx is not None
-        sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
-        sparse_step_ctx = None
+        if grad_accum_steps > 1:
+            sparse_metrics = dynamic_vocab.apply_accumulated_gradients()
+            sparse_step_ctx = None
+        else:
+            assert sparse_step_ctx is not None
+            sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
+            sparse_step_ctx = None
     model.zero_grad(set_to_none=True)
     should_trim_sparse_cache = False
     if (

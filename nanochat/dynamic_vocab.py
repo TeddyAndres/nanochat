@@ -35,6 +35,10 @@ class DynamicVocabStep:
     writeback_ids_cpu: Optional[torch.Tensor] = None
     writeback_slot_ids_cpu: Optional[torch.Tensor] = None
     sampled_negative_ids_cpu: Optional[torch.Tensor] = None
+    grad_accum_ids_cpu: Optional[torch.Tensor] = None
+    grad_accum_steps: int = 1
+    grad_accum_micro_step: int = 0
+    is_grad_accum_boundary: bool = True
     is_last_step: bool = False
     fixed_u_mode: bool = False
 
@@ -111,6 +115,10 @@ class DynamicVocabRuntime:
         self.fixed_slot_to_global_cpu = None
         self.fixed_active_mask_cpu = None
         self._fixed_live_state = False
+        self._grad_accum_ids_cpu = None
+        self._grad_accum_global_to_local_cpu = None
+        self._grad_accum_buffers = None
+        self._grad_accum_live = False
         if self.fixed_u_mode:
             self.fixed_slot_to_global_cpu = torch.full((self.fixed_u_max,), -1, dtype=torch.long)
             self.fixed_active_mask_cpu = torch.zeros(self.fixed_u_max, dtype=torch.bool)
@@ -168,6 +176,8 @@ class DynamicVocabRuntime:
         """Temporarily move full vocab tables to the model device for dense eval/inference."""
         original_data = {}
         try:
+            if self._grad_accum_live:
+                raise RuntimeError("Cannot materialize dense params while sparse accumulated gradients are pending")
             self.flush_active_to_cpu()
             for spec in self.table_specs.values():
                 param = spec["param"]
@@ -189,6 +199,38 @@ class DynamicVocabRuntime:
             return
         for param in self.fixed_params.values():
             param.grad = None
+
+    def _invalidate_fixed_live_state(self):
+        if not self.fixed_u_mode:
+            return
+        self._fixed_live_state = False
+        if self.fixed_slot_to_global_cpu is not None:
+            self.fixed_slot_to_global_cpu.fill_(-1)
+        if self.fixed_active_mask_cpu is not None:
+            self.fixed_active_mask_cpu.zero_()
+        if self.fixed_logit_mask is not None:
+            self.fixed_logit_mask.zero_()
+        self._clear_fixed_grads()
+
+    def _clear_grad_accum_window(self):
+        self._grad_accum_ids_cpu = None
+        self._grad_accum_global_to_local_cpu = None
+        self._grad_accum_buffers = None
+        self._grad_accum_live = False
+
+    def _start_grad_accum_window(self, grad_accum_ids_cpu: torch.Tensor):
+        grad_accum_ids_cpu = grad_accum_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        self._grad_accum_ids_cpu = grad_accum_ids_cpu
+        global_to_local = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+        if grad_accum_ids_cpu.numel() > 0:
+            global_to_local[grad_accum_ids_cpu] = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        self._grad_accum_global_to_local_cpu = global_to_local
+        self._grad_accum_buffers = {}
+        for name, spec in self.table_specs.items():
+            param = spec["param"]
+            shape = (grad_accum_ids_cpu.numel(),) + tuple(param.shape[1:])
+            self._grad_accum_buffers[name] = torch.zeros(shape, dtype=param.dtype, device="cpu")
+        self._grad_accum_live = True
 
     def _writeback_fixed_rows_(self, global_ids_cpu: torch.Tensor, slot_ids_cpu: torch.Tensor):
         global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
@@ -225,6 +267,8 @@ class DynamicVocabRuntime:
 
     @torch.no_grad()
     def flush_active_to_cpu(self):
+        if self._grad_accum_live:
+            raise RuntimeError("Cannot flush active sparse rows while sparse accumulated gradients are pending")
         if not self.fixed_u_mode or not self._fixed_live_state:
             return
         assert self.fixed_slot_to_global_cpu is not None
@@ -381,6 +425,10 @@ class DynamicVocabRuntime:
     def _prepare_fixed_step(self, step_meta: dict) -> DynamicVocabStep:
         assert self.fixed_u_mode, "Fixed-U step requested without fixed_u_max runtime configuration"
         active_ids_cpu = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        grad_accum_ids_cpu = step_meta.get("grad_accum_ids_cpu", active_ids_cpu).detach().to(device="cpu", dtype=torch.long)
+        grad_accum_steps = int(step_meta.get("grad_accum_steps", 1))
+        grad_accum_micro_step = int(step_meta.get("grad_accum_micro_step", 0))
+        is_grad_accum_boundary = bool(step_meta.get("is_grad_accum_boundary", True))
         active_slot_ids_cpu = step_meta["active_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
@@ -420,6 +468,8 @@ class DynamicVocabRuntime:
         self.fixed_logit_mask.copy_(active_mask_cpu.to(self.device, non_blocking=self.use_cuda))
         self._fixed_live_state = True
 
+        if grad_accum_steps > 1 and self.sampled_negative_count > 0:
+            raise ValueError("Sparse grad accumulation does not yet support sampled cold negatives; set --sparse-cold-negative-count 0")
         sampled_negative_ids_cpu = self._sample_cold_negative_ids(active_ids_cpu)
         sampled_negative_param, sampled_negative_state = self._stage_sampled_negative_state(sampled_negative_ids_cpu)
         step_active_vocab = {
@@ -453,6 +503,10 @@ class DynamicVocabRuntime:
             writeback_ids_cpu=writeback_ids_cpu,
             writeback_slot_ids_cpu=writeback_slot_ids_cpu,
             sampled_negative_ids_cpu=sampled_negative_ids_cpu,
+            grad_accum_ids_cpu=grad_accum_ids_cpu,
+            grad_accum_steps=grad_accum_steps,
+            grad_accum_micro_step=grad_accum_micro_step,
+            is_grad_accum_boundary=is_grad_accum_boundary,
             is_last_step=is_last_step,
             fixed_u_mode=True,
         )
@@ -510,6 +564,111 @@ class DynamicVocabRuntime:
         active_param.index_copy_(0, slot_ids, param_rows)
         exp_avg.index_copy_(0, slot_ids, exp_avg_rows)
         exp_avg_sq.index_copy_(0, slot_ids, exp_avg_sq_rows)
+
+    @torch.no_grad()
+    def accumulate_gradients(self, step_ctx: DynamicVocabStep) -> DynamicVocabStep:
+        assert step_ctx.fixed_u_mode, "Sparse grad accumulation currently supports fixed-U mode only"
+        assert step_ctx.active_slot_ids_cpu is not None
+        assert step_ctx.active_ids_cpu is not None
+        if step_ctx.grad_accum_ids_cpu is None:
+            raise ValueError("Sparse grad accumulation requires grad_accum_ids_cpu metadata")
+        if step_ctx.sampled_negative_ids_cpu is not None and step_ctx.sampled_negative_ids_cpu.numel() > 0:
+            raise ValueError("Sparse grad accumulation does not yet support sampled cold negatives")
+
+        if (not self._grad_accum_live) or self._grad_accum_ids_cpu is None or not torch.equal(self._grad_accum_ids_cpu, step_ctx.grad_accum_ids_cpu):
+            self._start_grad_accum_window(step_ctx.grad_accum_ids_cpu)
+
+        assert self._grad_accum_global_to_local_cpu is not None
+        assert self._grad_accum_buffers is not None
+        accum_row_ids_cpu = self._grad_accum_global_to_local_cpu[step_ctx.active_ids_cpu]
+        if (accum_row_ids_cpu < 0).any():
+            raise ValueError("Sparse grad accumulation map is missing active vocab rows")
+        active_slot_ids_device = step_ctx.active_slot_ids_cpu.to(self.device)
+
+        for name in self.table_specs:
+            if name == "wte":
+                grad = self.fixed_params["wte"].grad
+            elif name == "lm_head":
+                grad = self.fixed_params["lm_head"].grad
+            else:
+                grad = self.fixed_params[name].grad
+            if grad is None:
+                continue
+            grad_rows = grad.detach().index_select(0, active_slot_ids_device).to(device="cpu", dtype=self._grad_accum_buffers[name].dtype)
+            self._grad_accum_buffers[name].index_add_(0, accum_row_ids_cpu, grad_rows)
+
+        self._clear_fixed_grads()
+        step_ctx.active_vocab = None
+        step_ctx.optimizer_state = None
+        step_ctx.unique_count = int(step_ctx.grad_accum_ids_cpu.numel())
+        return step_ctx
+
+    @torch.no_grad()
+    def apply_accumulated_gradients(self) -> DynamicVocabStep:
+        if not self._grad_accum_live or self._grad_accum_ids_cpu is None or self._grad_accum_buffers is None:
+            raise ValueError("No sparse accumulated gradients are pending")
+
+        grad_accum_ids_cpu = self._grad_accum_ids_cpu
+        cpu_rows = {}
+        cpu_exp_avg = {}
+        cpu_exp_avg_sq = {}
+        for name, spec in self.table_specs.items():
+            param = spec["param"]
+            state = self.state[param]
+            rows = param.index_select(0, grad_accum_ids_cpu)
+            exp_avg = state["exp_avg"].index_select(0, grad_accum_ids_cpu)
+            exp_avg_sq = state["exp_avg_sq"].index_select(0, grad_accum_ids_cpu)
+            cpu_rows[name] = rows
+            cpu_exp_avg[name] = exp_avg
+            cpu_exp_avg_sq[name] = exp_avg_sq
+
+        gpu_rows = self._stage_rows_to_gpu(cpu_rows)
+        gpu_exp_avg = self._stage_rows_to_gpu(cpu_exp_avg)
+        gpu_exp_avg_sq = self._stage_rows_to_gpu(cpu_exp_avg_sq)
+
+        active_params = {
+            name: nn.Parameter(gpu_rows[name], requires_grad=True)
+            for name in gpu_rows
+        }
+        optimizer_state = {
+            name: {
+                "exp_avg": gpu_exp_avg[name],
+                "exp_avg_sq": gpu_exp_avg_sq[name],
+            }
+            for name in gpu_rows
+        }
+        for name in self.table_specs:
+            active_params[name].grad = self._grad_accum_buffers[name].to(self.device, non_blocking=self.use_cuda)
+            self._adamw_update_(name, active_params[name], optimizer_state[name])
+
+        for name, spec in self.table_specs.items():
+            param = spec["param"]
+            state = self.state[param]
+            row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}", tuple(active_params[name].shape), active_params[name].dtype)
+            exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}", tuple(optimizer_state[name]["exp_avg"].shape), optimizer_state[name]["exp_avg"].dtype)
+            exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}", tuple(optimizer_state[name]["exp_avg_sq"].shape), optimizer_state[name]["exp_avg_sq"].dtype)
+            row_buffer.copy_(active_params[name].detach(), non_blocking=self.use_cuda)
+            exp_avg_buffer.copy_(optimizer_state[name]["exp_avg"].detach(), non_blocking=self.use_cuda)
+            exp_avg_sq_buffer.copy_(optimizer_state[name]["exp_avg_sq"].detach(), non_blocking=self.use_cuda)
+            if self.use_cuda:
+                torch.cuda.synchronize(self.device)
+            param.index_copy_(0, grad_accum_ids_cpu, row_buffer)
+            state["exp_avg"].index_copy_(0, grad_accum_ids_cpu, exp_avg_buffer)
+            state["exp_avg_sq"].index_copy_(0, grad_accum_ids_cpu, exp_avg_sq_buffer)
+
+        metrics = DynamicVocabStep(
+            active_ids_cpu=grad_accum_ids_cpu,
+            active_vocab=None,
+            optimizer_state=None,
+            unique_count=int(grad_accum_ids_cpu.numel()),
+            u_capacity=self.fixed_u_max if self.fixed_u_mode else int(grad_accum_ids_cpu.numel()),
+            stage_count=int(grad_accum_ids_cpu.numel()),
+            writeback_count=int(grad_accum_ids_cpu.numel()),
+            fixed_u_mode=self.fixed_u_mode,
+        )
+        self._invalidate_fixed_live_state()
+        self._clear_grad_accum_window()
+        return metrics
 
     @torch.no_grad()
     def step(self, step_ctx: DynamicVocabStep) -> DynamicVocabStep:

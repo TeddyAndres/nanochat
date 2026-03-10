@@ -207,13 +207,14 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     assert vocab_size is not None, "vocab_size is required for manifest sparse loader"
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     manifest = load_sparse_manifest_header(manifest_path)
+    manifest_version = int(manifest.get("version", 1))
     validate_sparse_manifest(
         manifest,
         split=split,
         vocab_size=vocab_size,
         device_batch_size=B,
         max_seq_len=T,
-        grad_accum_steps=1,
+        grad_accum_steps=int(manifest.get("grad_accum_steps", 1)),
         ddp_world_size=ddp_world_size,
     )
 
@@ -295,7 +296,19 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     except StopIteration as exc:
         raise ValueError("Sparse manifest contains no step entries") from exc
 
-    first_active_ids = torch.tensor(current_step_entry["active_ids"], dtype=torch.long)
+    def get_microsteps(step_entry):
+        if manifest_version >= 2:
+            microsteps = step_entry.get("microsteps")
+            if not isinstance(microsteps, list) or len(microsteps) == 0:
+                raise ValueError("Sparse manifest step is missing microsteps")
+            return microsteps
+        return [step_entry]
+
+    current_microsteps = get_microsteps(current_step_entry)
+    current_micro_idx = 0
+    current_micro_entry = current_microsteps[current_micro_idx]
+
+    first_active_ids = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
     if first_active_ids.numel() > u_max:
         raise ValueError(
             f"Sparse manifest first step exceeds U_max: {first_active_ids.numel()} > {u_max}"
@@ -306,13 +319,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     current_new_ids = first_active_ids.clone()
     current_new_slots = first_slots.clone()
     for replay_step in range(manifest_step):
-        current_new_ids, current_new_slots = apply_next_transition(current_step_entry)
+        for replay_micro_entry in current_microsteps:
+            current_new_ids, current_new_slots = apply_next_transition(replay_micro_entry)
         try:
             current_step_entry = next(manifest_iter)
         except StopIteration as exc:
             raise ValueError(
                 f"Sparse manifest ended before requested resume step {manifest_step}"
             ) from exc
+        current_microsteps = get_microsteps(current_step_entry)
+        current_micro_idx = 0
+        current_micro_entry = current_microsteps[current_micro_idx]
 
     while True:
         if manifest_step >= num_manifest_steps:
@@ -332,13 +349,21 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         active_mask_cpu = slot_to_global >= 0
         active_slot_ids_cpu = torch.nonzero(active_mask_cpu, as_tuple=False).flatten()
         active_ids_cpu = slot_to_global[active_slot_ids_cpu]
-        current_leaving_ids = torch.tensor(current_step_entry["next_leaving_ids"], dtype=torch.long)
+        current_leaving_ids = torch.tensor(current_micro_entry["next_leaving_ids"], dtype=torch.long)
         if current_leaving_ids.numel() > 0:
             current_leaving_slots = global_to_slot[current_leaving_ids]
             if (current_leaving_slots < 0).any():
                 raise ValueError("Sparse manifest leaving ids are not present in the current slot map")
         else:
             current_leaving_slots = torch.empty(0, dtype=torch.long)
+
+        grad_accum_ids_cpu = active_ids_cpu.clone()
+        accum_steps = 1
+        micro_step_index = 0
+        if manifest_version >= 2:
+            grad_accum_ids_cpu = torch.tensor(current_step_entry["grad_accum_active_ids"], dtype=torch.long)
+            accum_steps = len(current_microsteps)
+            micro_step_index = current_micro_idx
 
         step_meta = {
             "mode": "fixed-u",
@@ -351,6 +376,10 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             "writeback_ids_cpu": current_leaving_ids.clone(),
             "writeback_slot_ids_cpu": current_leaving_slots.clone(),
             "is_last_step": manifest_step == num_manifest_steps - 1,
+            "grad_accum_ids_cpu": grad_accum_ids_cpu.clone(),
+            "grad_accum_steps": accum_steps,
+            "grad_accum_micro_step": micro_step_index,
+            "is_grad_accum_boundary": micro_step_index == accum_steps - 1,
         }
 
         state_dict = dict(base_state_dict)
@@ -359,10 +388,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, step_meta, state_dict
 
-        if manifest_step == num_manifest_steps - 1:
+        is_last_microstep = current_micro_idx == len(current_microsteps) - 1
+        if manifest_step == num_manifest_steps - 1 and is_last_microstep:
             manifest_step += 1
             continue
-        current_new_ids, current_new_slots = apply_next_transition(current_step_entry)
+
+        current_new_ids, current_new_slots = apply_next_transition(current_micro_entry)
+        if not is_last_microstep:
+            current_micro_idx += 1
+            current_micro_entry = current_microsteps[current_micro_idx]
+            continue
+
         manifest_step += 1
         try:
             current_step_entry = next(manifest_iter)
@@ -370,3 +406,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             raise ValueError(
                 f"Sparse manifest ended early after step {manifest_step - 1}; expected {num_manifest_steps} total steps"
             ) from exc
+        current_microsteps = get_microsteps(current_step_entry)
+        current_micro_idx = 0
+        current_micro_entry = current_microsteps[current_micro_idx]

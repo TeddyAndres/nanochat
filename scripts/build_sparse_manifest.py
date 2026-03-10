@@ -7,6 +7,8 @@ python -m scripts.build_sparse_manifest --num-iterations 2000 --output manifests
 
 import argparse
 
+import torch
+
 from nanochat.common import get_dist_info, print0
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic
 from nanochat.sparse_manifest import build_manifest_payload, compute_next_transition, save_sparse_manifest, tensor_ids_to_list
@@ -31,9 +33,6 @@ def main() -> None:
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp:
         raise ValueError("Sparse manifest builder is single-process only; run it without torchrun")
-    if args.grad_accum_steps != 1:
-        raise ValueError("Sparse manifest builder currently supports grad_accum_steps == 1 only")
-
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
     total_batch_size = args.total_batch_size
@@ -60,23 +59,38 @@ def main() -> None:
 
     steps: list[dict] = []
     previous_active_ids = None
+    previous_microstep_entry = None
     for step_idx in range(args.num_iterations):
-        _, _, active_ids_cpu, _ = next(loader)
-        active_ids_cpu = active_ids_cpu.to(device="cpu")
-        if previous_active_ids is not None:
-            next_common_ids, next_leaving_ids, next_new_ids = compute_next_transition(previous_active_ids, active_ids_cpu)
-            steps[-1]["next_common_ids"] = tensor_ids_to_list(next_common_ids)
-            steps[-1]["next_leaving_ids"] = tensor_ids_to_list(next_leaving_ids)
-            steps[-1]["next_new_ids"] = tensor_ids_to_list(next_new_ids)
+        microsteps: list[dict] = []
+        active_ids_list = []
+        for micro_idx in range(args.grad_accum_steps):
+            _, _, active_ids_cpu, _ = next(loader)
+            active_ids_cpu = active_ids_cpu.to(device="cpu")
+            active_ids_list.append(active_ids_cpu)
+            if previous_active_ids is not None and previous_microstep_entry is not None:
+                next_common_ids, next_leaving_ids, next_new_ids = compute_next_transition(previous_active_ids, active_ids_cpu)
+                previous_microstep_entry["next_common_ids"] = tensor_ids_to_list(next_common_ids)
+                previous_microstep_entry["next_leaving_ids"] = tensor_ids_to_list(next_leaving_ids)
+                previous_microstep_entry["next_new_ids"] = tensor_ids_to_list(next_new_ids)
+            microstep_entry = {
+                "microstep": micro_idx,
+                "u_size": int(active_ids_cpu.numel()),
+                "active_ids": tensor_ids_to_list(active_ids_cpu),
+                "next_common_ids": [],
+                "next_leaving_ids": [],
+                "next_new_ids": [],
+            }
+            microsteps.append(microstep_entry)
+            previous_active_ids = active_ids_cpu
+            previous_microstep_entry = microstep_entry
+
+        grad_accum_ids_cpu = torch.unique(torch.cat(active_ids_list), sorted=True)
         steps.append({
             "step": step_idx,
-            "u_size": int(active_ids_cpu.numel()),
-            "active_ids": tensor_ids_to_list(active_ids_cpu),
-            "next_common_ids": [],
-            "next_leaving_ids": [],
-            "next_new_ids": [],
+            "grad_accum_u_size": int(grad_accum_ids_cpu.numel()),
+            "grad_accum_active_ids": tensor_ids_to_list(grad_accum_ids_cpu),
+            "microsteps": microsteps,
         })
-        previous_active_ids = active_ids_cpu
         if (step_idx + 1) % 100 == 0 or step_idx + 1 == args.num_iterations:
             print0(f"  processed {step_idx + 1:,}/{args.num_iterations:,} steps")
 

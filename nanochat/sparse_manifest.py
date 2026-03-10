@@ -7,14 +7,15 @@ from typing import Any, Iterator
 import torch
 
 
-SPARSE_MANIFEST_VERSION = 1
+SPARSE_MANIFEST_VERSION = 2
+SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2}
 
 
 def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
     version = int(payload.get("version", -1))
-    if version != SPARSE_MANIFEST_VERSION:
+    if version not in SUPPORTED_SPARSE_MANIFEST_VERSIONS:
         raise ValueError(
-            f"Unsupported sparse manifest version {version}; expected {SPARSE_MANIFEST_VERSION}"
+            f"Unsupported sparse manifest version {version}; expected one of {sorted(SUPPORTED_SPARSE_MANIFEST_VERSIONS)}"
         )
     return payload
 
@@ -56,9 +57,22 @@ def build_manifest_payload(
     buffer_size: int,
     steps: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    u_max = max((int(step["u_size"]) for step in steps), default=0)
+    first_step = steps[0] if steps else None
+    version = 1
+    if first_step is not None and "microsteps" in first_step:
+        version = 2
+        u_max = max(
+            (
+                int(microstep["u_size"])
+                for step in steps
+                for microstep in step.get("microsteps", [])
+            ),
+            default=0,
+        )
+    else:
+        u_max = max((int(step["u_size"]) for step in steps), default=0)
     return {
-        "version": SPARSE_MANIFEST_VERSION,
+        "version": version,
         "split": split,
         "vocab_size": int(vocab_size),
         "device_batch_size": int(device_batch_size),
@@ -218,3 +232,16 @@ def validate_sparse_manifest(
     steps = payload.get("steps")
     if steps is not None and len(steps) != num_steps:
         raise ValueError("Sparse manifest num_steps does not match the number of stored steps")
+    version = int(payload.get("version", 1))
+    if version == 2 and steps is not None:
+        for step_idx, step_entry in enumerate(steps):
+            microsteps = step_entry.get("microsteps")
+            if not isinstance(microsteps, list) or len(microsteps) != grad_accum_steps:
+                raise ValueError(
+                    f"Sparse manifest step {step_idx} must store {grad_accum_steps} microsteps, found {0 if microsteps is None else len(microsteps)}"
+                )
+            grad_accum_ids = step_entry.get("grad_accum_active_ids")
+            if not isinstance(grad_accum_ids, list) or len(grad_accum_ids) == 0:
+                raise ValueError(
+                    f"Sparse manifest step {step_idx} must define a non-empty grad_accum_active_ids list"
+                )

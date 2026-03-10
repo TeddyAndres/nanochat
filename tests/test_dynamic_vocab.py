@@ -29,11 +29,24 @@ def build_tiny_model(vocab_size=8):
     return model
 
 
-def build_fixed_step_meta(slot_to_global, stage_slots, stage_ids, writeback_slots, writeback_ids, is_last_step=False):
+def build_fixed_step_meta(
+    slot_to_global,
+    stage_slots,
+    stage_ids,
+    writeback_slots,
+    writeback_ids,
+    is_last_step=False,
+    grad_accum_ids=None,
+    grad_accum_steps=1,
+    grad_accum_micro_step=0,
+    is_grad_accum_boundary=True,
+):
     slot_to_global = torch.tensor(slot_to_global, dtype=torch.long)
     active_mask = slot_to_global >= 0
     active_slot_ids = torch.nonzero(active_mask, as_tuple=False).flatten()
     active_ids = slot_to_global[active_slot_ids]
+    if grad_accum_ids is None:
+        grad_accum_ids = active_ids.tolist()
     return {
         "mode": "fixed-u",
         "active_ids_cpu": active_ids,
@@ -44,6 +57,10 @@ def build_fixed_step_meta(slot_to_global, stage_slots, stage_ids, writeback_slot
         "stage_slot_ids_cpu": torch.tensor(stage_slots, dtype=torch.long),
         "writeback_ids_cpu": torch.tensor(writeback_ids, dtype=torch.long),
         "writeback_slot_ids_cpu": torch.tensor(writeback_slots, dtype=torch.long),
+        "grad_accum_ids_cpu": torch.tensor(grad_accum_ids, dtype=torch.long),
+        "grad_accum_steps": grad_accum_steps,
+        "grad_accum_micro_step": grad_accum_micro_step,
+        "is_grad_accum_boundary": is_grad_accum_boundary,
         "is_last_step": is_last_step,
     }
 
@@ -360,3 +377,120 @@ def test_fixed_u_sampled_cold_negatives_append_after_masked_slots():
     assert torch.all(logits[..., 4:6] < -1e8)
     expected_negative_logit = 20.0 * math.tanh(expected_bias / 20.0)
     assert torch.allclose(logits[..., 6:], torch.full_like(logits[..., 6:], expected_negative_logit), atol=2e-3, rtol=0.0)
+
+
+def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=10)
+    reference_model = build_tiny_model(vocab_size=10)
+    reference_model.load_state_dict(model.state_dict())
+
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+    reference_runtime = DynamicVocabRuntime(
+        reference_model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+    )
+    union_ids = [1, 3, 7, 9]
+
+    step0 = build_fixed_step_meta(
+        slot_to_global=[1, 3, 7, -1, -1, -1],
+        stage_slots=[0, 1, 2],
+        stage_ids=[1, 3, 7],
+        writeback_slots=[0],
+        writeback_ids=[1],
+        is_last_step=False,
+        grad_accum_ids=union_ids,
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+    )
+    step0_ctx = runtime.prepare_step(step0)
+    slots0 = step0_ctx.active_slot_ids_cpu
+    assert slots0 is not None
+    step0_ctx.active_vocab["wte"].grad = torch.zeros_like(step0_ctx.active_vocab["wte"])
+    step0_ctx.active_vocab["wte"].grad[slots0[0]] = 1
+    step0_ctx.active_vocab["wte"].grad[slots0[1]] = 2
+    step0_ctx.active_vocab["wte"].grad[slots0[2]] = 3
+    step0_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step0_ctx.active_vocab["lm_head"])
+    step0_ctx.active_vocab["lm_head"].grad[slots0[0]] = 10
+    step0_ctx.active_vocab["lm_head"].grad[slots0[1]] = 20
+    step0_ctx.active_vocab["lm_head"].grad[slots0[2]] = 30
+    for value_embed in step0_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+        value_embed.grad[slots0[0]] = 100
+        value_embed.grad[slots0[1]] = 200
+        value_embed.grad[slots0[2]] = 300
+    runtime.accumulate_gradients(step0_ctx)
+
+    wte_param = runtime.table_specs["wte"]["param"]
+    assert runtime.state[wte_param]["step"] == 0
+
+    step1 = build_fixed_step_meta(
+        slot_to_global=[3, 7, 9, -1, -1, -1],
+        stage_slots=[2],
+        stage_ids=[9],
+        writeback_slots=[0],
+        writeback_ids=[3],
+        is_last_step=False,
+        grad_accum_ids=union_ids,
+        grad_accum_steps=2,
+        grad_accum_micro_step=1,
+        is_grad_accum_boundary=True,
+    )
+    step1_ctx = runtime.prepare_step(step1)
+    slots1 = step1_ctx.active_slot_ids_cpu
+    assert slots1 is not None
+    step1_ctx.active_vocab["wte"].grad = torch.zeros_like(step1_ctx.active_vocab["wte"])
+    step1_ctx.active_vocab["wte"].grad[slots1[0]] = 4
+    step1_ctx.active_vocab["wte"].grad[slots1[1]] = 5
+    step1_ctx.active_vocab["wte"].grad[slots1[2]] = 6
+    step1_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step1_ctx.active_vocab["lm_head"])
+    step1_ctx.active_vocab["lm_head"].grad[slots1[0]] = 40
+    step1_ctx.active_vocab["lm_head"].grad[slots1[1]] = 50
+    step1_ctx.active_vocab["lm_head"].grad[slots1[2]] = 60
+    for value_embed in step1_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+        value_embed.grad[slots1[0]] = 400
+        value_embed.grad[slots1[1]] = 500
+        value_embed.grad[slots1[2]] = 600
+    runtime.accumulate_gradients(step1_ctx)
+    runtime.apply_accumulated_gradients()
+
+    reference_ctx = reference_runtime.prepare_step(torch.tensor(union_ids, dtype=torch.long))
+    reference_ctx.active_vocab["wte"].grad = torch.stack([
+        torch.ones_like(reference_ctx.active_vocab["wte"][0]) * 1,
+        torch.ones_like(reference_ctx.active_vocab["wte"][1]) * 6,
+        torch.ones_like(reference_ctx.active_vocab["wte"][2]) * 8,
+        torch.ones_like(reference_ctx.active_vocab["wte"][3]) * 6,
+    ])
+    reference_ctx.active_vocab["lm_head"].grad = torch.stack([
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][0]) * 10,
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][1]) * 60,
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][2]) * 80,
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][3]) * 60,
+    ])
+    for value_embed in reference_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.stack([
+            torch.ones_like(value_embed[0]) * 100,
+            torch.ones_like(value_embed[1]) * 600,
+            torch.ones_like(value_embed[2]) * 800,
+            torch.ones_like(value_embed[3]) * 600,
+        ])
+    reference_runtime.step(reference_ctx)
+
+    union_ids_tensor = torch.tensor(union_ids, dtype=torch.long)
+    for name in runtime.table_specs:
+        runtime_param = runtime.table_specs[name]["param"]
+        reference_param = reference_runtime.table_specs[name]["param"]
+        assert torch.allclose(runtime_param[union_ids_tensor], reference_param[union_ids_tensor])
+        assert runtime.state[runtime_param]["step"] == reference_runtime.state[reference_param]["step"]
