@@ -315,7 +315,7 @@ sparse_step_tokens = args.device_batch_size * args.max_seq_len * ddp_world_size
 # We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
 # The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
 total_batch_size = args.total_batch_size # user-provided override is possible
-if args.sparse_mode and total_batch_size == -1:
+if args.sparse_mode and not hybrid_sparse and total_batch_size == -1:
     total_batch_size = sparse_step_tokens
     print0(f"Sparse mode forcing total batch size to one micro-batch: {total_batch_size:,} tokens")
 elif total_batch_size == -1:
