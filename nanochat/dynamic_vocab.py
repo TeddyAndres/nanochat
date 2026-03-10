@@ -121,6 +121,8 @@ class DynamicVocabRuntime:
         self._grad_accum_buffers = None
         self._grad_accum_live = False
         self._grad_accum_stage_count = 0
+        self._grad_accum_pending_transfers = []
+        self._grad_accum_transfer_stream = torch.cuda.Stream(device=self.device) if self.use_cuda else None
         if self.fixed_u_mode:
             self.fixed_slot_to_global_cpu = torch.full((self.fixed_u_max,), -1, dtype=torch.long)
             self.fixed_active_mask_cpu = torch.zeros(self.fixed_u_max, dtype=torch.bool)
@@ -215,10 +217,73 @@ class DynamicVocabRuntime:
         self._clear_fixed_grads()
 
     def _clear_grad_accum_window(self):
+        self._grad_accum_pending_transfers = []
         self._grad_accum_ids_cpu = None
         self._grad_accum_global_to_local_cpu = None
         self._grad_accum_buffers = None
         self._grad_accum_live = False
+
+    def _flush_pending_grad_accum_transfers(self, wait: bool) -> None:
+        if not self._grad_accum_pending_transfers:
+            return
+        if self._grad_accum_buffers is None:
+            raise RuntimeError("Sparse grad accumulation buffers are missing while transfers are pending")
+
+        remaining = []
+        for pending in self._grad_accum_pending_transfers:
+            ready_event = pending.get("ready_event")
+            if self.use_cuda and ready_event is not None:
+                if not wait and not ready_event.query():
+                    remaining.append(pending)
+                    continue
+                ready_event.synchronize()
+
+            accum_row_ids_cpu = pending["accum_row_ids_cpu"]
+            for name, grad_rows_cpu in pending["buffers"].items():
+                self._grad_accum_buffers[name].index_add_(0, accum_row_ids_cpu, grad_rows_cpu)
+
+        self._grad_accum_pending_transfers = remaining
+
+    def _queue_grad_accum_transfer_(self, accum_row_ids_cpu: torch.Tensor, active_slot_ids_device: torch.Tensor, grad_map: dict[str, torch.Tensor]) -> None:
+        if not grad_map:
+            return
+
+        if self._grad_accum_buffers is None:
+            raise RuntimeError("Sparse grad accumulation buffers are missing while queueing transfers")
+
+        accum_row_ids_cpu = accum_row_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        if not self.use_cuda:
+            for name, grad in grad_map.items():
+                grad_rows_cpu = grad.detach().index_select(0, active_slot_ids_device).to(device="cpu", dtype=self._grad_accum_buffers[name].dtype)
+                self._grad_accum_buffers[name].index_add_(0, accum_row_ids_cpu, grad_rows_cpu)
+            return
+
+        assert self._grad_accum_transfer_stream is not None
+
+        pending = {
+            "accum_row_ids_cpu": accum_row_ids_cpu,
+            "buffers": {},
+            "source_refs": [active_slot_ids_device],
+        }
+        current_stream = torch.cuda.current_stream(self.device)
+        with torch.cuda.stream(self._grad_accum_transfer_stream):
+            self._grad_accum_transfer_stream.wait_stream(current_stream)
+            for name, grad in grad_map.items():
+                grad_detached = grad.detach()
+                grad_rows = grad_detached.index_select(0, active_slot_ids_device)
+                grad_rows_cpu = torch.empty(
+                    tuple(grad_rows.shape),
+                    dtype=self._grad_accum_buffers[name].dtype,
+                    pin_memory=True,
+                )
+                grad_rows_cpu.copy_(grad_rows, non_blocking=True)
+                pending["buffers"][name] = grad_rows_cpu
+                pending["source_refs"].append(grad_detached)
+                pending["source_refs"].append(grad_rows)
+            ready_event = torch.cuda.Event()
+            ready_event.record(self._grad_accum_transfer_stream)
+        pending["ready_event"] = ready_event
+        self._grad_accum_pending_transfers.append(pending)
 
     def _start_grad_accum_window(self, grad_accum_ids_cpu: torch.Tensor):
         grad_accum_ids_cpu = grad_accum_ids_cpu.detach().to(device="cpu", dtype=torch.long)
@@ -585,11 +650,13 @@ class DynamicVocabRuntime:
 
         assert self._grad_accum_global_to_local_cpu is not None
         assert self._grad_accum_buffers is not None
+        self._flush_pending_grad_accum_transfers(wait=False)
         accum_row_ids_cpu = self._grad_accum_global_to_local_cpu[step_ctx.active_ids_cpu]
         if (accum_row_ids_cpu < 0).any():
             raise ValueError("Sparse grad accumulation map is missing active vocab rows")
         active_slot_ids_device = step_ctx.active_slot_ids_cpu.to(self.device)
 
+        grad_map = {}
         for name in self.table_specs:
             if name == "wte":
                 grad = self.fixed_params["wte"].grad
@@ -599,8 +666,9 @@ class DynamicVocabRuntime:
                 grad = self.fixed_params[name].grad
             if grad is None:
                 continue
-            grad_rows = grad.detach().index_select(0, active_slot_ids_device).to(device="cpu", dtype=self._grad_accum_buffers[name].dtype)
-            self._grad_accum_buffers[name].index_add_(0, accum_row_ids_cpu, grad_rows)
+            grad_map[name] = grad
+
+        self._queue_grad_accum_transfer_(accum_row_ids_cpu, active_slot_ids_device, grad_map)
 
         self._clear_fixed_grads()
         step_ctx.active_vocab = None
@@ -614,6 +682,8 @@ class DynamicVocabRuntime:
     def apply_accumulated_gradients(self) -> DynamicVocabStep:
         if not self._grad_accum_live or self._grad_accum_ids_cpu is None or self._grad_accum_buffers is None:
             raise ValueError("No sparse accumulated gradients are pending")
+
+        self._flush_pending_grad_accum_transfers(wait=True)
 
         grad_accum_ids_cpu = self._grad_accum_ids_cpu
         cpu_rows = {}
