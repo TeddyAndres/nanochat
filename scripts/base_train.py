@@ -38,7 +38,7 @@ from nanochat.dynamic_vocab import DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
-from nanochat.sparse_manifest import load_sparse_manifest_header, validate_sparse_manifest
+from nanochat.sparse_manifest import load_sparse_manifest_header, resolve_sparse_manifest_grad_accum_u_max, validate_sparse_manifest
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -374,7 +374,7 @@ if args.sparse_mode:
     if hybrid_sparse:
         assert sparse_manifest is not None
         sparse_fixed_u_max = int(sparse_manifest["u_max"])
-        sparse_grad_accum_u_max = int(sparse_manifest.get("grad_accum_u_max", sparse_manifest["u_max"]))
+        sparse_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,

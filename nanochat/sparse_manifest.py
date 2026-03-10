@@ -127,6 +127,45 @@ def load_sparse_manifest_header(path: str | Path) -> dict[str, Any]:
             return _validate_manifest_version(payload)
 
 
+def resolve_sparse_manifest_grad_accum_u_max(path: str | Path, header: dict[str, Any] | None = None) -> int:
+    path = Path(path)
+    if header is None:
+        header = load_sparse_manifest_header(path)
+
+    u_max = int(header.get("u_max", 0))
+    if u_max <= 0:
+        raise ValueError("Sparse manifest must define a positive u_max")
+
+    header_grad_accum_u_max = header.get("grad_accum_u_max")
+    if header_grad_accum_u_max is not None:
+        grad_accum_u_max = int(header_grad_accum_u_max)
+        if grad_accum_u_max < u_max:
+            raise ValueError(
+                f"Sparse manifest grad_accum_u_max must be at least u_max, found grad_accum_u_max={grad_accum_u_max}, u_max={u_max}"
+            )
+        return grad_accum_u_max
+
+    version = int(header.get("version", 1))
+    if version < 2:
+        return u_max
+
+    grad_accum_u_max = u_max
+    found_grad_accum_window = False
+    for step_idx, step_entry in enumerate(stream_sparse_manifest_steps(path)):
+        if "grad_accum_u_size" not in step_entry:
+            continue
+        grad_accum_u_size = int(step_entry["grad_accum_u_size"])
+        grad_accum_ids = step_entry.get("grad_accum_active_ids")
+        if isinstance(grad_accum_ids, list) and len(grad_accum_ids) != grad_accum_u_size:
+            raise ValueError(
+                f"Sparse manifest step {step_idx} grad_accum_u_size mismatch: expected {grad_accum_u_size}, found {len(grad_accum_ids)} ids"
+            )
+        grad_accum_u_max = max(grad_accum_u_max, grad_accum_u_size)
+        found_grad_accum_window = True
+
+    return grad_accum_u_max if found_grad_accum_window else u_max
+
+
 def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Iterator[dict[str, Any]]:
     path = Path(path)
     if start_step < 0:
