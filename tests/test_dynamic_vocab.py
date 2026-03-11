@@ -433,14 +433,21 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         value_embed.grad[slots0[2]] = 300
     runtime.accumulate_gradients(step0_ctx)
 
+    assert step0_ctx.grad_accum_queue_count == 1
+    assert step0_ctx.grad_accum_resident_count == 2
+    assert runtime.fixed_params["wte"].grad is not None
+    assert torch.allclose(runtime.fixed_params["wte"].grad[slots0[0]], torch.zeros_like(runtime.fixed_params["wte"].grad[slots0[0]]))
+    assert torch.allclose(runtime.fixed_params["wte"].grad[slots0[1]], torch.ones_like(runtime.fixed_params["wte"].grad[slots0[1]]) * 2)
+    assert torch.allclose(runtime.fixed_params["wte"].grad[slots0[2]], torch.ones_like(runtime.fixed_params["wte"].grad[slots0[2]]) * 3)
+
     wte_param = runtime.table_specs["wte"]["param"]
     assert runtime.state[wte_param]["step"] == 0
 
     step1 = build_fixed_step_meta(
-        slot_to_global=[3, 7, 9],
-        stage_slots=[2],
+        slot_to_global=[9, 3, 7],
+        stage_slots=[0],
         stage_ids=[9],
-        writeback_slots=[0],
+        writeback_slots=[1],
         writeback_ids=[3],
         is_last_step=False,
         grad_accum_ids=union_ids,
@@ -451,21 +458,25 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
     step1_ctx = runtime.prepare_step(step1)
     slots1 = step1_ctx.active_slot_ids_cpu
     assert slots1 is not None
-    step1_ctx.active_vocab["wte"].grad = torch.zeros_like(step1_ctx.active_vocab["wte"])
-    step1_ctx.active_vocab["wte"].grad[slots1[0]] = 4
-    step1_ctx.active_vocab["wte"].grad[slots1[1]] = 5
-    step1_ctx.active_vocab["wte"].grad[slots1[2]] = 6
-    step1_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step1_ctx.active_vocab["lm_head"])
-    step1_ctx.active_vocab["lm_head"].grad[slots1[0]] = 40
-    step1_ctx.active_vocab["lm_head"].grad[slots1[1]] = 50
-    step1_ctx.active_vocab["lm_head"].grad[slots1[2]] = 60
+    assert step1_ctx.active_vocab["wte"].grad is not None
+    step1_ctx.active_vocab["wte"].grad[slots1[0]] += 6
+    step1_ctx.active_vocab["wte"].grad[slots1[1]] += 4
+    step1_ctx.active_vocab["wte"].grad[slots1[2]] += 5
+    assert step1_ctx.active_vocab["lm_head"].grad is not None
+    step1_ctx.active_vocab["lm_head"].grad[slots1[0]] += 60
+    step1_ctx.active_vocab["lm_head"].grad[slots1[1]] += 40
+    step1_ctx.active_vocab["lm_head"].grad[slots1[2]] += 50
     for value_embed in step1_ctx.active_vocab["value_embeds"].values():
-        value_embed.grad = torch.zeros_like(value_embed)
-        value_embed.grad[slots1[0]] = 400
-        value_embed.grad[slots1[1]] = 500
-        value_embed.grad[slots1[2]] = 600
+        assert value_embed.grad is not None
+        value_embed.grad[slots1[0]] += 600
+        value_embed.grad[slots1[1]] += 400
+        value_embed.grad[slots1[2]] += 500
     runtime.accumulate_gradients(step1_ctx)
-    runtime.apply_accumulated_gradients()
+    metrics = runtime.apply_accumulated_gradients()
+    runtime.flush_active_to_cpu()
+
+    assert metrics.grad_accum_queue_count == 1
+    assert metrics.grad_accum_resident_count == 3
 
     reference_ctx = reference_runtime.prepare_step(torch.tensor(union_ids, dtype=torch.long))
     reference_ctx.active_vocab["wte"].grad = torch.stack([
@@ -531,11 +542,14 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
         param.grad[slots0] = 1
     runtime.accumulate_gradients(step0_ctx)
 
+    assert step0_ctx.grad_accum_queue_count == 1
+    assert step0_ctx.grad_accum_resident_count == 2
+
     step1 = build_fixed_step_meta(
-        slot_to_global=[3, 7, 9],
-        stage_slots=[2],
+        slot_to_global=[9, 3, 7],
+        stage_slots=[0],
         stage_ids=[9],
-        writeback_slots=[0],
+        writeback_slots=[1],
         writeback_ids=[3],
         is_last_step=False,
         grad_accum_ids=union_ids,
@@ -547,23 +561,25 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
     slots1 = step1_ctx.active_slot_ids_cpu
     assert slots1 is not None
     for name, param in runtime.fixed_params.items():
-        param.grad = torch.zeros_like(param)
-        param.grad[slots1] = 2
+        assert param.grad is not None
+        param.grad[slots1] += 2
     runtime.accumulate_gradients(step1_ctx)
     metrics = runtime.apply_accumulated_gradients()
 
     assert runtime._fixed_live_state
     assert runtime.fixed_slot_to_global_cpu is not None
-    assert torch.equal(runtime.fixed_slot_to_global_cpu[:3], torch.tensor([3, 7, 9], dtype=torch.long))
+    assert torch.equal(runtime.fixed_slot_to_global_cpu[:3], torch.tensor([9, 3, 7], dtype=torch.long))
     assert metrics.live_count == 3
     assert metrics.unique_count == 4
     assert metrics.u_capacity == 4
+    assert metrics.grad_accum_queue_count == 1
+    assert metrics.grad_accum_resident_count == 3
 
     next_step = build_fixed_step_meta(
-        slot_to_global=[7, 9, 5],
-        stage_slots=[2],
+        slot_to_global=[9, 5, 7],
+        stage_slots=[1],
         stage_ids=[5],
-        writeback_slots=[0],
+        writeback_slots=[1],
         writeback_ids=[3],
         is_last_step=False,
         grad_accum_ids=[5, 7, 9],

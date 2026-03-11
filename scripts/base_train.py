@@ -78,6 +78,8 @@ parser.add_argument("--sparse-mode", action="store_true", help="enable first-pas
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-cold-negative-count", type=int, default=0, help="number of sampled cold lm_head rows to append to sparse training logits for normalization correction (0 disables)")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
+parser.add_argument("--sparse-debug-timing", action="store_true", help="log detailed sparse timing breakdowns for diagnosing sparse runtime overhead")
+parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", help="for sparse timing diagnosis, synchronize after each backward pass to separate deferred GPU work from grad-accum bookkeeping")
 parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="in sparse mode, call torch.cuda.empty_cache() every N steps after writeback (0 disables)")
 parser.add_argument("--sparse-max-reserved-mib", type=float, default=8192.0, help="in sparse mode, if current CUDA reserved memory exceeds this threshold after a step, trim the cache with torch.cuda.empty_cache() (0 disables)")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
@@ -548,6 +550,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 if hybrid_sparse:
     assert sparse_manifest is not None
+    resolved_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
     validate_sparse_manifest(
         sparse_manifest,
         split="train",
@@ -561,7 +564,7 @@ if hybrid_sparse:
     print0(
         f"Sparse hybrid manifest: {args.sparse_manifest} | "
         f"U_max={int(sparse_manifest['u_max']):,} | "
-        f"grad_accum_U_max={int(sparse_manifest.get('grad_accum_u_max', sparse_manifest['u_max'])):,}"
+        f"grad_accum_U_max={resolved_grad_accum_u_max:,}"
     )
 
 # Go!
@@ -713,9 +716,17 @@ while True:
     sparse_step_ctx = None
     sparse_window_metrics = None
     train_loss_accum = None
+    sparse_prepare_ms = 0.0
+    sparse_fwdbwd_ms = 0.0
+    sparse_backward_sync_ms = 0.0
+    sparse_accum_call_ms = 0.0
+    sparse_apply_call_ms = 0.0
     for micro_step in range(grad_accum_steps):
+        micro_t0 = time.perf_counter()
         if args.sparse_mode:
+            prepare_t0 = time.perf_counter()
             sparse_step_ctx = dynamic_vocab.prepare_step(sparse_batch_meta)
+            sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_metrics = sparse_step_ctx
             loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab)
         else:
@@ -727,9 +738,16 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        if args.sparse_mode and args.sparse_debug_sync_after_backward and device_type == "cuda":
+            backward_sync_t0 = time.perf_counter()
+            synchronize()
+            sparse_backward_sync_ms += (time.perf_counter() - backward_sync_t0) * 1000.0
+        sparse_fwdbwd_ms += (time.perf_counter() - micro_t0) * 1000.0
         if args.sparse_mode and grad_accum_steps > 1:
             assert sparse_step_ctx is not None
+            accum_t0 = time.perf_counter()
             sparse_window_metrics = dynamic_vocab.accumulate_gradients(sparse_step_ctx)
+            sparse_accum_call_ms += (time.perf_counter() - accum_t0) * 1000.0
             sparse_step_ctx = None
         if not final_train_step:
             if args.sparse_mode:
@@ -765,11 +783,15 @@ while True:
         optimizer.step()
     if args.sparse_mode:
         if grad_accum_steps > 1:
+            sparse_apply_t0 = time.perf_counter()
             sparse_metrics = dynamic_vocab.apply_accumulated_gradients()
+            sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
         else:
             assert sparse_step_ctx is not None
+            sparse_apply_t0 = time.perf_counter()
             sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
+            sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
     model.zero_grad(set_to_none=True)
     should_trim_sparse_cache = False
@@ -820,6 +842,31 @@ while True:
             sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
         else:
             sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
+        if args.sparse_debug_timing and grad_accum_steps > 1:
+            sparse_str += (
+                f" | step_ms prep: {sparse_prepare_ms:.2f}"
+                f" fwdbwd: {sparse_fwdbwd_ms:.2f}"
+                f" bw_sync: {sparse_backward_sync_ms:.2f}"
+                f" accum: {sparse_accum_call_ms:.2f}"
+                f" apply_call: {sparse_apply_call_ms:.2f}"
+                f" | sparse_ms flush: {sparse_metrics.grad_accum_flush_ms:.2f}"
+                f" stage: {sparse_metrics.grad_accum_stage_ms:.2f}"
+                f" apply: {sparse_metrics.grad_accum_apply_ms:.2f}"
+                f" restore: {sparse_metrics.grad_accum_restore_ms:.2f}"
+                f" writeback: {sparse_metrics.grad_accum_writeback_ms:.2f}"
+                f" (launch: {sparse_metrics.d2h_launch_ms:.2f}"
+                f" sync: {sparse_metrics.d2h_sync_ms:.2f}"
+                f" cpu: {sparse_metrics.cpu_writeback_ms:.2f})"
+                f" | union_rows buffered: {sparse_metrics.grad_accum_queue_count:,}"
+                f" resident: {sparse_metrics.grad_accum_resident_count:,}"
+            )
+            if sparse_window_metrics is not None:
+                sparse_str += (
+                    f" | micro_ms flush: {sparse_window_metrics.grad_accum_flush_ms:.2f}"
+                    f" queue: {sparse_window_metrics.grad_accum_queue_ms:.2f}"
+                    f" | micro_rows queued: {sparse_window_metrics.grad_accum_queue_count:,}"
+                    f" resident: {sparse_window_metrics.grad_accum_resident_count:,}"
+                )
     should_print_step = (step == 0) or (step == num_iterations - 1) or (args.log_every > 0 and step % args.log_every == 0)
     if should_print_step:
         print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}{grad_norm_str}{sparse_str} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
