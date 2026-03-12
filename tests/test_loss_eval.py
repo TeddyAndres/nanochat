@@ -20,8 +20,10 @@ class DummyEvalModel(torch.nn.Module):
     def get_device(self):
         return self._logits.device
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', logit_scale=1.0):
         logits = self._logits[:idx.size(0), :idx.size(1)]
+        if logit_scale != 1.0:
+            logits = logits * logit_scale
         if targets is None:
             return logits
         loss = torch.nn.functional.cross_entropy(
@@ -37,7 +39,9 @@ class ChunkedEvalModel(DummyEvalModel):
     def forward_features(self, idx, kv_cache=None):
         return self._logits[:idx.size(0), :idx.size(1)]
 
-    def compute_logits(self, x):
+    def compute_logits(self, x, logit_scale=1.0):
+        if logit_scale != 1.0:
+            return x * logit_scale
         return x
 
 
@@ -115,3 +119,82 @@ def test_chunked_eval_path_matches_fallback_path():
     assert math.isclose(chunked_bpb, fallback_bpb, rel_tol=1e-6)
     assert math.isclose(chunked_ece, fallback_ece, rel_tol=1e-6)
     assert math.isclose(chunked_bpb_only, fallback_bpb_only, rel_tol=1e-6)
+
+
+def test_logit_scale_matches_manual_scaled_logits_in_eval_paths():
+    logits = torch.tensor([
+        [[4.0, 1.0, -2.0], [0.5, 2.0, -1.0], [3.0, 0.0, -1.0]],
+        [[1.0, 3.0, -0.5], [2.5, 0.5, -2.0], [0.0, 1.5, 2.0]],
+    ], dtype=torch.float32)
+    targets = torch.tensor([
+        [0, 1, 0],
+        [1, 0, 2],
+    ], dtype=torch.long)
+    inputs = torch.zeros_like(targets)
+    token_bytes = torch.tensor([1, 1, 1], dtype=torch.int64)
+    scale = 0.5
+
+    fallback_model = DummyEvalModel(logits)
+    fallback_scaled_model = DummyEvalModel(logits * scale)
+    chunked_model = ChunkedEvalModel(logits)
+    chunked_scaled_model = ChunkedEvalModel(logits * scale)
+
+    actual_bpb, actual_ece = evaluate_bpb_and_ece(
+        fallback_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+        logit_scale=scale,
+    )
+    expected_bpb, expected_ece = evaluate_bpb_and_ece(
+        fallback_scaled_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+    )
+    actual_bpb_only = evaluate_bpb(
+        fallback_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+        logit_scale=scale,
+    )
+    expected_bpb_only = evaluate_bpb(
+        fallback_scaled_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+    )
+    chunked_actual_bpb, chunked_actual_ece = evaluate_bpb_and_ece(
+        chunked_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+        logit_scale=scale,
+    )
+    chunked_expected_bpb, chunked_expected_ece = evaluate_bpb_and_ece(
+        chunked_scaled_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+    )
+    chunked_actual_bpb_only = evaluate_bpb(
+        chunked_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+        logit_scale=scale,
+    )
+    chunked_expected_bpb_only = evaluate_bpb(
+        chunked_scaled_model,
+        [(inputs, targets)],
+        steps=1,
+        token_bytes=token_bytes,
+    )
+
+    assert math.isclose(actual_bpb, expected_bpb, rel_tol=1e-6)
+    assert math.isclose(actual_ece, expected_ece, rel_tol=1e-6)
+    assert math.isclose(actual_bpb_only, expected_bpb_only, rel_tol=1e-6)
+    assert math.isclose(chunked_actual_bpb, chunked_expected_bpb, rel_tol=1e-6)
+    assert math.isclose(chunked_actual_ece, chunked_expected_ece, rel_tol=1e-6)
+    assert math.isclose(chunked_actual_bpb_only, chunked_expected_bpb_only, rel_tol=1e-6)

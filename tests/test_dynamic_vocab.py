@@ -5,8 +5,6 @@ Run:
 python -m pytest tests/test_dynamic_vocab.py -v
 """
 
-import math
-
 import torch
 import torch.nn as nn
 
@@ -239,10 +237,12 @@ def test_fixed_u_masked_logits_hide_inactive_slots():
     targets = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
 
     logits = model(idx, active_vocab=step_ctx.active_vocab)
+    scaled_logits = model(idx, active_vocab=step_ctx.active_vocab, logit_scale=0.5)
     loss = model(idx, targets, active_vocab=step_ctx.active_vocab)
 
     assert torch.isfinite(loss)
     assert torch.all(logits[..., 4:] < -1e8)
+    assert torch.all(scaled_logits[..., 4:] < -1e8)
 
 
 def test_fixed_u_runtime_survives_inference_mode_materialization():
@@ -294,89 +294,27 @@ def test_fixed_u_runtime_survives_inference_mode_materialization():
     runtime.step(next_ctx)
 
 
-def test_dynamic_vocab_sampled_cold_negatives_extend_logits_and_update_rows():
+def test_sparse_logit_scale_changes_sparse_loss_for_same_targets():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
-    for param in model.parameters():
-        param.data.zero_()
     runtime = DynamicVocabRuntime(
         model,
         device="cpu",
         embedding_lr=0.01,
         value_embedding_lr=0.01,
         unembedding_lr=0.01,
-        sampled_negative_count=2,
     )
-    active_ids = torch.tensor([0, 2, 4], dtype=torch.long)
-    step_ctx = runtime.prepare_step(active_ids)
-
-    sampled_ids = step_ctx.sampled_negative_ids_cpu
-    assert sampled_ids is not None
-    assert sampled_ids.numel() == 2
-    assert not torch.isin(sampled_ids, active_ids).any()
-    assert step_ctx.active_vocab is not None
-    assert "lm_head_negatives" in step_ctx.active_vocab
-    expected_bias = math.log((model.config.vocab_size - active_ids.numel()) / sampled_ids.numel())
-    assert math.isclose(step_ctx.active_vocab["lm_head_negative_logit_bias"].item(), expected_bias, rel_tol=0.0, abs_tol=1e-6)
-
-    idx = torch.tensor([[0, 1, 2, 0]], dtype=torch.long)
-    targets = torch.tensor([[1, 2, 0, 1]], dtype=torch.long)
-    logits = model(idx, active_vocab=step_ctx.active_vocab)
-    assert logits.shape[-1] == active_ids.numel() + sampled_ids.numel()
-    expected_negative_logit = 20.0 * math.tanh(expected_bias / 20.0)
-    assert torch.allclose(logits[..., :active_ids.numel()], torch.zeros_like(logits[..., :active_ids.numel()]), atol=2e-3, rtol=0.0)
-    assert torch.allclose(logits[..., -sampled_ids.numel():], torch.full_like(logits[..., -sampled_ids.numel():], expected_negative_logit), atol=2e-3, rtol=0.0)
-
-    lm_head_param = runtime.table_specs["lm_head"]["param"]
-    original_sampled_rows = lm_head_param[sampled_ids].clone()
-    step_ctx.active_vocab["wte"].grad = torch.zeros_like(step_ctx.active_vocab["wte"])
-    step_ctx.active_vocab["lm_head"].grad = torch.ones_like(step_ctx.active_vocab["lm_head"])
-    step_ctx.active_vocab["lm_head_negatives"].grad = torch.ones_like(step_ctx.active_vocab["lm_head_negatives"])
-    for value_embed in step_ctx.active_vocab["value_embeds"].values():
-        value_embed.grad = torch.zeros_like(value_embed)
-
-    runtime.step(step_ctx)
-
-    assert runtime.state[lm_head_param]["step"] == 1
-    assert not torch.allclose(lm_head_param[sampled_ids], original_sampled_rows)
-
-
-def test_fixed_u_sampled_cold_negatives_append_after_masked_slots():
-    torch.manual_seed(0)
-    model = build_tiny_model(vocab_size=8)
-    for param in model.parameters():
-        param.data.zero_()
-    runtime = DynamicVocabRuntime(
-        model,
-        device="cpu",
-        embedding_lr=0.01,
-        value_embedding_lr=0.01,
-        unembedding_lr=0.01,
-        fixed_u_max=6,
-        sampled_negative_count=2,
-    )
-    step_meta = build_fixed_step_meta(
-        slot_to_global=[0, 1, 2, 3, -1, -1],
-        stage_slots=[0, 1, 2, 3],
-        stage_ids=[0, 1, 2, 3],
-        writeback_slots=[0, 1, 2, 3],
-        writeback_ids=[0, 1, 2, 3],
-        is_last_step=True,
-    )
-    step_ctx = runtime.prepare_step(step_meta)
-    sampled_ids = step_ctx.sampled_negative_ids_cpu
-    assert sampled_ids is not None
-    assert sampled_ids.numel() == 2
-    expected_bias = math.log((model.config.vocab_size - step_ctx.active_ids_cpu.numel()) / sampled_ids.numel())
-    assert math.isclose(step_ctx.active_vocab["lm_head_negative_logit_bias"].item(), expected_bias, rel_tol=0.0, abs_tol=1e-6)
-
+    step_ctx = runtime.prepare_step(torch.arange(model.config.vocab_size, dtype=torch.long))
     idx = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
-    logits = model(idx, active_vocab=step_ctx.active_vocab)
 
-    assert logits.shape[-1] == 8
-    assert torch.all(logits[..., 4:6] < -1e8)
-    expected_negative_logit = 20.0 * math.tanh(expected_bias / 20.0)
-    assert torch.allclose(logits[..., 6:], torch.full_like(logits[..., 6:], expected_negative_logit), atol=2e-3, rtol=0.0)
+    baseline_logits = model(idx, active_vocab=step_ctx.active_vocab)
+    targets = baseline_logits.argmax(dim=-1)
+    baseline_loss = model(idx, targets, active_vocab=step_ctx.active_vocab)
+    scaled_loss = model(idx, targets, active_vocab=step_ctx.active_vocab, logit_scale=0.5)
+
+    assert torch.isfinite(baseline_loss)
+    assert torch.isfinite(scaled_loss)
+    assert scaled_loss > baseline_loss
 
 
 def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():

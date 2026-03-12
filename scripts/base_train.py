@@ -76,7 +76,7 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
-parser.add_argument("--sparse-cold-negative-count", type=int, default=0, help="number of sampled cold lm_head rows to append to sparse training logits for normalization correction (0 disables)")
+parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-debug-timing", action="store_true", help="log detailed sparse timing breakdowns for diagnosing sparse runtime overhead")
 parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", help="for sparse timing diagnosis, synchronize after each backward pass to separate deferred GPU work from grad-accum bookkeeping")
@@ -88,12 +88,12 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-tokens", type=int, default=5*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-parser.add_argument("--grad-norm-every", type=int, default=100, help="log global gradient norm every N steps (-1 = disable)")
+parser.add_argument("--grad-norm-every", type=int, default=10, help="log global gradient norm every N steps (-1 = disable)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -368,9 +368,9 @@ optimizer = model.setup_optimizer(
 dynamic_vocab = None
 optimizer_data_sparse = None
 if args.sparse_mode:
-    assert args.sparse_cold_negative_count >= 0, "--sparse-cold-negative-count must be non-negative"
-    if args.sparse_cold_negative_count > 0:
-        print0(f"Sparse normalization fix: adding {args.sparse_cold_negative_count:,} importance-corrected sampled cold lm_head negatives per step")
+    assert args.sparse_logit_scale > 0.0, "--sparse-logit-scale must be positive"
+    if args.sparse_logit_scale != 1.0:
+        print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
     sparse_fixed_u_max = None
     sparse_grad_accum_u_max = None
     if hybrid_sparse:
@@ -385,7 +385,6 @@ if args.sparse_mode:
         unembedding_lr=sparse_unembedding_lr,
         fixed_u_max=sparse_fixed_u_max,
         grad_accum_u_max=sparse_grad_accum_u_max,
-        sampled_negative_count=args.sparse_cold_negative_count,
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
@@ -587,7 +586,7 @@ while True:
             if args.sparse_mode:
                 with dynamic_vocab.materialize_dense_params():
                     with disable_fp8(orig_model):
-                        val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes)
+                        val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes, logit_scale=args.sparse_logit_scale)
             else:
                 with disable_fp8(orig_model):
                     val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes)
@@ -728,7 +727,7 @@ while True:
             sparse_step_ctx = dynamic_vocab.prepare_step(sparse_batch_meta)
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_metrics = sparse_step_ctx
-            loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab)
+            loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab, logit_scale=args.sparse_logit_scale)
         else:
             loss = model(x, y)
         micro_loss = loss.detach()

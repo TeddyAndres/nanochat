@@ -1,4 +1,3 @@
-import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -45,7 +44,6 @@ class DynamicVocabStep:
     stage_slot_ids_cpu: Optional[torch.Tensor] = None
     writeback_ids_cpu: Optional[torch.Tensor] = None
     writeback_slot_ids_cpu: Optional[torch.Tensor] = None
-    sampled_negative_ids_cpu: Optional[torch.Tensor] = None
     grad_accum_ids_cpu: Optional[torch.Tensor] = None
     grad_accum_steps: int = 1
     grad_accum_micro_step: int = 0
@@ -72,7 +70,6 @@ class DynamicVocabRuntime:
         unembedding_lr,
         fixed_u_max=None,
         grad_accum_u_max=None,
-        sampled_negative_count=0,
         value_embedding_lr=None,
         adam_betas=(0.8, 0.95),
         eps=1e-10,
@@ -94,9 +91,6 @@ class DynamicVocabRuntime:
             raise ValueError(
                 f"grad_accum_u_max must be at least fixed_u_max in fixed-U sparse mode, got grad_accum_u_max={self.grad_accum_u_max}, fixed_u_max={self.fixed_u_max}"
             )
-        self.sampled_negative_count = int(sampled_negative_count)
-        if self.sampled_negative_count < 0:
-            raise ValueError(f"sampled_negative_count must be non-negative, got {self.sampled_negative_count}")
         value_embedding_lr = embedding_lr if value_embedding_lr is None else value_embedding_lr
 
         self.table_specs = {
@@ -474,70 +468,6 @@ class DynamicVocabRuntime:
             gpu_tensor_map[name] = staged.to(self.device, non_blocking=self.use_cuda)
         return gpu_tensor_map
 
-    def _sample_cold_negative_ids(self, active_ids_cpu: torch.Tensor) -> torch.Tensor:
-        if self.sampled_negative_count == 0:
-            return torch.empty(0, dtype=torch.long)
-        vocab_size = int(self.model.config.vocab_size)
-        active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        cold_mask = torch.ones(vocab_size, dtype=torch.bool)
-        cold_mask[active_ids_cpu] = False
-        cold_ids = torch.nonzero(cold_mask, as_tuple=False).flatten()
-        if cold_ids.numel() < self.sampled_negative_count:
-            raise ValueError(
-                f"Sparse cold-negative sampling requires at least {self.sampled_negative_count} cold vocab rows, found {cold_ids.numel()}"
-            )
-        sample_order = torch.randperm(cold_ids.numel())[:self.sampled_negative_count]
-        return cold_ids.index_select(0, sample_order)
-
-    def _stage_sampled_negative_state(self, sampled_ids_cpu: torch.Tensor):
-        sampled_ids_cpu = sampled_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        if sampled_ids_cpu.numel() == 0:
-            return None, None
-        spec = self.table_specs["lm_head"]
-        param = spec["param"]
-        state = self.state[param]
-        rows = param.index_select(0, sampled_ids_cpu)
-        exp_avg = state["exp_avg"].index_select(0, sampled_ids_cpu)
-        exp_avg_sq = state["exp_avg_sq"].index_select(0, sampled_ids_cpu)
-        rows_gpu = rows.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else rows.to(self.device)
-        exp_avg_gpu = exp_avg.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg.to(self.device)
-        exp_avg_sq_gpu = exp_avg_sq.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg_sq.to(self.device)
-        return (
-            nn.Parameter(rows_gpu, requires_grad=True),
-            {
-                "exp_avg": exp_avg_gpu,
-                "exp_avg_sq": exp_avg_sq_gpu,
-            },
-        )
-
-    def _compute_sampled_negative_logit_bias(self, active_ids_cpu: torch.Tensor, sampled_ids_cpu: torch.Tensor) -> float:
-        sampled_count = int(sampled_ids_cpu.numel())
-        if sampled_count == 0:
-            return 0.0
-        cold_count = int(self.model.config.vocab_size) - int(active_ids_cpu.numel())
-        if cold_count <= sampled_count:
-            return 0.0
-        return math.log(cold_count / sampled_count)
-
-    def _writeback_sampled_negative_rows_(self, sampled_ids_cpu: torch.Tensor, sampled_param: nn.Parameter, sampled_state: dict):
-        sampled_ids_cpu = sampled_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        if sampled_ids_cpu.numel() == 0:
-            return
-        row_buffer = self._get_cpu_receive_buffer("rows:lm_head_negatives", tuple(sampled_param.shape), sampled_param.dtype)
-        exp_avg_buffer = self._get_cpu_receive_buffer("exp_avg:lm_head_negatives", tuple(sampled_state["exp_avg"].shape), sampled_state["exp_avg"].dtype)
-        exp_avg_sq_buffer = self._get_cpu_receive_buffer("exp_avg_sq:lm_head_negatives", tuple(sampled_state["exp_avg_sq"].shape), sampled_state["exp_avg_sq"].dtype)
-        row_buffer.copy_(sampled_param.detach(), non_blocking=self.use_cuda)
-        exp_avg_buffer.copy_(sampled_state["exp_avg"].detach(), non_blocking=self.use_cuda)
-        exp_avg_sq_buffer.copy_(sampled_state["exp_avg_sq"].detach(), non_blocking=self.use_cuda)
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
-        spec = self.table_specs["lm_head"]
-        param = spec["param"]
-        state = self.state[param]
-        param.index_copy_(0, sampled_ids_cpu, row_buffer)
-        state["exp_avg"].index_copy_(0, sampled_ids_cpu, exp_avg_buffer)
-        state["exp_avg_sq"].index_copy_(0, sampled_ids_cpu, exp_avg_sq_buffer)
-
     def _get_cpu_receive_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype):
         buffer = self._cpu_receive_buffers.get(name)
         is_inference_buffer = bool(buffer is not None and getattr(buffer, "is_inference", lambda: False)())
@@ -592,16 +522,6 @@ class DynamicVocabRuntime:
             }
             for name in gpu_rows
         }
-        sampled_negative_ids_cpu = self._sample_cold_negative_ids(active_ids_cpu)
-        sampled_negative_param, sampled_negative_state = self._stage_sampled_negative_state(sampled_negative_ids_cpu)
-        if sampled_negative_param is not None and sampled_negative_state is not None:
-            active_vocab["lm_head_negatives"] = sampled_negative_param
-            active_vocab["lm_head_negative_logit_bias"] = torch.tensor(
-                self._compute_sampled_negative_logit_bias(active_ids_cpu, sampled_negative_ids_cpu),
-                device=self.device,
-                dtype=gpu_rows["lm_head"].dtype,
-            )
-            optimizer_state["lm_head_negatives"] = sampled_negative_state
         return DynamicVocabStep(
             active_ids_cpu=active_ids_cpu,
             active_vocab=active_vocab,
@@ -610,7 +530,6 @@ class DynamicVocabRuntime:
             live_count=active_ids_cpu.numel(),
             u_capacity=active_ids_cpu.numel(),
             stage_count=active_ids_cpu.numel(),
-            sampled_negative_ids_cpu=sampled_negative_ids_cpu,
         )
 
     def _prepare_fixed_step(self, step_meta: dict) -> DynamicVocabStep:
@@ -670,10 +589,6 @@ class DynamicVocabRuntime:
         self.fixed_logit_mask.copy_(active_mask_cpu.to(self.device, non_blocking=self.use_cuda))
         self._fixed_live_state = True
 
-        if grad_accum_steps > 1 and self.sampled_negative_count > 0:
-            raise ValueError("Sparse grad accumulation does not yet support sampled cold negatives; set --sparse-cold-negative-count 0")
-        sampled_negative_ids_cpu = self._sample_cold_negative_ids(active_ids_cpu)
-        sampled_negative_param, sampled_negative_state = self._stage_sampled_negative_state(sampled_negative_ids_cpu)
         step_active_vocab = {
             **self.fixed_active_vocab,
             "value_embeds": self.fixed_active_vocab["value_embeds"],
@@ -681,14 +596,6 @@ class DynamicVocabRuntime:
         step_optimizer_state = {
             **self.fixed_optimizer_state,
         }
-        if sampled_negative_param is not None and sampled_negative_state is not None:
-            step_active_vocab["lm_head_negatives"] = sampled_negative_param
-            step_active_vocab["lm_head_negative_logit_bias"] = torch.tensor(
-                self._compute_sampled_negative_logit_bias(active_ids_cpu, sampled_negative_ids_cpu),
-                device=self.device,
-                dtype=self.fixed_params["lm_head"].dtype,
-            )
-            step_optimizer_state["lm_head_negatives"] = sampled_negative_state
 
         return DynamicVocabStep(
             active_ids_cpu=active_ids_cpu,
@@ -705,7 +612,6 @@ class DynamicVocabRuntime:
             stage_slot_ids_cpu=stage_slot_ids_cpu,
             writeback_ids_cpu=writeback_ids_cpu,
             writeback_slot_ids_cpu=writeback_slot_ids_cpu,
-            sampled_negative_ids_cpu=sampled_negative_ids_cpu,
             grad_accum_ids_cpu=grad_accum_ids_cpu,
             grad_accum_steps=grad_accum_steps,
             grad_accum_micro_step=grad_accum_micro_step,
@@ -776,8 +682,6 @@ class DynamicVocabRuntime:
         assert step_ctx.active_ids_cpu is not None
         if step_ctx.grad_accum_ids_cpu is None:
             raise ValueError("Sparse grad accumulation requires grad_accum_ids_cpu metadata")
-        if step_ctx.sampled_negative_ids_cpu is not None and step_ctx.sampled_negative_ids_cpu.numel() > 0:
-            raise ValueError("Sparse grad accumulation does not yet support sampled cold negatives")
 
         if (not self._grad_accum_live) or self._grad_accum_ids_cpu is None or not torch.equal(self._grad_accum_ids_cpu, step_ctx.grad_accum_ids_cpu):
             self._start_grad_accum_window(step_ctx.grad_accum_ids_cpu)
@@ -1024,13 +928,6 @@ class DynamicVocabRuntime:
             assert step_ctx.active_slot_ids_cpu is not None
             self._adamw_update_("wte", self.fixed_params["wte"], self.fixed_optimizer_state["wte"], slot_ids_cpu=step_ctx.active_slot_ids_cpu)
             self._adamw_update_("lm_head", self.fixed_params["lm_head"], self.fixed_optimizer_state["lm_head"], slot_ids_cpu=step_ctx.active_slot_ids_cpu)
-            if step_ctx.sampled_negative_ids_cpu is not None and step_ctx.sampled_negative_ids_cpu.numel() > 0:
-                self._adamw_update_with_step_(
-                    "lm_head",
-                    step_ctx.active_vocab["lm_head_negatives"],
-                    step_ctx.optimizer_state["lm_head_negatives"],
-                    self.state[self.table_specs["lm_head"]["param"]]["step"],
-                )
             for layer_name in step_ctx.active_vocab["value_embeds"]:
                 param_name = f"value_embeds.{layer_name}"
                 self._adamw_update_(
@@ -1051,12 +948,6 @@ class DynamicVocabRuntime:
             step_ctx.writeback_count = writeback_ids_cpu.numel()
 
             self._writeback_fixed_rows_(writeback_ids_cpu, writeback_slot_ids_cpu)
-            if step_ctx.sampled_negative_ids_cpu is not None and step_ctx.sampled_negative_ids_cpu.numel() > 0:
-                self._writeback_sampled_negative_rows_(
-                    step_ctx.sampled_negative_ids_cpu,
-                    step_ctx.active_vocab["lm_head_negatives"],
-                    step_ctx.optimizer_state["lm_head_negatives"],
-                )
             self._clear_fixed_grads()
             step_ctx.active_vocab = None
             step_ctx.optimizer_state = None
@@ -1064,13 +955,6 @@ class DynamicVocabRuntime:
 
         self._adamw_update_("wte", step_ctx.active_vocab["wte"], step_ctx.optimizer_state["wte"])
         self._adamw_update_("lm_head", step_ctx.active_vocab["lm_head"], step_ctx.optimizer_state["lm_head"])
-        if step_ctx.sampled_negative_ids_cpu is not None and step_ctx.sampled_negative_ids_cpu.numel() > 0:
-            self._adamw_update_with_step_(
-                "lm_head",
-                step_ctx.active_vocab["lm_head_negatives"],
-                step_ctx.optimizer_state["lm_head_negatives"],
-                self.state[self.table_specs["lm_head"]["param"]]["step"],
-            )
         for layer_name, active_param in step_ctx.active_vocab["value_embeds"].items():
             param_name = f"value_embeds.{layer_name}"
             self._adamw_update_(param_name, active_param, step_ctx.optimizer_state[param_name])
@@ -1108,12 +992,6 @@ class DynamicVocabRuntime:
             param.index_copy_(0, step_ctx.active_ids_cpu, cpu_rows[name])
             state["exp_avg"].index_copy_(0, step_ctx.active_ids_cpu, cpu_exp_avg[name])
             state["exp_avg_sq"].index_copy_(0, step_ctx.active_ids_cpu, cpu_exp_avg_sq[name])
-        if step_ctx.sampled_negative_ids_cpu is not None and step_ctx.sampled_negative_ids_cpu.numel() > 0:
-            self._writeback_sampled_negative_rows_(
-                step_ctx.sampled_negative_ids_cpu,
-                step_ctx.active_vocab["lm_head_negatives"],
-                step_ctx.optimizer_state["lm_head_negatives"],
-            )
         step_ctx.active_vocab = None
         step_ctx.optimizer_state = None
         return step_ctx

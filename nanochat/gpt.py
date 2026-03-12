@@ -432,7 +432,7 @@ class GPT(nn.Module):
         x = norm(x)
         return x
 
-    def compute_logits(self, x, active_vocab=None):
+    def compute_logits(self, x, active_vocab=None, logit_scale=1.0):
         # Forward the lm_head (compute logits)
         softcap = 20 # smoothly cap the logits to the range [-softcap, softcap]
         if active_vocab is None:
@@ -441,28 +441,20 @@ class GPT(nn.Module):
         else:
             active_lm_head = active_vocab["lm_head"].to(dtype=x.dtype)
             logits = F.linear(x, active_lm_head)
-            if "lm_head_negatives" in active_vocab:
-                negative_lm_head = active_vocab["lm_head_negatives"].to(dtype=x.dtype)
-                negative_logits = F.linear(x, negative_lm_head)
-                negative_logit_bias = active_vocab.get("lm_head_negative_logit_bias")
-                if negative_logit_bias is not None:
-                    negative_logits = negative_logits + negative_logit_bias.to(device=x.device, dtype=x.dtype)
-                logits = torch.cat((logits, negative_logits), dim=-1)
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
         if active_vocab is not None and "logit_mask" in active_vocab:
             logit_mask = active_vocab["logit_mask"].to(device=logits.device, dtype=torch.bool)
             active_width = active_vocab["lm_head"].size(0)
             active_logits = logits[..., :active_width].masked_fill(~logit_mask.view(1, 1, -1), -1e9)
-            if logits.size(-1) == active_width:
-                logits = active_logits
-            else:
-                logits = torch.cat((active_logits, logits[..., active_width:]), dim=-1)
+            logits = active_logits
+        if logit_scale != 1.0:
+            logits = logits * logit_scale
         return logits
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None, logit_scale=1.0):
         x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
-        logits = self.compute_logits(x, active_vocab=active_vocab)
+        logits = self.compute_logits(x, active_vocab=active_vocab, logit_scale=logit_scale)
 
         if targets is not None:
             # training: given the targets, compute and return the loss

@@ -1,0 +1,55 @@
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Autodetected device type: cuda
+2026-03-11 13:16:04,222 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+2026-03-11 13:16:04,223 - nanochat.common - [33m[1mWARNING[0m - Peak flops undefined for: Radeon RX 7900 XT, MFU will show as 0%
+GPU: Radeon RX 7900 XT | Peak FLOPS (BF16): inf
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 110 (bf16 supported))
+PYTORCH_ALLOC_CONF: <unset>
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback
+WARNING: Training will be less efficient without FA3
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Vocab size: 65,536
+Model config:
+{
+  "sequence_len": 2048,
+  "vocab_size": 65536,
+  "n_layer": 6,
+  "n_head": 3,
+  "n_kv_head": 3,
+  "n_embd": 384,
+  "window_pattern": "L"
+}
+Sparse hybrid mode: fixed-U manifest path enabled; dense eval/sample paths materialize from CPU masters and training uses manifest-driven overlap reuse
+Parameter counts:
+wte                     : 25,165,824
+value_embeds            : 75,497,472
+lm_head                 : 25,165,824
+transformer_matrices    : 10,617,120
+scalars                 : 12
+total                   : 136,446,252
+Estimated FLOPs per token: 2.713208e+08
+Auto-computed optimal batch size: 262,144 tokens
+Scaling LRs by 0.7071 for batch size 262,144 (reference: 524,288)
+Scaling weight decay from 0.200000 to 0.534604 for depth 6
+Scaling the LR for the AdamW parameters ∝1/√(384/768) = 1.414214
+Using user-provided number of iterations: 250
+Total number of training tokens: 65,536,000
+Tokens : Scaling params ratio: 1.83
+Total training FLOPs estimate: 1.778128e+16
+Tokens / micro-batch / rank: 32 x 2048 = 65,536
+Tokens / micro-batch: 65,536
+Total batch size 262,144 => gradient accumulation steps: 4
+Sparse hybrid manifest: manifests/d6_probe_250step_tmp.json | U_max=11,542 | grad_accum_U_max=25,023
+Step 00000 | Validation bpb: 3.255072 | ECE: 0.000001
+step 00000/00250 (0.00%) | loss: 9.288841 | lrm: 1.00 | dt: 3462.63ms | tok/sec: 75,706 | bf16_mfu: 0.00 | grad_norm: 0.0479 | U_live: 10,371 | U_union: 24,107 | stage: 27,680 | epoch: 1 pq: 0 rg: 1 | total time: 0.00m
+step 00249/00250 (99.60%) | loss: 3.970875 | lrm: 0.01 | dt: 1574.81ms | tok/sec: 166,461 | bf16_mfu: 0.00 | grad_norm: 0.3926 | U_live: 10,810 | U_union: 24,429 | stage: 22,612 | epoch: 1 pq: 1 rg: 44 | total time: 6.33m | eta: 0.0m
