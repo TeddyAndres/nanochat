@@ -65,7 +65,7 @@ def _accumulate_bpb_from_logits(logits, targets, token_bytes, total_nats, total_
 
 
 @torch.no_grad()
-def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64, num_bins=15, logit_scale=1.0):
+def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64, num_bins=15, logit_scale=1.0, logit_bias=None):
     """
     Evaluate validation bits-per-byte and token-level expected calibration error.
 
@@ -86,7 +86,7 @@ def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64
             features = model.forward_features(x)
             for start in range(0, x.size(1), token_chunk_size):
                 end = min(start + token_chunk_size, x.size(1))
-                logits = model.compute_logits(features[:, start:end], logit_scale=logit_scale)
+                logits = model.compute_logits(features[:, start:end], logit_scale=logit_scale, logit_bias=logit_bias)
                 _accumulate_bpb_and_ece_from_logits(
                     logits,
                     y[:, start:end],
@@ -100,7 +100,7 @@ def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64
                 del logits
             del features
         else:
-            logits = model(x, logit_scale=logit_scale)
+            logits = model(x, logit_scale=logit_scale, logit_bias=logit_bias)
             _accumulate_bpb_and_ece_from_logits(
                 logits,
                 y,
@@ -143,7 +143,7 @@ def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64
     return bpb, ece
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes, logit_scale=1.0):
+def evaluate_bpb(model, batches, steps, token_bytes, logit_scale=1.0, logit_bias=None):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -171,12 +171,12 @@ def evaluate_bpb(model, batches, steps, token_bytes, logit_scale=1.0):
             features = model.forward_features(x)
             for start in range(0, x.size(1), 64):
                 end = min(start + 64, x.size(1))
-                logits = model.compute_logits(features[:, start:end], logit_scale=logit_scale)
+                logits = model.compute_logits(features[:, start:end], logit_scale=logit_scale, logit_bias=logit_bias)
                 _accumulate_bpb_from_logits(logits, y[:, start:end], token_bytes, total_nats, total_bytes)
                 del logits
             del features
         else:
-            loss2d = model(x, y, loss_reduction='none', logit_scale=logit_scale) # (B, T)
+            loss2d = model(x, y, loss_reduction='none', logit_scale=logit_scale, logit_bias=logit_bias) # (B, T)
             loss2d = loss2d.view(-1) # flatten
             y = y.view(-1) # flatten
             _, num_bytes2d, valid = _get_valid_targets_and_num_bytes(y, token_bytes)

@@ -70,6 +70,7 @@ class DynamicVocabRuntime:
         unembedding_lr,
         fixed_u_max=None,
         grad_accum_u_max=None,
+        cold_bias_reference_tokens=2**19,
         value_embedding_lr=None,
         adam_betas=(0.8, 0.95),
         eps=1e-10,
@@ -81,6 +82,7 @@ class DynamicVocabRuntime:
         self.beta1, self.beta2 = adam_betas
         self.eps = eps
         self.weight_decay = weight_decay
+        self.cold_bias_reference_tokens = float(cold_bias_reference_tokens)
         self.fixed_u_max = 0 if fixed_u_max is None else int(fixed_u_max)
         self.fixed_u_mode = self.fixed_u_max > 0
         default_grad_accum_u_max = self.fixed_u_max if self.fixed_u_mode else 0
@@ -110,6 +112,8 @@ class DynamicVocabRuntime:
             }
 
         self.state = {}
+        self.runtime_step = 0
+        self.last_seen_step_cpu = torch.full((model.config.vocab_size,), -1, dtype=torch.long)
         self._cpu_receive_buffers = {}
         for spec in self.table_specs.values():
             param = spec["param"]
@@ -126,6 +130,7 @@ class DynamicVocabRuntime:
         self.fixed_optimizer_state = {}
         self.fixed_active_vocab = None
         self.fixed_logit_mask = None
+        self.fixed_cold_logit_bias = None
         self.fixed_slot_to_global_cpu = None
         self.fixed_active_mask_cpu = None
         self._fixed_live_state = False
@@ -157,6 +162,7 @@ class DynamicVocabRuntime:
                     "exp_avg_sq": torch.zeros(shape, device=self.device, dtype=param.dtype),
                 }
             self.fixed_logit_mask = torch.zeros(self.fixed_u_max, dtype=torch.bool, device=self.device)
+            self.fixed_cold_logit_bias = torch.zeros(self.fixed_u_max, dtype=torch.float32, device=self.device)
             self.fixed_active_vocab = {
                 "wte": self.fixed_params["wte"],
                 "lm_head": self.fixed_params["lm_head"],
@@ -166,6 +172,7 @@ class DynamicVocabRuntime:
                     if name.startswith("value_embeds.")
                 },
                 "logit_mask": self.fixed_logit_mask,
+                "cold_logit_bias": self.fixed_cold_logit_bias,
             }
 
     def state_dict(self):
@@ -180,11 +187,18 @@ class DynamicVocabRuntime:
                 "lr": spec["lr"],
             }
         return {
-            "version": 1,
+            "version": 2,
+            "runtime_step": self.runtime_step,
+            "last_seen_step_cpu": self.last_seen_step_cpu,
             "tables": serialized,
         }
 
     def load_state_dict(self, state_dict):
+        self.runtime_step = int(state_dict.get("runtime_step", 0))
+        if "last_seen_step_cpu" in state_dict:
+            self.last_seen_step_cpu.copy_(state_dict["last_seen_step_cpu"].to(device="cpu", dtype=torch.long))
+        else:
+            self.last_seen_step_cpu.fill_(-1)
         tables = state_dict.get("tables", {})
         for name, table_state in tables.items():
             spec = self.table_specs[name]
@@ -193,6 +207,45 @@ class DynamicVocabRuntime:
             state["step"] = int(table_state["step"])
             state["exp_avg"].copy_(table_state["exp_avg"].to("cpu"))
             state["exp_avg_sq"].copy_(table_state["exp_avg_sq"].to("cpu"))
+
+    def _capture_cold_steps_cpu(self, active_ids_cpu: torch.Tensor) -> torch.Tensor:
+        active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        if active_ids_cpu.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        last_seen = self.last_seen_step_cpu.index_select(0, active_ids_cpu)
+        cold_steps_cpu = (self.runtime_step - last_seen - 1).clamp_min_(0)
+        self.last_seen_step_cpu.index_fill_(0, active_ids_cpu, self.runtime_step)
+        return cold_steps_cpu
+
+    def _compute_cold_logit_bias_cpu(
+        self,
+        cold_steps_cpu: torch.Tensor,
+        cold_bias_scale: float = 0.0,
+        cold_bias_tokens_per_step: Optional[int] = None,
+    ) -> torch.Tensor:
+        cold_steps_cpu = cold_steps_cpu.detach().to(device="cpu", dtype=torch.float32)
+        if cold_steps_cpu.numel() == 0:
+            return torch.empty(0, dtype=torch.float32)
+        if cold_bias_scale <= 0.0 or cold_bias_tokens_per_step is None or cold_bias_tokens_per_step <= 0:
+            return torch.zeros_like(cold_steps_cpu)
+        reference_tokens = max(self.cold_bias_reference_tokens, 1.0)
+        cold_tokens = cold_steps_cpu * float(cold_bias_tokens_per_step)
+        return -float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
+
+    def get_dense_cold_logit_bias(
+        self,
+        cold_bias_scale: float = 0.0,
+        cold_bias_tokens_per_step: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        if cold_bias_scale <= 0.0 or cold_bias_tokens_per_step is None or cold_bias_tokens_per_step <= 0:
+            return None
+        cold_steps_cpu = (self.runtime_step - self.last_seen_step_cpu - 1).clamp_min(0)
+        cold_bias_cpu = self._compute_cold_logit_bias_cpu(
+            cold_steps_cpu,
+            cold_bias_scale=cold_bias_scale,
+            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+        )
+        return cold_bias_cpu.to(self.device, non_blocking=self.use_cuda)
 
     @contextmanager
     def materialize_dense_params(self):
@@ -486,9 +539,20 @@ class DynamicVocabRuntime:
         slices = tuple(slice(0, dim) for dim in shape)
         return buffer[slices]
 
-    def _prepare_dynamic_step(self, active_ids_cpu: torch.Tensor) -> DynamicVocabStep:
+    def _prepare_dynamic_step(
+        self,
+        active_ids_cpu: torch.Tensor,
+        cold_bias_scale: float = 0.0,
+        cold_bias_tokens_per_step: Optional[int] = None,
+    ) -> DynamicVocabStep:
         self._flush_pending_cpu_writeback()
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        cold_steps_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
+        cold_logit_bias_cpu = self._compute_cold_logit_bias_cpu(
+            cold_steps_cpu,
+            cold_bias_scale=cold_bias_scale,
+            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+        )
         cpu_rows = {}
         cpu_exp_avg = {}
         cpu_exp_avg_sq = {}
@@ -514,6 +578,7 @@ class DynamicVocabRuntime:
                 for name in gpu_rows
                 if name.startswith("value_embeds.")
             },
+            "cold_logit_bias": cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda),
         }
         optimizer_state = {
             name: {
@@ -532,7 +597,12 @@ class DynamicVocabRuntime:
             stage_count=active_ids_cpu.numel(),
         )
 
-    def _prepare_fixed_step(self, step_meta: dict) -> DynamicVocabStep:
+    def _prepare_fixed_step(
+        self,
+        step_meta: dict,
+        cold_bias_scale: float = 0.0,
+        cold_bias_tokens_per_step: Optional[int] = None,
+    ) -> DynamicVocabStep:
         assert self.fixed_u_mode, "Fixed-U step requested without fixed_u_max runtime configuration"
         active_ids_cpu = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
         grad_accum_ids_cpu = step_meta.get("grad_accum_ids_cpu", active_ids_cpu).detach().to(device="cpu", dtype=torch.long)
@@ -540,6 +610,12 @@ class DynamicVocabRuntime:
         grad_accum_micro_step = int(step_meta.get("grad_accum_micro_step", 0))
         is_grad_accum_boundary = bool(step_meta.get("is_grad_accum_boundary", True))
         active_slot_ids_cpu = step_meta["active_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        cold_steps_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
+        cold_logit_bias_cpu = self._compute_cold_logit_bias_cpu(
+            cold_steps_cpu,
+            cold_bias_scale=cold_bias_scale,
+            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+        )
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
         stage_ids_cpu = step_meta["stage_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
@@ -552,6 +628,7 @@ class DynamicVocabRuntime:
         assert self.fixed_active_mask_cpu is not None
         assert self.fixed_logit_mask is not None
         assert self.fixed_active_vocab is not None
+        assert self.fixed_cold_logit_bias is not None
 
         if not self._fixed_live_state:
             stage_ids_cpu = active_ids_cpu
@@ -587,6 +664,10 @@ class DynamicVocabRuntime:
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         self.fixed_active_mask_cpu.copy_(active_mask_cpu)
         self.fixed_logit_mask.copy_(active_mask_cpu.to(self.device, non_blocking=self.use_cuda))
+        self.fixed_cold_logit_bias.zero_()
+        if active_slot_ids_cpu.numel() > 0:
+            active_slot_ids_device = active_slot_ids_cpu.to(self.device)
+            self.fixed_cold_logit_bias.index_copy_(0, active_slot_ids_device, cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
         self._fixed_live_state = True
 
         step_active_vocab = {
@@ -620,10 +701,23 @@ class DynamicVocabRuntime:
             fixed_u_mode=True,
         )
 
-    def prepare_step(self, active_ids_cpu) -> DynamicVocabStep:
+    def prepare_step(
+        self,
+        active_ids_cpu,
+        cold_bias_scale: float = 0.0,
+        cold_bias_tokens_per_step: Optional[int] = None,
+    ) -> DynamicVocabStep:
         if isinstance(active_ids_cpu, dict):
-            return self._prepare_fixed_step(active_ids_cpu)
-        return self._prepare_dynamic_step(active_ids_cpu)
+            return self._prepare_fixed_step(
+                active_ids_cpu,
+                cold_bias_scale=cold_bias_scale,
+                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+            )
+        return self._prepare_dynamic_step(
+            active_ids_cpu,
+            cold_bias_scale=cold_bias_scale,
+            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+        )
 
     def _adamw_update_(self, param_name: str, active_param: nn.Parameter, active_state: dict, slot_ids_cpu: Optional[torch.Tensor] = None) -> None:
         grad = active_param.grad
@@ -918,6 +1012,7 @@ class DynamicVocabRuntime:
         )
         self._clear_fixed_grads()
         self._clear_grad_accum_window()
+        self.runtime_step += 1
         return metrics
 
     @torch.no_grad()
@@ -951,6 +1046,7 @@ class DynamicVocabRuntime:
             self._clear_fixed_grads()
             step_ctx.active_vocab = None
             step_ctx.optimizer_state = None
+            self.runtime_step += 1
             return step_ctx
 
         self._adamw_update_("wte", step_ctx.active_vocab["wte"], step_ctx.optimizer_state["wte"])
@@ -994,4 +1090,5 @@ class DynamicVocabRuntime:
             state["exp_avg_sq"].index_copy_(0, step_ctx.active_ids_cpu, cpu_exp_avg_sq[name])
         step_ctx.active_vocab = None
         step_ctx.optimizer_state = None
+        self.runtime_step += 1
         return step_ctx

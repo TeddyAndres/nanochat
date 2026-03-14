@@ -77,6 +77,7 @@ parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 f
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
+parser.add_argument("--sparse-cold-bias-scale", type=float, default=0.0, help="sparse-only cold-token bias coefficient; effective magnitude also follows sparse unembedding LR, LR schedule, and total batch size")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-debug-timing", action="store_true", help="log detailed sparse timing breakdowns for diagnosing sparse runtime overhead")
 parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", help="for sparse timing diagnosis, synchronize after each backward pass to separate deferred GPU work from grad-accum bookkeeping")
@@ -369,8 +370,14 @@ dynamic_vocab = None
 optimizer_data_sparse = None
 if args.sparse_mode:
     assert args.sparse_logit_scale > 0.0, "--sparse-logit-scale must be positive"
+    assert args.sparse_cold_bias_scale >= 0.0, "--sparse-cold-bias-scale must be non-negative"
     if args.sparse_logit_scale != 1.0:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
+    if args.sparse_cold_bias_scale > 0.0:
+        print0(
+            f"Sparse cold-token bias enabled: scale={args.sparse_cold_bias_scale:.4f}, "
+            f"reference_tokens={B_REF:,}, total_batch={total_batch_size:,}"
+        )
     sparse_fixed_u_max = None
     sparse_grad_accum_u_max = None
     if hybrid_sparse:
@@ -385,6 +392,7 @@ if args.sparse_mode:
         unembedding_lr=sparse_unembedding_lr,
         fixed_u_max=sparse_fixed_u_max,
         grad_accum_u_max=sparse_grad_accum_u_max,
+        cold_bias_reference_tokens=B_REF,
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
@@ -468,6 +476,12 @@ def get_lr_multiplier(it):
     else:
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
+
+
+def get_sparse_cold_bias_scale(it):
+    if not args.sparse_mode or args.sparse_cold_bias_scale <= 0.0:
+        return 0.0
+    return args.sparse_cold_bias_scale * sparse_unembedding_lr * get_lr_multiplier(it)
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
@@ -582,11 +596,23 @@ while True:
         reset_peak_memory()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        sparse_cold_bias = get_sparse_cold_bias_scale(step)
         with torch.inference_mode():
             if args.sparse_mode:
+                sparse_eval_logit_bias = dynamic_vocab.get_dense_cold_logit_bias(
+                    cold_bias_scale=sparse_cold_bias,
+                    cold_bias_tokens_per_step=total_batch_size,
+                )
                 with dynamic_vocab.materialize_dense_params():
                     with disable_fp8(orig_model):
-                        val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes, logit_scale=args.sparse_logit_scale)
+                        val_bpb, val_ece = evaluate_bpb_and_ece(
+                            dense_eval_model,
+                            val_loader,
+                            eval_steps,
+                            token_bytes,
+                            logit_scale=args.sparse_logit_scale,
+                            logit_bias=sparse_eval_logit_bias,
+                        )
             else:
                 with disable_fp8(orig_model):
                     val_bpb, val_ece = evaluate_bpb_and_ece(dense_eval_model, val_loader, eval_steps, token_bytes)
@@ -720,11 +746,16 @@ while True:
     sparse_backward_sync_ms = 0.0
     sparse_accum_call_ms = 0.0
     sparse_apply_call_ms = 0.0
+    sparse_cold_bias = get_sparse_cold_bias_scale(step)
     for micro_step in range(grad_accum_steps):
         micro_t0 = time.perf_counter()
         if args.sparse_mode:
             prepare_t0 = time.perf_counter()
-            sparse_step_ctx = dynamic_vocab.prepare_step(sparse_batch_meta)
+            sparse_step_ctx = dynamic_vocab.prepare_step(
+                sparse_batch_meta,
+                cold_bias_scale=sparse_cold_bias,
+                cold_bias_tokens_per_step=total_batch_size,
+            )
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_metrics = sparse_step_ctx
             loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab, logit_scale=args.sparse_logit_scale)

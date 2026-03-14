@@ -63,6 +63,13 @@ def build_fixed_step_meta(
     }
 
 
+def set_zero_sparse_grads(step_ctx):
+    step_ctx.active_vocab["wte"].grad = torch.zeros_like(step_ctx.active_vocab["wte"])
+    step_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step_ctx.active_vocab["lm_head"])
+    for value_embed in step_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+
+
 def test_dynamic_vocab_forward_matches_dense_when_u_equals_v():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -132,6 +139,8 @@ def test_dynamic_vocab_runtime_state_dict_round_trip():
         assert runtime_state["step"] == restored_state["step"]
         assert torch.allclose(runtime_state["exp_avg"], restored_state["exp_avg"])
         assert torch.allclose(runtime_state["exp_avg_sq"], restored_state["exp_avg_sq"])
+    assert runtime.runtime_step == restored.runtime_step
+    assert torch.equal(runtime.last_seen_step_cpu, restored.last_seen_step_cpu)
 
 
 def test_dynamic_vocab_dense_materialization_round_trip():
@@ -315,6 +324,101 @@ def test_sparse_logit_scale_changes_sparse_loss_for_same_targets():
     assert torch.isfinite(baseline_loss)
     assert torch.isfinite(scaled_loss)
     assert scaled_loss > baseline_loss
+
+
+def test_sparse_cold_logit_bias_grows_with_absence_steps_and_batch_scale():
+    torch.manual_seed(0)
+
+    def build_runtime():
+        return DynamicVocabRuntime(
+            build_tiny_model(vocab_size=8),
+            device="cpu",
+            embedding_lr=0.01,
+            value_embedding_lr=0.01,
+            unembedding_lr=0.01,
+            cold_bias_reference_tokens=8,
+        )
+
+    runtime_small = build_runtime()
+    step0_small = runtime_small.prepare_step(torch.tensor([0], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    assert torch.allclose(step0_small.active_vocab["cold_logit_bias"], torch.zeros(1))
+    set_zero_sparse_grads(step0_small)
+    runtime_small.step(step0_small)
+
+    step1_small = runtime_small.prepare_step(torch.tensor([1], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(step1_small)
+    runtime_small.step(step1_small)
+
+    revisit_small = runtime_small.prepare_step(torch.tensor([0], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    expected_small = -torch.log1p(torch.tensor([1.0]))
+    assert torch.allclose(revisit_small.active_vocab["cold_logit_bias"], expected_small, atol=1e-6)
+
+    runtime_large = build_runtime()
+    step0_large = runtime_large.prepare_step(torch.tensor([0], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=16)
+    set_zero_sparse_grads(step0_large)
+    runtime_large.step(step0_large)
+
+    step1_large = runtime_large.prepare_step(torch.tensor([1], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=16)
+    set_zero_sparse_grads(step1_large)
+    runtime_large.step(step1_large)
+
+    revisit_large = runtime_large.prepare_step(torch.tensor([0], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=16)
+    expected_large = -torch.log1p(torch.tensor([2.0]))
+    assert torch.allclose(revisit_large.active_vocab["cold_logit_bias"], expected_large, atol=1e-6)
+    assert revisit_large.active_vocab["cold_logit_bias"].item() < revisit_small.active_vocab["cold_logit_bias"].item()
+
+
+def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=6,
+        cold_bias_reference_tokens=8,
+    )
+
+    step0 = build_fixed_step_meta(
+        slot_to_global=[0, 2, -1, -1, -1, -1],
+        stage_slots=[0, 1],
+        stage_ids=[0, 2],
+        writeback_slots=[0, 1],
+        writeback_ids=[0, 2],
+        is_last_step=True,
+    )
+    step0_ctx = runtime.prepare_step(step0, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    assert torch.allclose(step0_ctx.active_vocab["cold_logit_bias"][:2], torch.zeros(2))
+    set_zero_sparse_grads(step0_ctx)
+    runtime.step(step0_ctx)
+
+    warm_other = build_fixed_step_meta(
+        slot_to_global=[5, -1, -1, -1, -1, -1],
+        stage_slots=[0],
+        stage_ids=[5],
+        writeback_slots=[0],
+        writeback_ids=[5],
+        is_last_step=True,
+    )
+    warm_other_ctx = runtime.prepare_step(warm_other, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(warm_other_ctx)
+    runtime.step(warm_other_ctx)
+
+    revisit = build_fixed_step_meta(
+        slot_to_global=[-1, 0, -1, 2, -1, -1],
+        stage_slots=[1, 3],
+        stage_ids=[0, 2],
+        writeback_slots=[1, 3],
+        writeback_ids=[0, 2],
+        is_last_step=True,
+    )
+    revisit_ctx = runtime.prepare_step(revisit, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    cold_bias = revisit_ctx.active_vocab["cold_logit_bias"]
+    expected = -torch.log1p(torch.tensor(1.0))
+    assert torch.allclose(cold_bias[[1, 3]], expected.repeat(2), atol=1e-6)
+    assert torch.allclose(cold_bias[[0, 2, 4, 5]], torch.zeros(4), atol=1e-6)
 
 
 def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():

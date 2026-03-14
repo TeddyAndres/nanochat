@@ -432,7 +432,7 @@ class GPT(nn.Module):
         x = norm(x)
         return x
 
-    def compute_logits(self, x, active_vocab=None, logit_scale=1.0):
+    def compute_logits(self, x, active_vocab=None, logit_scale=1.0, logit_bias=None):
         # Forward the lm_head (compute logits)
         softcap = 20 # smoothly cap the logits to the range [-softcap, softcap]
         if active_vocab is None:
@@ -443,6 +443,12 @@ class GPT(nn.Module):
             logits = F.linear(x, active_lm_head)
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        if active_vocab is not None and "cold_logit_bias" in active_vocab:
+            sparse_logit_bias = active_vocab["cold_logit_bias"].to(device=logits.device, dtype=logits.dtype)
+            logits = logits + sparse_logit_bias.view(1, 1, -1)
+        if logit_bias is not None:
+            logit_bias = logit_bias.to(device=logits.device, dtype=logits.dtype)
+            logits = logits + logit_bias.view(1, 1, -1)
         if active_vocab is not None and "logit_mask" in active_vocab:
             logit_mask = active_vocab["logit_mask"].to(device=logits.device, dtype=torch.bool)
             active_width = active_vocab["lm_head"].size(0)
@@ -452,9 +458,9 @@ class GPT(nn.Module):
             logits = logits * logit_scale
         return logits
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None, logit_scale=1.0):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None, logit_scale=1.0, logit_bias=None):
         x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
-        logits = self.compute_logits(x, active_vocab=active_vocab, logit_scale=logit_scale)
+        logits = self.compute_logits(x, active_vocab=active_vocab, logit_scale=logit_scale, logit_bias=logit_bias)
 
         if targets is not None:
             # training: given the targets, compute and return the loss
