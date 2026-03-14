@@ -872,6 +872,8 @@ while True:
             sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
         else:
             sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
+        if sparse_metrics.cold_bias_clamped_count > 0:
+            sparse_str += f" | cold_clamped: {sparse_metrics.cold_bias_clamped_count:,} | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
         if args.sparse_debug_timing and grad_accum_steps > 1:
             sparse_str += (
                 f" | step_ms prep: {sparse_prepare_ms:.2f}"
@@ -920,6 +922,8 @@ while True:
                 "train/u_live": sparse_metrics.live_count if sparse_metrics.live_count > 0 else sparse_metrics.unique_count,
                 "train/u_stage": sparse_metrics.stage_count,
                 "train/u_writeback": sparse_metrics.writeback_count,
+                "train/cold_bias_clamped": sparse_metrics.cold_bias_clamped_count,
+                "train/cold_bias_absmax": sparse_metrics.cold_bias_abs_max,
             })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm

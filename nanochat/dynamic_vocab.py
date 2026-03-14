@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 
 
-COLD_LOGIT_BIAS_CLAMP_MIN = -500.0
-COLD_LOGIT_BIAS_CLAMP_MAX = 500.0
+COLD_LOGIT_BIAS_CLAMP_MIN = -40.0
+COLD_LOGIT_BIAS_CLAMP_MAX = 40.0
 
 
 @dataclass
@@ -41,6 +41,8 @@ class DynamicVocabStep:
     u_capacity: int = 0
     stage_count: int = 0
     writeback_count: int = 0
+    cold_bias_clamped_count: int = 0
+    cold_bias_abs_max: float = 0.0
     active_slot_ids_cpu: Optional[torch.Tensor] = None
     active_mask_cpu: Optional[torch.Tensor] = None
     slot_to_global_cpu: Optional[torch.Tensor] = None
@@ -227,15 +229,31 @@ class DynamicVocabRuntime:
         cold_bias_scale: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> torch.Tensor:
+        cold_bias, _, _ = self._compute_cold_logit_bias_with_stats_cpu(
+            cold_steps_cpu,
+            cold_bias_scale=cold_bias_scale,
+            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+        )
+        return cold_bias
+
+    def _compute_cold_logit_bias_with_stats_cpu(
+        self,
+        cold_steps_cpu: torch.Tensor,
+        cold_bias_scale: float = 0.0,
+        cold_bias_tokens_per_step: Optional[int] = None,
+    ) -> tuple[torch.Tensor, int, float]:
         cold_steps_cpu = cold_steps_cpu.detach().to(device="cpu", dtype=torch.float32)
         if cold_steps_cpu.numel() == 0:
-            return torch.empty(0, dtype=torch.float32)
+            return torch.empty(0, dtype=torch.float32), 0, 0.0
         if cold_bias_scale <= 0.0 or cold_bias_tokens_per_step is None or cold_bias_tokens_per_step <= 0:
-            return torch.zeros_like(cold_steps_cpu)
+            return torch.zeros_like(cold_steps_cpu), 0, 0.0
         reference_tokens = max(self.cold_bias_reference_tokens, 1.0)
         cold_tokens = cold_steps_cpu * float(cold_bias_tokens_per_step)
         cold_bias = float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
-        return cold_bias.clamp_(min=COLD_LOGIT_BIAS_CLAMP_MIN, max=COLD_LOGIT_BIAS_CLAMP_MAX)
+        clamped_mask = (cold_bias < COLD_LOGIT_BIAS_CLAMP_MIN) | (cold_bias > COLD_LOGIT_BIAS_CLAMP_MAX)
+        cold_bias.clamp_(min=COLD_LOGIT_BIAS_CLAMP_MIN, max=COLD_LOGIT_BIAS_CLAMP_MAX)
+        cold_bias_abs_max = float(cold_bias.abs().max().item()) if cold_bias.numel() > 0 else 0.0
+        return cold_bias, int(clamped_mask.sum().item()), cold_bias_abs_max
 
     def get_dense_cold_logit_bias(
         self,
@@ -553,7 +571,7 @@ class DynamicVocabRuntime:
         self._flush_pending_cpu_writeback()
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         cold_steps_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
-        cold_logit_bias_cpu = self._compute_cold_logit_bias_cpu(
+        cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
             cold_steps_cpu,
             cold_bias_scale=cold_bias_scale,
             cold_bias_tokens_per_step=cold_bias_tokens_per_step,
@@ -600,6 +618,8 @@ class DynamicVocabRuntime:
             live_count=active_ids_cpu.numel(),
             u_capacity=active_ids_cpu.numel(),
             stage_count=active_ids_cpu.numel(),
+            cold_bias_clamped_count=cold_bias_clamped_count,
+            cold_bias_abs_max=cold_bias_abs_max,
         )
 
     def _prepare_fixed_step(
@@ -616,7 +636,7 @@ class DynamicVocabRuntime:
         is_grad_accum_boundary = bool(step_meta.get("is_grad_accum_boundary", True))
         active_slot_ids_cpu = step_meta["active_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
         cold_steps_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
-        cold_logit_bias_cpu = self._compute_cold_logit_bias_cpu(
+        cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
             cold_steps_cpu,
             cold_bias_scale=cold_bias_scale,
             cold_bias_tokens_per_step=cold_bias_tokens_per_step,
@@ -704,6 +724,8 @@ class DynamicVocabRuntime:
             is_grad_accum_boundary=is_grad_accum_boundary,
             is_last_step=is_last_step,
             fixed_u_mode=True,
+            cold_bias_clamped_count=cold_bias_clamped_count,
+            cold_bias_abs_max=cold_bias_abs_max,
         )
 
     def prepare_step(

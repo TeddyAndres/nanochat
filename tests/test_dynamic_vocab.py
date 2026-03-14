@@ -442,6 +442,16 @@ def test_sparse_cold_logit_bias_clamps_for_extreme_absence():
     assert cold_bias[1].item() == COLD_LOGIT_BIAS_CLAMP_MAX
     assert cold_bias[2].item() == COLD_LOGIT_BIAS_CLAMP_MAX
 
+    runtime.runtime_step = 3
+    runtime.last_seen_step_cpu[:3] = torch.tensor([2, 0, -998], dtype=torch.long)
+    step_ctx = runtime.prepare_step(
+        torch.tensor([0, 1, 2], dtype=torch.long),
+        cold_bias_scale=512.0,
+        cold_bias_tokens_per_step=8,
+    )
+    assert step_ctx.cold_bias_clamped_count == 2
+    assert step_ctx.cold_bias_abs_max == COLD_LOGIT_BIAS_CLAMP_MAX
+
 
 def test_dense_cold_logit_bias_uses_same_clamp_bounds():
     runtime = DynamicVocabRuntime(
