@@ -8,7 +8,7 @@ python -m pytest tests/test_dynamic_vocab.py -v
 import torch
 import torch.nn as nn
 
-from nanochat.dynamic_vocab import DynamicVocabRuntime
+from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, DynamicVocabRuntime
 from nanochat.gpt import GPT, GPTConfig
 
 
@@ -419,6 +419,71 @@ def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
     expected = torch.log1p(torch.tensor(1.0))
     assert torch.allclose(cold_bias[[1, 3]], expected.repeat(2), atol=1e-6)
     assert torch.allclose(cold_bias[[0, 2, 4, 5]], torch.zeros(4), atol=1e-6)
+
+
+def test_sparse_cold_logit_bias_clamps_for_extreme_absence():
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=8),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        cold_bias_reference_tokens=8,
+    )
+
+    cold_steps = torch.tensor([0.0, 2.0, 1_000.0], dtype=torch.float32)
+    cold_bias = runtime._compute_cold_logit_bias_cpu(
+        cold_steps,
+        cold_bias_scale=512.0,
+        cold_bias_tokens_per_step=8,
+    )
+
+    assert cold_bias[0].item() == 0.0
+    assert cold_bias[1].item() == COLD_LOGIT_BIAS_CLAMP_MAX
+    assert cold_bias[2].item() == COLD_LOGIT_BIAS_CLAMP_MAX
+
+
+def test_dense_cold_logit_bias_uses_same_clamp_bounds():
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=8),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        cold_bias_reference_tokens=8,
+    )
+    runtime.runtime_step = 5
+    runtime.last_seen_step_cpu.copy_(torch.tensor([4, 2, -996, 4, 4, 4, 4, 4], dtype=torch.float32))
+
+    dense_bias = runtime.get_dense_cold_logit_bias(
+        cold_bias_scale=512.0,
+        cold_bias_tokens_per_step=8,
+    )
+
+    assert dense_bias is not None
+    assert dense_bias[0].item() == 0.0
+    assert dense_bias[1].item() == COLD_LOGIT_BIAS_CLAMP_MAX
+    assert dense_bias[2].item() == COLD_LOGIT_BIAS_CLAMP_MAX
+
+
+def test_cold_logit_bias_returns_zeros_for_non_positive_scale():
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=8),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        cold_bias_reference_tokens=8,
+    )
+
+    cold_steps = torch.tensor([0.0, 2.0, 1_000.0], dtype=torch.float32)
+    cold_bias = runtime._compute_cold_logit_bias_cpu(
+        cold_steps,
+        cold_bias_scale=0.0,
+        cold_bias_tokens_per_step=8,
+    )
+
+    assert torch.allclose(cold_bias, torch.zeros_like(cold_steps))
 
 
 def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():

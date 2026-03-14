@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 
 
+COLD_LOGIT_BIAS_CLAMP_MIN = -500.0
+COLD_LOGIT_BIAS_CLAMP_MAX = 500.0
+
+
 @dataclass
 class DynamicVocabStep:
     active_ids_cpu: torch.Tensor
@@ -230,7 +234,8 @@ class DynamicVocabRuntime:
             return torch.zeros_like(cold_steps_cpu)
         reference_tokens = max(self.cold_bias_reference_tokens, 1.0)
         cold_tokens = cold_steps_cpu * float(cold_bias_tokens_per_step)
-        return float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
+        cold_bias = float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
+        return cold_bias.clamp_(min=COLD_LOGIT_BIAS_CLAMP_MIN, max=COLD_LOGIT_BIAS_CLAMP_MAX)
 
     def get_dense_cold_logit_bias(
         self,
