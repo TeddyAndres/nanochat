@@ -603,13 +603,8 @@ while True:
         reset_peak_memory()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        sparse_cold_bias = get_sparse_cold_bias_scale(step)
         with torch.inference_mode():
             if args.sparse_mode:
-                sparse_eval_logit_bias = dynamic_vocab.get_dense_cold_logit_bias(
-                    cold_bias_scale=sparse_cold_bias,
-                    cold_bias_tokens_per_step=total_batch_size,
-                )
                 with dynamic_vocab.materialize_dense_params():
                     with disable_fp8(orig_model):
                         val_bpb, val_ece = evaluate_bpb_and_ece(
@@ -618,7 +613,6 @@ while True:
                             eval_steps,
                             token_bytes,
                             logit_scale=args.sparse_logit_scale,
-                            logit_bias=sparse_eval_logit_bias,
                         )
             else:
                 with disable_fp8(orig_model):
