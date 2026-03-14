@@ -34,7 +34,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.dynamic_vocab import DynamicVocabRuntime
+from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CLAMP_MIN, DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -374,9 +374,16 @@ if args.sparse_mode:
     if args.sparse_logit_scale != 1.0:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
     if args.sparse_cold_bias_scale > 0.0:
+        bias_examples = []
+        for cold_steps in (1, 10, 100):
+            raw_bias = args.sparse_cold_bias_scale * math.log1p(cold_steps * total_batch_size / B_REF)
+            clamped_bias = max(min(raw_bias, COLD_LOGIT_BIAS_CLAMP_MAX), COLD_LOGIT_BIAS_CLAMP_MIN)
+            bias_examples.append(f"{cold_steps}: raw={raw_bias:.2f}, clamped={clamped_bias:.2f}")
         print0(
-            f"Sparse cold-token bias enabled: scale={args.sparse_cold_bias_scale:.4f}, "
-            f"reference_tokens={B_REF:,}, total_batch={total_batch_size:,}"
+            f"Sparse cold-token bias enabled: stale-only scale={args.sparse_cold_bias_scale:.4f}, "
+            f"first_seen_bias=0, reference_tokens={B_REF:,}, total_batch={total_batch_size:,}, "
+            f"clamp=[{COLD_LOGIT_BIAS_CLAMP_MIN:.0f}, {COLD_LOGIT_BIAS_CLAMP_MAX:.0f}], "
+            f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
         )
     sparse_fixed_u_max = None
     sparse_grad_accum_u_max = None
@@ -481,7 +488,7 @@ def get_lr_multiplier(it):
 def get_sparse_cold_bias_scale(it):
     if not args.sparse_mode or args.sparse_cold_bias_scale <= 0.0:
         return 0.0
-    return args.sparse_cold_bias_scale * sparse_unembedding_lr * get_lr_multiplier(it)
+    return args.sparse_cold_bias_scale
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):

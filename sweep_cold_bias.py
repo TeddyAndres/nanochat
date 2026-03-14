@@ -17,7 +17,7 @@ def run_training_with_bias_scale(bias_scale):
         "--depth=6",
         "--num-iterations=1000",
         "--device-batch-size=32",
-        f"--run=sparse 65kvoc 1kstep unembedlr0.018 fasteval logit1 coldbiasclamp{bias_scale}",
+        f"--run=sparse 65kvoc 1kstep unembedlr0.018 fasteval logit1 coldbiascl2{bias_scale}",
         "--sparse-mode",
         "--window-pattern", "L",
         "--sparse-manifest", "manifests/d6_2kseq_32batch_1kstep_noaccum.json",

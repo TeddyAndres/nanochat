@@ -220,8 +220,13 @@ class DynamicVocabRuntime:
             return torch.empty(0, dtype=torch.long)
         last_seen = self.last_seen_step_cpu.index_select(0, active_ids_cpu)
         cold_steps_cpu = (self.runtime_step - last_seen - 1).clamp_min_(0)
+        cold_steps_cpu.masked_fill_(last_seen < 0, 0)
         self.last_seen_step_cpu.index_fill_(0, active_ids_cpu, self.runtime_step)
         return cold_steps_cpu
+
+    def _get_dense_cold_steps_cpu(self) -> torch.Tensor:
+        cold_steps_cpu = (self.runtime_step - self.last_seen_step_cpu - 1).clamp_min(0)
+        return cold_steps_cpu.masked_fill(self.last_seen_step_cpu < 0, 0)
 
     def _compute_cold_logit_bias_cpu(
         self,
@@ -262,7 +267,7 @@ class DynamicVocabRuntime:
     ) -> Optional[torch.Tensor]:
         if cold_bias_scale <= 0.0 or cold_bias_tokens_per_step is None or cold_bias_tokens_per_step <= 0:
             return None
-        cold_steps_cpu = (self.runtime_step - self.last_seen_step_cpu - 1).clamp_min(0)
+        cold_steps_cpu = self._get_dense_cold_steps_cpu()
         cold_bias_cpu = self._compute_cold_logit_bias_cpu(
             cold_steps_cpu,
             cold_bias_scale=cold_bias_scale,

@@ -368,6 +368,26 @@ def test_sparse_cold_logit_bias_grows_with_absence_steps_and_batch_scale():
     assert revisit_large.active_vocab["cold_logit_bias"].item() > revisit_small.active_vocab["cold_logit_bias"].item()
 
 
+def test_first_seen_rows_do_not_receive_cold_bias_even_late_in_training():
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=8),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        cold_bias_reference_tokens=8,
+    )
+
+    runtime.runtime_step = 400
+    first_seen = runtime.prepare_step(torch.tensor([0, 3], dtype=torch.long), cold_bias_scale=512.0, cold_bias_tokens_per_step=8)
+    assert torch.allclose(first_seen.active_vocab["cold_logit_bias"], torch.zeros(2))
+
+    runtime.runtime_step = 400
+    dense_bias = runtime.get_dense_cold_logit_bias(cold_bias_scale=512.0, cold_bias_tokens_per_step=8)
+    assert dense_bias is not None
+    assert torch.allclose(dense_bias, torch.zeros_like(dense_bias))
+
+
 def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -442,8 +462,8 @@ def test_sparse_cold_logit_bias_clamps_for_extreme_absence():
     assert cold_bias[1].item() == COLD_LOGIT_BIAS_CLAMP_MAX
     assert cold_bias[2].item() == COLD_LOGIT_BIAS_CLAMP_MAX
 
-    runtime.runtime_step = 3
-    runtime.last_seen_step_cpu[:3] = torch.tensor([2, 0, -998], dtype=torch.long)
+    runtime.runtime_step = 1003
+    runtime.last_seen_step_cpu[:3] = torch.tensor([1002, 1000, 0], dtype=torch.long)
     step_ctx = runtime.prepare_step(
         torch.tensor([0, 1, 2], dtype=torch.long),
         cold_bias_scale=512.0,
@@ -462,8 +482,8 @@ def test_dense_cold_logit_bias_uses_same_clamp_bounds():
         unembedding_lr=0.01,
         cold_bias_reference_tokens=8,
     )
-    runtime.runtime_step = 5
-    runtime.last_seen_step_cpu.copy_(torch.tensor([4, 2, -996, 4, 4, 4, 4, 4], dtype=torch.float32))
+    runtime.runtime_step = 1005
+    runtime.last_seen_step_cpu.copy_(torch.tensor([1004, 1002, 0, 1004, 1004, 1004, 1004, 1004], dtype=torch.long))
 
     dense_bias = runtime.get_dense_cold_logit_bias(
         cold_bias_scale=512.0,
