@@ -230,7 +230,7 @@ class DynamicVocabRuntime:
             return torch.zeros_like(cold_steps_cpu)
         reference_tokens = max(self.cold_bias_reference_tokens, 1.0)
         cold_tokens = cold_steps_cpu * float(cold_bias_tokens_per_step)
-        return -float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
+        return float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
 
     def get_dense_cold_logit_bias(
         self,

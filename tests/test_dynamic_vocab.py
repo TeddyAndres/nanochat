@@ -350,7 +350,7 @@ def test_sparse_cold_logit_bias_grows_with_absence_steps_and_batch_scale():
     runtime_small.step(step1_small)
 
     revisit_small = runtime_small.prepare_step(torch.tensor([0], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    expected_small = -torch.log1p(torch.tensor([1.0]))
+    expected_small = torch.log1p(torch.tensor([1.0]))
     assert torch.allclose(revisit_small.active_vocab["cold_logit_bias"], expected_small, atol=1e-6)
 
     runtime_large = build_runtime()
@@ -363,9 +363,9 @@ def test_sparse_cold_logit_bias_grows_with_absence_steps_and_batch_scale():
     runtime_large.step(step1_large)
 
     revisit_large = runtime_large.prepare_step(torch.tensor([0], dtype=torch.long), cold_bias_scale=1.0, cold_bias_tokens_per_step=16)
-    expected_large = -torch.log1p(torch.tensor([2.0]))
+    expected_large = torch.log1p(torch.tensor([2.0]))
     assert torch.allclose(revisit_large.active_vocab["cold_logit_bias"], expected_large, atol=1e-6)
-    assert revisit_large.active_vocab["cold_logit_bias"].item() < revisit_small.active_vocab["cold_logit_bias"].item()
+    assert revisit_large.active_vocab["cold_logit_bias"].item() > revisit_small.active_vocab["cold_logit_bias"].item()
 
 
 def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
@@ -416,7 +416,7 @@ def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
     )
     revisit_ctx = runtime.prepare_step(revisit, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
     cold_bias = revisit_ctx.active_vocab["cold_logit_bias"]
-    expected = -torch.log1p(torch.tensor(1.0))
+    expected = torch.log1p(torch.tensor(1.0))
     assert torch.allclose(cold_bias[[1, 3]], expected.repeat(2), atol=1e-6)
     assert torch.allclose(cold_bias[[0, 2, 4, 5]], torch.zeros(4), atol=1e-6)
 
