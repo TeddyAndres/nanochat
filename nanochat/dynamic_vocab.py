@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 
 
-COLD_LOGIT_BIAS_CLAMP_MIN = -40.0
-COLD_LOGIT_BIAS_CLAMP_MAX = 40.0
+COLD_LOGIT_BIAS_CLAMP_MIN = -4.0
+COLD_LOGIT_BIAS_CLAMP_MAX = 4.0
 
 
 @dataclass

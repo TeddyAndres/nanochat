@@ -15,12 +15,12 @@ def run_training_with_bias_scale(bias_scale):
     cmd = [
         sys.executable, "-m", "scripts.base_train",
         "--depth=6",
-        "--num-iterations=1000",
+        "--num-iterations=8000",
         "--device-batch-size=32",
-        f"--run=sparse 65kvoc 1kstep unembedlr0.018 fasteval logit1 coldbiascl2{bias_scale}",
+        f"--run=sparse 65kvoc 8kstep unembedlr0.018 fasteval logit1 coldbiasclamp4_{bias_scale}",
         "--sparse-mode",
         "--window-pattern", "L",
-        "--sparse-manifest", "manifests/d6_2kseq_32batch_1kstep_noaccum.json",
+        "--sparse-manifest", "manifests/d6_2kseq_32batch_8kstep_noaccum.json",
         "--log-every", "10",
         "--eval-every", "1000",
         "--unembedding-lr=0.018",
@@ -49,7 +49,7 @@ def main():
     """Main sweep function"""
     
     # Values to test (greater than 4)
-    bias_scales = [300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950]
+    bias_scales = [1.8, 1.9, 2, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8]
     
     print("Starting sparse-cold-bias-scale sweep")
     print(f"Testing values: {bias_scales}")

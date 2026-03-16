@@ -192,12 +192,12 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
-    def init_weights(self):
+    def init_weights(self, lm_head_init_std=None):
         """
         Initialize the full model in this one function for maximum clarity.
 
         wte (embedding):     normal, std=1.0
-        lm_head:             normal, std=0.001
+        lm_head:             normal, std=0.001 by default
         for each block:
             attn.c_q:        uniform, std=1/sqrt(n_embd)
             attn.c_k:        uniform, std=1/sqrt(n_embd)
@@ -208,8 +208,9 @@ class GPT(nn.Module):
         """
 
         # Embedding and unembedding
+        lm_head_std = 0.001 if lm_head_init_std is None else float(lm_head_init_std)
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=lm_head_std)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
