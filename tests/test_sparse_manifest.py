@@ -1,5 +1,7 @@
 import json
 
+from scripts.build_sparse_manifest import resolve_batch_geometry
+
 from nanochat.sparse_manifest import (
     build_manifest_payload,
     load_sparse_manifest_header,
@@ -37,8 +39,6 @@ def test_sparse_manifest_header_and_streaming_steps(tmp_path):
         grad_accum_steps=1,
         ddp_world_size=1,
         num_iterations=2,
-        tokenizer_batch_size=8,
-        tokenizer_threads=2,
         buffer_size=32,
         steps=steps,
     )
@@ -61,6 +61,8 @@ def test_sparse_manifest_header_and_streaming_steps(tmp_path):
     assert "steps" not in header
     assert header["u_max"] == 3
     assert header["num_steps"] == 2
+    assert "tokenizer_batch_size" not in header
+    assert "tokenizer_threads" not in header
 
     streamed_steps = list(stream_sparse_manifest_steps(manifest_path))
     assert streamed_steps == steps
@@ -104,8 +106,6 @@ def test_sparse_manifest_v2_accumulation_windows(tmp_path):
         grad_accum_steps=2,
         ddp_world_size=1,
         num_iterations=1,
-        tokenizer_batch_size=8,
-        tokenizer_threads=2,
         buffer_size=32,
         steps=steps,
     )
@@ -143,8 +143,6 @@ def test_sparse_manifest_resolves_grad_accum_u_max_from_legacy_v2_steps(tmp_path
         "grad_accum_steps": 2,
         "ddp_world_size": 1,
         "num_steps": 2,
-        "tokenizer_batch_size": 8,
-        "tokenizer_threads": 2,
         "buffer_size": 32,
         "u_max": 3,
         "steps": [
@@ -175,3 +173,41 @@ def test_sparse_manifest_resolves_grad_accum_u_max_from_legacy_v2_steps(tmp_path
     header = load_sparse_manifest_header(manifest_path)
     assert "grad_accum_u_max" not in header
     assert resolve_sparse_manifest_grad_accum_u_max(manifest_path, header) == 5
+
+
+def test_resolve_batch_geometry_defaults_to_one_microbatch():
+    total_batch_size, grad_accum_steps = resolve_batch_geometry(
+        device_batch_size=2,
+        max_seq_len=8,
+        total_batch_size=-1,
+        grad_accum_steps=-1,
+    )
+
+    assert total_batch_size == 16
+    assert grad_accum_steps == 1
+
+
+def test_resolve_batch_geometry_accepts_explicit_grad_accum_steps():
+    total_batch_size, grad_accum_steps = resolve_batch_geometry(
+        device_batch_size=2,
+        max_seq_len=8,
+        total_batch_size=-1,
+        grad_accum_steps=4,
+    )
+
+    assert total_batch_size == 64
+    assert grad_accum_steps == 4
+
+
+def test_resolve_batch_geometry_rejects_inconsistent_inputs():
+    try:
+        resolve_batch_geometry(
+            device_batch_size=2,
+            max_seq_len=8,
+            total_batch_size=32,
+            grad_accum_steps=3,
+        )
+    except ValueError as exc:
+        assert "grad_accum_steps mismatch" in str(exc)
+    else:
+        raise AssertionError("Expected resolve_batch_geometry to reject inconsistent inputs")

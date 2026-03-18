@@ -84,6 +84,12 @@ parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", h
 parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="in sparse mode, call torch.cuda.empty_cache() every N steps after writeback (0 disables)")
 parser.add_argument("--sparse-max-reserved-mib", type=float, default=8192.0, help="in sparse mode, if current CUDA reserved memory exceeds this threshold after a step, trim the cache with torch.cuda.empty_cache() (0 disables)")
 parser.add_argument("--lm-head-init-std", type=float, default=-1.0, help="override lm_head init std; negative values keep the model default")
+parser.add_argument("--lm-head-init-dist", type=str, default="normal", choices=["normal", "uniform"], help="lm_head initialization distribution when building a fresh model")
+parser.add_argument("--sparse-unembed-warmup-steps", type=int, default=0, help="linearly ramp sparse unembedding LR from 0 to its full value over this many steps (0 = disabled)")
+parser.add_argument("--sparse-first-hot-unembedding-lr", type=float, default=0.0, help="for lm_head rows only, use this LR the first time a token becomes active, then revert to the configured sparse unembedding LR (0 = disabled)")
+parser.add_argument("--sparse-hot-unembed-ramp-activations", type=int, default=0, help="for lm_head rows only, ramp per-token sparse unembedding LR over this many hot activations (0 = disabled)")
+parser.add_argument("--sparse-hot-unembed-ramp-start-lr", type=float, default=0.0, help="starting lm_head LR for the per-token hot-activation ramp; used with --sparse-hot-unembed-ramp-activations (0 = disabled)")
+parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip global gradient norm (dense params only) to this value before optimizer step; 0 = disabled")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -155,7 +161,8 @@ def build_model_meta(depth):
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    num_heads = model_dim // args.head_dim
+    # num_heads = model_dim // args.head_dim
+    num_heads = 4
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
@@ -174,7 +181,9 @@ model.to_empty(device=device) # 2) All tensors get storage on target device but 
 lm_head_init_std = None if args.lm_head_init_std < 0.0 else args.lm_head_init_std
 if lm_head_init_std is not None:
     print0(f"Overriding lm_head init std to {lm_head_init_std:.6f}")
-model.init_weights(lm_head_init_std=lm_head_init_std) # 3) All tensors get initialized
+if args.lm_head_init_dist != "normal":
+    print0(f"Overriding lm_head init distribution to {args.lm_head_init_dist}")
+model.init_weights(lm_head_init_std=lm_head_init_std, lm_head_init_dist=args.lm_head_init_dist) # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -401,6 +410,9 @@ if args.sparse_mode:
         embedding_lr=sparse_embedding_lr,
         value_embedding_lr=sparse_value_embedding_lr,
         unembedding_lr=sparse_unembedding_lr,
+        first_hot_unembedding_lr=args.sparse_first_hot_unembedding_lr,
+        hot_unembedding_ramp_activations=args.sparse_hot_unembed_ramp_activations,
+        hot_unembedding_ramp_start_lr=args.sparse_hot_unembed_ramp_start_lr,
         fixed_u_max=sparse_fixed_u_max,
         grad_accum_u_max=sparse_grad_accum_u_max,
         cold_bias_reference_tokens=B_REF,
@@ -804,6 +816,9 @@ while True:
         scaler.unscale_(optimizer)
         if should_log_grad_norm:
             grad_norm = compute_global_grad_norm(optimizer)
+        if args.max_grad_norm > 0.0:
+            params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+            torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
@@ -815,8 +830,14 @@ while True:
     else:
         if should_log_grad_norm:
             grad_norm = compute_global_grad_norm(optimizer)
+        if args.max_grad_norm > 0.0:
+            params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+            torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
         optimizer.step()
     if args.sparse_mode:
+        if args.sparse_unembed_warmup_steps > 0:
+            warmup_scale = min(1.0, (step + 1) / args.sparse_unembed_warmup_steps)
+            dynamic_vocab.table_specs["lm_head"]["lr"] = sparse_unembedding_lr * warmup_scale
         if grad_accum_steps > 1:
             sparse_apply_t0 = time.perf_counter()
             sparse_metrics = dynamic_vocab.apply_accumulated_gradients()

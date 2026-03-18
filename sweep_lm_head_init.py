@@ -52,22 +52,25 @@ def parse_metrics(output: str) -> dict:
     return metrics
 
 
-def summarize(std: float, returncode: int, metrics: dict) -> str:
+def summarize(std: float, init_dist: str, returncode: int, metrics: dict, unembed_warmup: int = 0, max_grad_norm: float = 0.0, first_hot_unembedding_lr: float = 0.0, hot_ramp_activations: int = 0, hot_ramp_start_lr: float = 0.0) -> str:
     if returncode != 0:
-        return f"lm_head_std={std:.6f} | FAILED"
-    max_grad_norm = metrics["max_grad_norm"]
+        return f"lm_head_std={std:.6f} | unembed_warmup={unembed_warmup:3d} | first_hot_unembed_lr={first_hot_unembedding_lr:.4f} | hot_ramp={hot_ramp_activations:2d}@{hot_ramp_start_lr:.4f} | grad_clip={max_grad_norm:.1f} | FAILED"
+    mgn = metrics["max_grad_norm"]
     final_loss = metrics["final_loss"]
-    if max_grad_norm is None or final_loss is None:
-        return f"lm_head_std={std:.6f} | no grad_norm captured"
+    if mgn is None or final_loss is None:
+        return f"lm_head_std={std:.6f} | unembed_warmup={unembed_warmup:3d} | first_hot_unembed_lr={first_hot_unembedding_lr:.4f} | hot_ramp={hot_ramp_activations:2d}@{hot_ramp_start_lr:.4f} | grad_clip={max_grad_norm:.1f} | no grad_norm captured"
     return (
-        f"lm_head_std={std:.6f} | max_grad_norm_10={metrics['max_grad_norm_first_10']:.4f}"
+        f"lm_head_std={std:.6f} | unembed_warmup={unembed_warmup:3d} | first_hot_unembed_lr={first_hot_unembedding_lr:.4f} | hot_ramp={hot_ramp_activations:2d}@{hot_ramp_start_lr:.4f} | grad_clip={max_grad_norm:.1f}"
+        f" | max_grad_norm_10={metrics['max_grad_norm_first_10']:.4f}"
         f" | max_grad_norm_20={metrics['max_grad_norm_first_20']:.4f}"
-        f" | max_grad_norm_all={max_grad_norm:.4f}"
+        f" | max_grad_norm_all={mgn:.4f}"
         f" @ step {metrics['step_of_max_grad_norm']:02d} | final_loss={final_loss:.4f}"
     )
 
 
-def run_training(lm_head_std: float, cold_bias_scale: float, num_iterations: int) -> tuple[int, str]:
+def run_training(lm_head_std: float, lm_head_dist: str, cold_bias_scale: float, num_iterations: int,
+                 unembed_warmup_steps: int = 0, max_grad_norm: float = 0.0, first_hot_unembedding_lr: float = 0.0,
+                 hot_ramp_activations: int = 0, hot_ramp_start_lr: float = 0.0) -> tuple[int, str]:
     cmd = [
         sys.executable, "-m", "scripts.base_train",
         "--run=dummy",
@@ -89,6 +92,12 @@ def run_training(lm_head_std: float, cold_bias_scale: float, num_iterations: int
         "--warmdown-ratio", "0.5",
         f"--sparse-cold-bias-scale={cold_bias_scale}",
         f"--lm-head-init-std={lm_head_std}",
+        f"--lm-head-init-dist={lm_head_dist}",
+        f"--sparse-unembed-warmup-steps={unembed_warmup_steps}",
+        f"--sparse-first-hot-unembedding-lr={first_hot_unembedding_lr}",
+        f"--sparse-hot-unembed-ramp-activations={hot_ramp_activations}",
+        f"--sparse-hot-unembed-ramp-start-lr={hot_ramp_start_lr}",
+        f"--max-grad-norm={max_grad_norm}",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     output = proc.stdout + proc.stderr
@@ -98,22 +107,53 @@ def run_training(lm_head_std: float, cold_bias_scale: float, num_iterations: int
 def main() -> None:
     cold_bias_scale = 2.2
     num_iterations = 250
-    std_values = [0.0010, 0.0016, 0.0025, 0.0040, 0.0064]
+    lm_head_std = 0.00084
+    lm_head_dist = "normal"
 
-    print("Sparse lm_head init sweep")
-    print(f"Cold bias scale: {cold_bias_scale}")
-    print(f"Iterations per trial: {num_iterations}")
-    print(f"Testing std values: {std_values}")
+    first_hot_unembedding_lr = 0.0
+    hot_ramp_activations_values = [0, 1, 2, 4, 8]
+    hot_ramp_start_lr = 0.004
+    warmup_steps = 0
+    max_grad_norm = 0.0
+
+    print("Sparse startup control sweep: per-token hot-activation lm_head LR ramp")
+    print(f"Fixed: lm_head_std={lm_head_std}, lm_head_dist={lm_head_dist}, cold_bias_scale={cold_bias_scale}, iterations={num_iterations}")
+    print(f"Warmup steps: {warmup_steps}")
+    print(f"Max grad norm (clip): {max_grad_norm}")
+    print(f"First-hot unembedding LR: {first_hot_unembedding_lr}")
+    print(f"Hot ramp activations: {hot_ramp_activations_values}")
+    print(f"Hot ramp start LR: {hot_ramp_start_lr}")
 
     summaries = []
-    for std in std_values:
-        print(f"\n{'=' * 60}")
-        print(f"Running sparse startup trial with lm_head_init_std={std:.6f}")
-        print(f"{'=' * 60}")
-        returncode, output = run_training(std, cold_bias_scale=cold_bias_scale, num_iterations=num_iterations)
+    for hot_ramp_activations in hot_ramp_activations_values:
+        label = f"hot_ramp={hot_ramp_activations:2d}@{hot_ramp_start_lr:.4f}"
+        print(f"\n{'-' * 60}")
+        print(f"Running: {label}")
+        print(f"{'-' * 60}")
+        returncode, output = run_training(
+            lm_head_std,
+            lm_head_dist=lm_head_dist,
+            cold_bias_scale=cold_bias_scale,
+            num_iterations=num_iterations,
+            unembed_warmup_steps=warmup_steps,
+            max_grad_norm=max_grad_norm,
+            first_hot_unembedding_lr=first_hot_unembedding_lr,
+            hot_ramp_activations=hot_ramp_activations,
+            hot_ramp_start_lr=hot_ramp_start_lr,
+        )
         metrics = parse_metrics(output)
-        summary = summarize(std, returncode, metrics)
-        summaries.append((std, returncode, metrics, summary, output))
+        summary = summarize(
+            lm_head_std,
+            lm_head_dist,
+            returncode,
+            metrics,
+            unembed_warmup=warmup_steps,
+            max_grad_norm=max_grad_norm,
+            first_hot_unembedding_lr=first_hot_unembedding_lr,
+            hot_ramp_activations=hot_ramp_activations,
+            hot_ramp_start_lr=hot_ramp_start_lr,
+        )
+        summaries.append((hot_ramp_activations, returncode, metrics, summary, output))
         print(summary)
         if returncode != 0:
             print(output)
@@ -135,8 +175,8 @@ def main() -> None:
             ),
         )
         print(
-            "\nRecommended starting point: "
-            f"lm_head_init_std={best[0]:.6f} based on minimum observed early grad-norm peak."
+            f"\nBest: hot_ramp_activations={best[0]} @ start_lr={hot_ramp_start_lr:.4f} "
+            "based on minimum observed early grad-norm peak."
         )
 
 

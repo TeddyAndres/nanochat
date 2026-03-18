@@ -52,8 +52,6 @@ def build_manifest_payload(
     grad_accum_steps: int,
     ddp_world_size: int,
     num_iterations: int,
-    tokenizer_batch_size: int,
-    tokenizer_threads: int,
     buffer_size: int,
     steps: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -87,8 +85,6 @@ def build_manifest_payload(
         "grad_accum_steps": int(grad_accum_steps),
         "ddp_world_size": int(ddp_world_size),
         "num_steps": int(num_iterations),
-        "tokenizer_batch_size": int(tokenizer_batch_size),
-        "tokenizer_threads": int(tokenizer_threads),
         "buffer_size": int(buffer_size),
         "u_max": int(u_max),
         "grad_accum_u_max": int(grad_accum_u_max),

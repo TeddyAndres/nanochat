@@ -192,12 +192,12 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
-    def init_weights(self, lm_head_init_std=None):
+    def init_weights(self, lm_head_init_std=None, lm_head_init_dist="normal"):
         """
         Initialize the full model in this one function for maximum clarity.
 
         wte (embedding):     normal, std=1.0
-        lm_head:             normal, std=0.001 by default
+        lm_head:             normal/uniform, std=0.001 by default
         for each block:
             attn.c_q:        uniform, std=1/sqrt(n_embd)
             attn.c_k:        uniform, std=1/sqrt(n_embd)
@@ -209,8 +209,16 @@ class GPT(nn.Module):
 
         # Embedding and unembedding
         lm_head_std = 0.001 if lm_head_init_std is None else float(lm_head_init_std)
+        lm_head_init_dist = str(lm_head_init_dist).lower()
+        if lm_head_init_dist not in {"normal", "uniform"}:
+            raise ValueError(f"Unsupported lm_head_init_dist '{lm_head_init_dist}', expected 'normal' or 'uniform'")
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=lm_head_std)
+        if lm_head_init_dist == "normal":
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=lm_head_std)
+        else:
+            # Match the requested standard deviation under a uniform distribution.
+            bound = (3.0 ** 0.5) * lm_head_std
+            torch.nn.init.uniform_(self.lm_head.weight, -bound, bound)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd

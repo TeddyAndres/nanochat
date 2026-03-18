@@ -15,22 +15,22 @@ def run_training_with_unembedding_lr(unembedding_lr):
     cmd = [
         sys.executable, "-m", "scripts.base_train",
         "--depth=6",
-        "--num-iterations=1000",
-        "--device-batch-size=32",
-        f"--run=sparse 65kvoc 1kstep unembedlr{unembedding_lr} fasteval logit1 coldbias512",
+        "--num-iterations=2000",
+        "--device-batch-size=16",
+        f"--run=sparse 65kvoc 2kstep 16batch 16aspect unembedlr{unembedding_lr} fasteval coldbias2.8",
         "--sparse-mode",
         "--window-pattern", "L",
-        "--sparse-manifest", "manifests/d6_2kseq_32batch_1kstep_noaccum.json",
+        "--sparse-manifest", "manifests/d6_2kseq_16batch_aspect16_2kstep_noaccum.json",
         "--log-every", "10",
         "--eval-every", "1000",
         f"--unembedding-lr={unembedding_lr}",
         "--core-metric-every", "-1",
-        "--total-batch-size", "65536",
+        "--total-batch-size", "32768",
         "--sparse-logit-scale", "1",
-        "--aspect-ratio", "64",
+        "--aspect-ratio", "16",
         "--warmup-ratio", "0",
         "--warmdown-ratio", "0.5",
-        "--sparse-cold-bias-scale", "512"
+        "--sparse-cold-bias-scale", "2.8"
     ]
     
     print(f"\n{'='*60}")
@@ -49,7 +49,7 @@ def main():
     """Main sweep function"""
     
     # Values to test for unembedding learning rate
-    unembedding_lrs = [0.001, 0.002, 0.004, 0.006, 0.012, 0.015, 0.018, 0.02, 0.0225, 0.025, 0.0275, 0.03]
+    unembedding_lrs = [0.001, 0.002, 0.004, 0.006, 0.008, 0.01, 0.012, 0.015, 0.018, 0.02, 0.0225, 0.025, 0.0275, 0.03]
     
     print("Starting unembedding-lr sweep")
     print(f"Testing values: {unembedding_lrs}")
