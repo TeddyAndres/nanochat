@@ -198,6 +198,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     device="cuda", resume_state_dict=None,
     buffer_size=1000,
     vocab_size=None,
+    include_local_batch=False,
 ):
     """Manifest-driven sparse loader with fixed logical U slots.
 
@@ -381,6 +382,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             "grad_accum_micro_step": micro_step_index,
             "is_grad_accum_boundary": micro_step_index == accum_steps - 1,
         }
+        if include_local_batch:
+            step_meta["inputs_cpu_local"] = cpu_inputs.clone()
+            step_meta["targets_cpu_local"] = cpu_targets.clone()
 
         state_dict = dict(base_state_dict)
         state_dict["manifest_step"] = manifest_step

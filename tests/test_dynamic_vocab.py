@@ -33,6 +33,10 @@ def build_fixed_step_meta(
     stage_ids,
     writeback_slots,
     writeback_ids,
+    warm_ids=None,
+    cold_ids=None,
+    inputs_cpu_local=None,
+    targets_cpu_local=None,
     is_last_step=False,
     grad_accum_ids=None,
     grad_accum_steps=1,
@@ -45,7 +49,7 @@ def build_fixed_step_meta(
     active_ids = slot_to_global[active_slot_ids]
     if grad_accum_ids is None:
         grad_accum_ids = active_ids.tolist()
-    return {
+    step_meta = {
         "mode": "fixed-u",
         "active_ids_cpu": active_ids,
         "active_slot_ids_cpu": active_slot_ids,
@@ -61,6 +65,15 @@ def build_fixed_step_meta(
         "is_grad_accum_boundary": is_grad_accum_boundary,
         "is_last_step": is_last_step,
     }
+    if warm_ids is not None:
+        step_meta["warm_ids_cpu"] = torch.tensor(warm_ids, dtype=torch.long)
+    if cold_ids is not None:
+        step_meta["cold_ids_cpu"] = torch.tensor(cold_ids, dtype=torch.long)
+    if inputs_cpu_local is not None:
+        step_meta["inputs_cpu_local"] = torch.tensor(inputs_cpu_local, dtype=torch.long)
+    if targets_cpu_local is not None:
+        step_meta["targets_cpu_local"] = torch.tensor(targets_cpu_local, dtype=torch.long)
+    return step_meta
 
 
 def set_zero_sparse_grads(step_ctx):
@@ -252,6 +265,228 @@ def test_fixed_u_masked_logits_hide_inactive_slots():
     assert torch.isfinite(loss)
     assert torch.all(logits[..., 4:] < -1e8)
     assert torch.all(scaled_logits[..., 4:] < -1e8)
+
+
+def test_plan_next_lm_head_cloud_excludes_step_ids_and_full_warm_pool():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=3,
+        lm_head_u_max=5,
+    )
+    with torch.no_grad():
+        runtime.table_specs["wte"]["param"].zero_()
+        runtime.table_specs["lm_head"]["param"].zero_()
+        runtime.table_specs["wte"]["param"][0, 0] = 1.0
+        runtime.table_specs["wte"]["param"][1, 1] = 1.0
+        runtime.table_specs["lm_head"]["param"][5, 0] = 2.0
+        runtime.table_specs["lm_head"]["param"][6, 1] = 1.5
+    runtime.global_token_count_cpu[torch.tensor([4, 5, 6, 7])] = torch.tensor([9, 20, 18, 7], dtype=torch.long)
+
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, -1],
+        stage_slots=[0, 1],
+        stage_ids=[0, 1],
+        writeback_slots=[0, 1],
+        writeback_ids=[0, 1],
+        inputs_cpu_local=[[0, 1, 0, 1]],
+        is_last_step=True,
+    )
+    planned = runtime.plan_next_lm_head_cloud(
+        step_meta,
+        warm_proportion=0.5,
+        router_candidate_pool_size=4,
+        router_topk=2,
+        source_token_limit=4,
+    )
+
+    warm_ids = planned["warm_ids_cpu"]
+    cold_ids = planned["cold_ids_cpu"]
+    warm_candidate_ids = planned["warm_candidate_ids_cpu"]
+    assert warm_ids.numel() == 2
+    assert cold_ids.numel() == 1
+    assert 0 not in warm_ids.tolist() and 1 not in warm_ids.tolist()
+    assert 0 not in cold_ids.tolist() and 1 not in cold_ids.tolist()
+    assert all(token not in warm_candidate_ids.tolist() for token in cold_ids.tolist())
+
+
+def test_select_warm_cloud_aggregates_per_position_router_scores():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=3,
+        lm_head_u_max=6,
+    )
+    with torch.no_grad():
+        runtime.table_specs["wte"]["param"].zero_()
+        runtime.table_specs["lm_head"]["param"].zero_()
+        runtime.table_specs["wte"]["param"][0, 0] = 1.0
+        runtime.table_specs["wte"]["param"][1, 1] = 1.0
+        runtime.table_specs["lm_head"]["param"][5, 0] = 1.0
+        runtime.table_specs["lm_head"]["param"][6, 1] = 1.0
+        runtime.table_specs["lm_head"]["param"][7, 2] = 1.0
+    runtime.global_token_count_cpu[torch.tensor([4, 5, 6, 7])] = torch.tensor([5, 10, 9, 8], dtype=torch.long)
+
+    warm_ids, ranked_ids = runtime.select_warm_cloud(
+        torch.tensor([[0, 1, 0, 1]], dtype=torch.long),
+        torch.tensor([0, 1], dtype=torch.long),
+        max_warm=2,
+        topk_per_position=2,
+        shortlist_limit=4,
+    )
+
+    assert warm_ids.tolist() == [5, 6]
+    assert ranked_ids[:2].tolist() == [5, 6]
+
+
+def test_get_subsampled_hidden_queries_returns_bounded_hidden_vectors():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=6,
+    )
+    queries = runtime.get_subsampled_hidden_queries(
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        num_samples=2,
+        max_prefix_len=3,
+    )
+
+    assert queries.shape == (2, model.config.n_embd)
+    assert torch.isfinite(queries).all()
+
+
+def test_select_warm_cloud_uses_hidden_queries_when_preview_active_vocab_is_available(monkeypatch):
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=6,
+    )
+    with torch.no_grad():
+        runtime.table_specs["lm_head"]["param"].zero_()
+        runtime.table_specs["lm_head"]["param"][5, 0] = 1.0
+        runtime.table_specs["lm_head"]["param"][6, 1] = 1.0
+    runtime.global_token_count_cpu[torch.tensor([4, 5, 6, 7])] = torch.tensor([4, 10, 9, 8], dtype=torch.long)
+
+    def fake_hidden_queries(*args, **kwargs):
+        return torch.tensor([[1.0] + [0.0] * (model.config.n_embd - 1)], dtype=torch.float32)
+
+    monkeypatch.setattr(runtime, "get_subsampled_hidden_queries", fake_hidden_queries)
+    warm_ids, ranked_ids = runtime.select_warm_cloud(
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        torch.tensor([0, 1], dtype=torch.long),
+        max_warm=1,
+        topk_per_position=2,
+        shortlist_limit=4,
+        max_positions=2,
+        preview_active_ids_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        preview_active_slot_ids_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+    )
+
+    assert warm_ids.tolist() == [5]
+    assert ranked_ids[0].item() == 5
+
+
+def test_fixed_u_clouds_expand_only_lm_head_capacity():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=4,
+        lm_head_u_max=6,
+    )
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2, -1],
+        stage_slots=[0, 1, 2],
+        stage_ids=[0, 1, 2],
+        writeback_slots=[0, 1, 2],
+        writeback_ids=[0, 1, 2],
+        warm_ids=[4],
+        cold_ids=[5],
+        is_last_step=True,
+    )
+    step_ctx = runtime.prepare_step(step_meta)
+    logits = model(torch.tensor([[0, 1, 2, 0]], dtype=torch.long), active_vocab=step_ctx.active_vocab)
+
+    assert step_ctx.active_vocab is not None
+    assert step_ctx.active_vocab["wte"].shape[0] == 4
+    assert step_ctx.active_vocab["lm_head"].shape[0] == 6
+    assert torch.all(logits[..., 3:4] < -1e8)
+    assert torch.all(logits[..., 4:] > -1e8)
+
+
+def test_fixed_u_cloud_rows_use_separate_lm_head_learning_rates():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=1.0,
+        unembedding_warm_lr=0.5,
+        unembedding_cold_lr=0.25,
+        fixed_u_max=3,
+        lm_head_u_max=5,
+        adam_betas=(0.0, 0.0),
+    )
+    original_rows = runtime.table_specs["lm_head"]["param"][[0, 1, 2, 4, 5]].clone()
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[0, 1, 2],
+        stage_ids=[0, 1, 2],
+        writeback_slots=[0, 1, 2],
+        writeback_ids=[0, 1, 2],
+        warm_ids=[4],
+        cold_ids=[5],
+        is_last_step=True,
+    )
+    step_ctx = runtime.prepare_step(step_meta)
+    assert step_ctx.active_vocab is not None
+    active_slots = step_ctx.active_slot_ids_cpu
+    warm_slots = step_ctx.warm_slot_ids_cpu
+    cold_slots = step_ctx.cold_slot_ids_cpu
+    assert active_slots is not None and warm_slots is not None and cold_slots is not None
+    step_ctx.active_vocab["wte"].grad = torch.zeros_like(step_ctx.active_vocab["wte"])
+    step_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step_ctx.active_vocab["lm_head"])
+    step_ctx.active_vocab["lm_head"].grad[active_slots] = 1.0
+    step_ctx.active_vocab["lm_head"].grad[warm_slots] = 1.0
+    step_ctx.active_vocab["lm_head"].grad[cold_slots] = 1.0
+    for value_embed in step_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+    runtime.step(step_ctx)
+
+    updated_rows = runtime.table_specs["lm_head"]["param"][[0, 1, 2, 4, 5]]
+    expected_deltas = torch.tensor([1.0, 1.0, 1.0, 0.5, 0.25], dtype=updated_rows.dtype).unsqueeze(1)
+    observed_deltas = original_rows - updated_rows
+    assert torch.allclose(observed_deltas, expected_deltas.expand_as(observed_deltas), atol=1e-6)
 
 
 def test_fixed_u_runtime_survives_inference_mode_materialization():

@@ -78,6 +78,15 @@ parser.add_argument("--sparse-mode", action="store_true", help="enable first-pas
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
 parser.add_argument("--sparse-cold-bias-scale", type=float, default=0.0, help="sparse-only cold-token bias coefficient; effective magnitude also follows sparse unembedding LR, LR schedule, and total batch size")
+parser.add_argument("--sparse-cloud-max-u", type=int, default=0, help="fixed lm_head sparse capacity for step_U + warm + cold rows (0 disables cloud expansion)")
+parser.add_argument("--sparse-cloud-warm-proportion", type=float, default=0.5, help="fraction of lm_head cloud capacity to allocate to warm rows; cold receives the remainder")
+parser.add_argument("--sparse-unembedding-warm-lr", type=float, default=-1.0, help="lm_head LR for warm cloud rows in sparse mode; negative values reuse --unembedding-lr")
+parser.add_argument("--sparse-unembedding-cold-lr", type=float, default=-1.0, help="lm_head LR for cold cloud rows in sparse mode; negative values reuse --unembedding-lr")
+parser.add_argument("--sparse-cloud-router-candidate-pool", type=int, default=2048, help="top global-frequency candidate pool size for warm cloud routing on CPU")
+parser.add_argument("--sparse-cloud-router-topk", type=int, default=8, help="per-source top-k candidate count aggregated into the warm cloud ranking")
+parser.add_argument("--sparse-cloud-hidden-query-samples", type=int, default=32, help="number of subsampled causal positions from the next batch preview used to build warm-cloud hidden queries")
+parser.add_argument("--sparse-cloud-hidden-query-strategy", type=str, default="uniform", choices=["uniform", "last"], help="subsampling strategy for warm-cloud hidden-state queries")
+parser.add_argument("--sparse-cloud-hidden-query-max-prefix-len", type=int, default=2048, help="maximum causal prefix length used when extracting each warm-cloud hidden query")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-debug-timing", action="store_true", help="log detailed sparse timing breakdowns for diagnosing sparse runtime overhead")
 parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", help="for sparse timing diagnosis, synchronize after each backward pass to separate deferred GPU work from grad-accum bookkeeping")
@@ -192,6 +201,7 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 sparse_manifest = None
 hybrid_sparse = args.sparse_mode and args.sparse_manifest != ""
+sparse_lm_head_clouds = args.sparse_cloud_max_u > 0
 if hybrid_sparse:
     sparse_manifest = load_sparse_manifest_header(args.sparse_manifest)
 if args.sparse_mode:
@@ -384,6 +394,9 @@ optimizer_data_sparse = None
 if args.sparse_mode:
     assert args.sparse_logit_scale > 0.0, "--sparse-logit-scale must be positive"
     assert args.sparse_cold_bias_scale >= 0.0, "--sparse-cold-bias-scale must be non-negative"
+    assert 0.0 <= args.sparse_cloud_warm_proportion <= 1.0, "--sparse-cloud-warm-proportion must be in [0, 1]"
+    if sparse_lm_head_clouds:
+        assert hybrid_sparse, "--sparse-cloud-max-u requires --sparse-manifest hybrid sparse mode"
     if args.sparse_logit_scale != 1.0:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
     if args.sparse_cold_bias_scale > 0.0:
@@ -399,11 +412,25 @@ if args.sparse_mode:
             f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
         )
     sparse_fixed_u_max = None
+    sparse_lm_head_u_max = None
     sparse_grad_accum_u_max = None
     if hybrid_sparse:
         assert sparse_manifest is not None
         sparse_fixed_u_max = int(sparse_manifest["u_max"])
         sparse_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
+        sparse_lm_head_u_max = sparse_fixed_u_max if not sparse_lm_head_clouds else int(args.sparse_cloud_max_u)
+        if sparse_lm_head_u_max < sparse_fixed_u_max:
+            raise ValueError(
+                f"--sparse-cloud-max-u must be at least manifest u_max={sparse_fixed_u_max}, got {sparse_lm_head_u_max}"
+            )
+        if sparse_lm_head_clouds:
+            warm_lr = sparse_unembedding_lr if args.sparse_unembedding_warm_lr < 0.0 else float(args.sparse_unembedding_warm_lr)
+            cold_lr = sparse_unembedding_lr if args.sparse_unembedding_cold_lr < 0.0 else float(args.sparse_unembedding_cold_lr)
+            print0(
+                f"Sparse lm_head clouds enabled: manifest_u_max={sparse_fixed_u_max:,} | "
+                f"lm_head_u_max={sparse_lm_head_u_max:,} | warm_fraction={args.sparse_cloud_warm_proportion:.2f} | "
+                f"warm_lr={warm_lr:.6f} | cold_lr={cold_lr:.6f}"
+            )
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,
@@ -414,8 +441,11 @@ if args.sparse_mode:
         hot_unembedding_ramp_activations=args.sparse_hot_unembed_ramp_activations,
         hot_unembedding_ramp_start_lr=args.sparse_hot_unembed_ramp_start_lr,
         fixed_u_max=sparse_fixed_u_max,
+        lm_head_u_max=sparse_lm_head_u_max,
         grad_accum_u_max=sparse_grad_accum_u_max,
         cold_bias_reference_tokens=B_REF,
+        unembedding_warm_lr=(None if args.sparse_unembedding_warm_lr < 0.0 else args.sparse_unembedding_warm_lr),
+        unembedding_cold_lr=(None if args.sparse_unembedding_cold_lr < 0.0 else args.sparse_unembedding_cold_lr),
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
@@ -453,14 +483,33 @@ if args.sparse_mode:
             device=device,
             resume_state_dict=dataloader_resume_state_dict,
             vocab_size=vocab_size,
+            include_local_batch=sparse_lm_head_clouds,
         )
     else:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, vocab_size=vocab_size)
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+
+
+def plan_sparse_batch_meta(step_meta):
+    if not sparse_lm_head_clouds:
+        return step_meta
+    assert dynamic_vocab is not None
+    return dynamic_vocab.plan_next_lm_head_cloud(
+        step_meta,
+        warm_proportion=args.sparse_cloud_warm_proportion,
+        router_candidate_pool_size=args.sparse_cloud_router_candidate_pool,
+        router_topk=args.sparse_cloud_router_topk,
+        source_token_limit=args.sparse_cloud_hidden_query_samples,
+        hidden_query_strategy=args.sparse_cloud_hidden_query_strategy,
+        hidden_query_max_prefix_len=args.sparse_cloud_hidden_query_max_prefix_len,
+    )
+
+
 if args.sparse_mode:
     x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
+    sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
 else:
     x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -581,6 +630,8 @@ if args.sparse_mode:
             f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
             f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
         )
+    if sparse_lm_head_clouds:
+        assert grad_accum_steps == 1, "lm_head cloud expansion currently requires grad_accum_steps == 1"
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -849,6 +900,8 @@ while True:
             sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
+            if not final_train_step:
+                sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
     model.zero_grad(set_to_none=True)
     should_trim_sparse_cache = False
     if (
@@ -898,6 +951,10 @@ while True:
             sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
         else:
             sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
+        warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
+        cold_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
+        if warm_count > 0 or cold_count > 0:
+            sparse_str += f" | warm: {warm_count:,} | cold: {cold_count:,}"
         if sparse_metrics.cold_bias_clamped_count > 0:
             sparse_str += f" | cold_clamped: {sparse_metrics.cold_bias_clamped_count:,} | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
         if args.sparse_debug_timing and grad_accum_steps > 1:
@@ -943,11 +1000,15 @@ while True:
             "train/step_peak_memory_mib": step_peak_memory / 1024 / 1024,
         }
         if sparse_metrics is not None:
+            warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
+            cold_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
                 "train/u_live": sparse_metrics.live_count if sparse_metrics.live_count > 0 else sparse_metrics.unique_count,
                 "train/u_stage": sparse_metrics.stage_count,
                 "train/u_writeback": sparse_metrics.writeback_count,
+                "train/u_warm": warm_count,
+                "train/u_cold": cold_count,
                 "train/cold_bias_clamped": sparse_metrics.cold_bias_clamped_count,
                 "train/cold_bias_absmax": sparse_metrics.cold_bias_abs_max,
             })
