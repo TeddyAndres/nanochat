@@ -84,7 +84,7 @@ parser.add_argument("--sparse-unembedding-warm-lr", type=float, default=-1.0, he
 parser.add_argument("--sparse-unembedding-cold-lr", type=float, default=-1.0, help="lm_head LR for cold cloud rows in sparse mode; negative values reuse --unembedding-lr")
 parser.add_argument("--sparse-cloud-router-candidate-pool", type=int, default=2048, help="top global-frequency candidate pool size for warm cloud routing on CPU")
 parser.add_argument("--sparse-cloud-router-topk", type=int, default=8, help="per-source top-k candidate count aggregated into the warm cloud ranking")
-parser.add_argument("--sparse-cloud-hidden-query-samples", type=int, default=32, help="number of subsampled causal positions from the next batch preview used to build warm-cloud hidden queries")
+parser.add_argument("--sparse-cloud-hidden-query-samples", type=int, default=32, help="number of subsampled causal positions from the next batch preview used to build warm-cloud hidden queries (0 uses the cheap preview-query path)")
 parser.add_argument("--sparse-cloud-hidden-query-strategy", type=str, default="uniform", choices=["uniform", "last"], help="subsampling strategy for warm-cloud hidden-state queries")
 parser.add_argument("--sparse-cloud-hidden-query-max-prefix-len", type=int, default=2048, help="maximum causal prefix length used when extracting each warm-cloud hidden query")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
@@ -170,8 +170,8 @@ def build_model_meta(depth):
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    # num_heads = model_dim // args.head_dim
-    num_heads = 4
+    num_heads = model_dim // args.head_dim
+    #num_heads = 4
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
@@ -850,6 +850,7 @@ while True:
         if not final_train_step:
             if args.sparse_mode:
                 x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # prefetch the next sparse batch while GPU is busy with backward
+                sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
             else:
                 x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
@@ -900,8 +901,6 @@ while True:
             sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
-            if not final_train_step:
-                sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
     model.zero_grad(set_to_none=True)
     should_trim_sparse_cache = False
     if (
@@ -946,17 +945,37 @@ while True:
     grad_norm_str = "" if grad_norm is None else f" | grad_norm: {grad_norm:.4f}"
     sparse_str = ""
     if sparse_metrics is not None:
+        step_u = sparse_metrics.step_u_count if sparse_metrics.step_u_count > 0 else sparse_metrics.unique_count
         live_u = sparse_metrics.live_count if sparse_metrics.live_count > 0 else sparse_metrics.unique_count
-        if sparse_metrics.unique_count != live_u:
+        if sparse_metrics.u_capacity > 0 and sparse_metrics.u_capacity != step_u:
+            sparse_str = f" | U_step: {step_u:,} | U_lm: {live_u:,}/{sparse_metrics.u_capacity:,} | stage: {sparse_metrics.stage_count:,}"
+        elif sparse_metrics.unique_count != live_u:
             sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
         else:
             sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
         warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
         cold_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
         if warm_count > 0 or cold_count > 0:
-            sparse_str += f" | warm: {warm_count:,} | cold: {cold_count:,}"
+            sparse_str += (
+                f" | warm: {warm_count:,}/{sparse_metrics.warm_budget_target:,}"
+                f" | cold: {cold_count:,}/{sparse_metrics.cold_budget_target:,}"
+            )
         if sparse_metrics.cold_bias_clamped_count > 0:
             sparse_str += f" | cold_clamped: {sparse_metrics.cold_bias_clamped_count:,} | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
+        if args.sparse_debug_timing and sparse_metrics.cloud_plan_ms > 0.0:
+            sparse_str += (
+                f" | cloud_ms plan: {sparse_metrics.cloud_plan_ms:.2f}"
+                f" select: {sparse_metrics.cloud_selection_ms:.2f}"
+                f" hidden: {sparse_metrics.cloud_hidden_query_ms:.2f}"
+                f" | residual: {sparse_metrics.cloud_residual_capacity:,}"
+                f" candidates: {sparse_metrics.warm_candidate_count:,}"
+            )
+        if args.sparse_debug_timing and grad_accum_steps == 1:
+            sparse_str += (
+                f" | step_ms prep: {sparse_prepare_ms:.2f}"
+                f" fwdbwd: {sparse_fwdbwd_ms:.2f}"
+                f" apply_call: {sparse_apply_call_ms:.2f}"
+            )
         if args.sparse_debug_timing and grad_accum_steps > 1:
             sparse_str += (
                 f" | step_ms prep: {sparse_prepare_ms:.2f}"
@@ -1004,13 +1023,25 @@ while True:
             cold_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
+                "train/u_step": sparse_metrics.step_u_count if sparse_metrics.step_u_count > 0 else sparse_metrics.unique_count,
                 "train/u_live": sparse_metrics.live_count if sparse_metrics.live_count > 0 else sparse_metrics.unique_count,
+                "train/u_capacity": sparse_metrics.u_capacity,
                 "train/u_stage": sparse_metrics.stage_count,
                 "train/u_writeback": sparse_metrics.writeback_count,
                 "train/u_warm": warm_count,
                 "train/u_cold": cold_count,
+                "train/u_residual": sparse_metrics.cloud_residual_capacity,
+                "train/u_warm_target": sparse_metrics.warm_budget_target,
+                "train/u_cold_target": sparse_metrics.cold_budget_target,
+                "train/u_warm_candidates": sparse_metrics.warm_candidate_count,
+                "train/cloud_plan_ms": sparse_metrics.cloud_plan_ms,
+                "train/cloud_hidden_query_ms": sparse_metrics.cloud_hidden_query_ms,
+                "train/cloud_selection_ms": sparse_metrics.cloud_selection_ms,
                 "train/cold_bias_clamped": sparse_metrics.cold_bias_clamped_count,
                 "train/cold_bias_absmax": sparse_metrics.cold_bias_abs_max,
+                "train/step_prepare_ms": sparse_prepare_ms,
+                "train/step_fwdbwd_ms": sparse_fwdbwd_ms,
+                "train/step_apply_call_ms": sparse_apply_call_ms,
             })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm

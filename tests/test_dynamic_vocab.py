@@ -7,6 +7,7 @@ python -m pytest tests/test_dynamic_vocab.py -v
 
 import torch
 import torch.nn as nn
+from concurrent.futures import Future
 
 from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, DynamicVocabRuntime
 from nanochat.gpt import GPT, GPTConfig
@@ -235,6 +236,76 @@ def test_fixed_u_runtime_delays_common_writeback_until_final_step():
     assert not torch.allclose(wte.weight[7], original_rows[2])
 
 
+def test_flush_pending_cpu_writeback_skips_disjoint_ids():
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+
+    class FakeFuture:
+        def __init__(self):
+            self.result_calls = 0
+
+        def done(self):
+            return False
+
+        def result(self):
+            self.result_calls += 1
+            return None
+
+    fake_future = FakeFuture()
+    runtime._pending_cpu_writeback_future = fake_future
+    pending_mask = torch.zeros(model.config.vocab_size, dtype=torch.bool)
+    pending_mask[1] = True
+    runtime._pending_cpu_writeback_mask_cpu = pending_mask
+
+    runtime._flush_pending_cpu_writeback(torch.tensor([2, 3], dtype=torch.long))
+
+    assert fake_future.result_calls == 0
+    assert runtime._pending_cpu_writeback_future is fake_future
+    assert runtime._pending_cpu_writeback_mask_cpu is pending_mask
+
+
+def test_flush_pending_cpu_writeback_waits_for_overlapping_ids():
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+
+    class FakeFuture:
+        def __init__(self):
+            self.result_calls = 0
+
+        def done(self):
+            return False
+
+        def result(self):
+            self.result_calls += 1
+            return None
+
+    fake_future = FakeFuture()
+    runtime._pending_cpu_writeback_future = fake_future
+    pending_mask = torch.zeros(model.config.vocab_size, dtype=torch.bool)
+    pending_mask[1] = True
+    runtime._pending_cpu_writeback_mask_cpu = pending_mask
+
+    runtime._flush_pending_cpu_writeback(torch.tensor([1, 3], dtype=torch.long))
+
+    assert fake_future.result_calls == 1
+    assert runtime._pending_cpu_writeback_future is None
+    assert runtime._pending_cpu_writeback_mask_cpu is None
+
+
 def test_fixed_u_masked_logits_hide_inactive_slots():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -373,6 +444,38 @@ def test_get_subsampled_hidden_queries_returns_bounded_hidden_vectors():
     assert torch.isfinite(queries).all()
 
 
+def test_get_subsampled_hidden_queries_matches_single_forward_causal_positions():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=6,
+    )
+    preview_tokens = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    positions = runtime._select_hidden_query_positions(preview_tokens.shape[1], "uniform", 2)
+    queries = runtime.get_subsampled_hidden_queries(
+        preview_tokens,
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        num_samples=2,
+        max_prefix_len=4,
+    )
+    active_vocab = runtime._build_hidden_query_active_vocab(
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+    )
+    with torch.inference_mode():
+        hidden = model.forward_features(preview_tokens, active_vocab=active_vocab)
+        expected = hidden.index_select(1, positions).mean(dim=0).to(dtype=torch.float32)
+
+    assert torch.allclose(queries, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_select_warm_cloud_uses_hidden_queries_when_preview_active_vocab_is_available(monkeypatch):
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -410,6 +513,76 @@ def test_select_warm_cloud_uses_hidden_queries_when_preview_active_vocab_is_avai
     assert ranked_ids[0].item() == 5
 
 
+def test_select_warm_cloud_falls_back_to_preview_queries_when_hidden_queries_disabled(monkeypatch):
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=6,
+    )
+
+    def hidden_queries_should_not_run(*args, **kwargs):
+        raise AssertionError("hidden-query path should be disabled when max_positions == 0")
+
+    monkeypatch.setattr(runtime, "get_subsampled_hidden_queries", hidden_queries_should_not_run)
+    warm_ids, ranked_ids = runtime.select_warm_cloud(
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        torch.tensor([0, 1], dtype=torch.long),
+        max_warm=1,
+        topk_per_position=2,
+        shortlist_limit=4,
+        max_positions=0,
+        preview_active_ids_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        preview_active_slot_ids_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+    )
+
+    assert warm_ids.numel() == 1
+    assert ranked_ids.numel() >= 1
+
+
+def test_plan_next_lm_head_cloud_fills_warm_budget_beyond_shortlist_limit():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=32)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=20,
+    )
+    runtime.global_token_count_cpu.copy_(torch.arange(32, dtype=torch.long))
+
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2, 3],
+        stage_slots=[0, 1, 2, 3],
+        stage_ids=[0, 1, 2, 3],
+        writeback_slots=[0, 1, 2, 3],
+        writeback_ids=[0, 1, 2, 3],
+        inputs_cpu_local=[[0, 1, 2, 3]],
+        is_last_step=True,
+    )
+    planned = runtime.plan_next_lm_head_cloud(
+        step_meta,
+        warm_proportion=0.5,
+        router_candidate_pool_size=3,
+        router_topk=2,
+        source_token_limit=0,
+    )
+
+    assert planned["warm_budget_target"] == 8
+    assert planned["cold_budget_target"] == 8
+    assert planned["warm_ids_cpu"].numel() == 8
+    assert planned["cold_ids_cpu"].numel() == 8
+    assert planned["warm_candidate_ids_cpu"].numel() >= 8
+
+
 def test_fixed_u_clouds_expand_only_lm_head_capacity():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -438,8 +611,13 @@ def test_fixed_u_clouds_expand_only_lm_head_capacity():
     assert step_ctx.active_vocab is not None
     assert step_ctx.active_vocab["wte"].shape[0] == 4
     assert step_ctx.active_vocab["lm_head"].shape[0] == 6
-    assert torch.all(logits[..., 3:4] < -1e8)
-    assert torch.all(logits[..., 4:] > -1e8)
+    assert step_ctx.step_u_count == 3
+    assert step_ctx.live_count == 5
+    assert step_ctx.u_capacity == 6
+    assert step_ctx.warm_slot_ids_cpu is not None
+    assert step_ctx.warm_slot_ids_cpu[0].item() == 3
+    assert torch.all(logits[..., 5:] < -1e8)
+    assert torch.all(logits[..., 3:5] > -1e8)
 
 
 def test_fixed_u_cloud_rows_use_separate_lm_head_learning_rates():
@@ -487,6 +665,167 @@ def test_fixed_u_cloud_rows_use_separate_lm_head_learning_rates():
     expected_deltas = torch.tensor([1.0, 1.0, 1.0, 0.5, 0.25], dtype=updated_rows.dtype).unsqueeze(1)
     observed_deltas = original_rows - updated_rows
     assert torch.allclose(observed_deltas, expected_deltas.expand_as(observed_deltas), atol=1e-6)
+
+
+def test_fixed_u_cloud_overlap_stays_resident_across_steps():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=3,
+        lm_head_u_max=5,
+    )
+
+    step0 = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[0, 1, 2],
+        stage_ids=[0, 1, 2],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[4],
+        cold_ids=[5],
+        is_last_step=False,
+    )
+    step0_ctx = runtime.prepare_step(step0)
+    warm_slots0 = step0_ctx.warm_slot_ids_cpu
+    cold_slots0 = step0_ctx.cold_slot_ids_cpu
+    assert warm_slots0 is not None and cold_slots0 is not None
+    assert step0_ctx.stage_count == 5
+    set_zero_sparse_grads(step0_ctx)
+    runtime.step(step0_ctx)
+
+    step1 = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[],
+        stage_ids=[],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[5],
+        cold_ids=[4],
+        is_last_step=False,
+    )
+    step1_ctx = runtime.prepare_step(step1)
+    warm_slots1 = step1_ctx.warm_slot_ids_cpu
+    cold_slots1 = step1_ctx.cold_slot_ids_cpu
+    assert warm_slots1 is not None and cold_slots1 is not None
+
+    assert step1_ctx.stage_count == 0
+    assert step1_ctx.cloud_stage_ids_cpu is not None
+    assert step1_ctx.cloud_stage_ids_cpu.numel() == 0
+    assert step1_ctx.cloud_writeback_ids_cpu is not None
+    assert step1_ctx.cloud_writeback_ids_cpu.numel() == 0
+    assert warm_slots1[0].item() == cold_slots0[0].item()
+    assert cold_slots1[0].item() == warm_slots0[0].item()
+
+
+def test_fixed_u_cloud_writeback_is_deferred_until_cloud_leaves():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=8)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=1.0,
+        unembedding_warm_lr=0.5,
+        fixed_u_max=3,
+        lm_head_u_max=4,
+        adam_betas=(0.0, 0.0),
+    )
+
+    original_row4 = runtime.table_specs["lm_head"]["param"][4].clone()
+    step0 = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[0, 1, 2],
+        stage_ids=[0, 1, 2],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[4],
+        is_last_step=False,
+    )
+    step0_ctx = runtime.prepare_step(step0)
+    warm_slots0 = step0_ctx.warm_slot_ids_cpu
+    assert warm_slots0 is not None
+    set_zero_sparse_grads(step0_ctx)
+    step0_ctx.active_vocab["lm_head"].grad[warm_slots0] = 1.0
+    runtime.step(step0_ctx)
+
+    after_step_row4 = runtime.table_specs["lm_head"]["param"][4].clone()
+    assert torch.allclose(after_step_row4, original_row4)
+
+    step1 = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[],
+        stage_ids=[],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[5],
+        is_last_step=False,
+    )
+    step1_ctx = runtime.prepare_step(step1)
+
+    runtime._flush_pending_cpu_writeback()
+
+    expected_row4 = original_row4 - 0.5
+    assert torch.allclose(runtime.table_specs["lm_head"]["param"][4], expected_row4)
+    assert step1_ctx.stage_count == 1
+    assert step1_ctx.cloud_writeback_ids_cpu is not None
+    assert step1_ctx.cloud_writeback_ids_cpu.tolist() == [4]
+    assert step1_ctx.cloud_stage_ids_cpu is not None
+    assert step1_ctx.cloud_stage_ids_cpu.tolist() == [5]
+
+
+def test_plan_next_lm_head_cloud_retains_resident_cloud_ids_when_still_ranked():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=3,
+        lm_head_u_max=5,
+    )
+    runtime.global_token_count_cpu.zero_()
+    runtime.global_token_count_cpu[torch.tensor([4, 5, 6, 7])] = torch.tensor([95, 94, 100, 99], dtype=torch.long)
+
+    first_step = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[0, 1, 2],
+        stage_ids=[0, 1, 2],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[4],
+        cold_ids=[5],
+        is_last_step=False,
+    )
+    first_ctx = runtime.prepare_step(first_step)
+    set_zero_sparse_grads(first_ctx)
+    runtime.step(first_ctx)
+
+    next_step = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[],
+        stage_ids=[],
+        writeback_slots=[],
+        writeback_ids=[],
+        inputs_cpu_local=[[0, 1, 2, 0]],
+        is_last_step=False,
+    )
+    planned = runtime.plan_next_lm_head_cloud(
+        next_step,
+        warm_proportion=0.0,
+        router_candidate_pool_size=0,
+        router_topk=0,
+        source_token_limit=0,
+    )
+
+    assert planned["cold_ids_cpu"].tolist() == [4, 5]
 
 
 def test_fixed_u_runtime_survives_inference_mode_materialization():
