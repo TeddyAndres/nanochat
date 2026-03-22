@@ -1678,6 +1678,23 @@ class DynamicVocabRuntime:
                 }
         stage_ms = (time.perf_counter() - t_stage_start) * 1000.0
 
+        live_reentered_slot_ids_cpu = torch.empty(0, dtype=torch.long)
+        live_reentered_union_row_ids_cpu = torch.empty(0, dtype=torch.long)
+        if self._grad_accum_cached_union_mask_cpu is not None and live_union_row_ids_cpu.numel() > 0:
+            live_reentered_mask_cpu = self._grad_accum_cached_union_mask_cpu[live_union_row_ids_cpu]
+            if live_reentered_mask_cpu.any():
+                live_reentered_slot_ids_cpu = live_slot_ids_cpu[live_reentered_mask_cpu]
+                live_reentered_union_row_ids_cpu = live_union_row_ids_cpu[live_reentered_mask_cpu]
+                live_reentered_slot_ids_device = live_reentered_slot_ids_cpu.to(self.device)
+                live_reentered_union_row_ids_device = live_reentered_union_row_ids_cpu.to(self.device)
+                for name in self.table_specs:
+                    grad = self.fixed_params[name].grad
+                    if grad is None:
+                        grad = torch.zeros_like(self.fixed_params[name])
+                        self.fixed_params[name].grad = grad
+                    buffered_grad_rows = self._grad_accum_buffers[name].index_select(0, live_reentered_union_row_ids_device)
+                    grad.index_add_(0, live_reentered_slot_ids_device, buffered_grad_rows.to(dtype=grad.dtype))
+
         t_apply_start = time.perf_counter()
         for name in self.table_specs:
             spec = self.table_specs[name]
