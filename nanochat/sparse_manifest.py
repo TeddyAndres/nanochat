@@ -7,8 +7,8 @@ from typing import Any, Iterator
 import torch
 
 
-SPARSE_MANIFEST_VERSION = 2
-SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2}
+SPARSE_MANIFEST_VERSION = 3
+SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2, 3}
 
 
 def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
@@ -42,19 +42,7 @@ def compute_next_transition(current_ids: torch.Tensor, next_ids: torch.Tensor) -
     return common_ids, leaving_ids, new_ids
 
 
-def build_manifest_payload(
-    *,
-    split: str,
-    vocab_size: int,
-    device_batch_size: int,
-    max_seq_len: int,
-    total_batch_size: int,
-    grad_accum_steps: int,
-    ddp_world_size: int,
-    num_iterations: int,
-    buffer_size: int,
-    steps: list[dict[str, Any]],
-) -> dict[str, Any]:
+def _compute_manifest_u_stats(steps: list[dict[str, Any]]) -> tuple[int, int, int]:
     first_step = steps[0] if steps else None
     version = 1
     grad_accum_u_max = 0
@@ -75,6 +63,23 @@ def build_manifest_payload(
     else:
         u_max = max((int(step["u_size"]) for step in steps), default=0)
         grad_accum_u_max = u_max
+    return version, int(u_max), int(grad_accum_u_max)
+
+
+def build_manifest_payload(
+    *,
+    split: str,
+    vocab_size: int,
+    device_batch_size: int,
+    max_seq_len: int,
+    total_batch_size: int,
+    grad_accum_steps: int,
+    ddp_world_size: int,
+    num_iterations: int,
+    buffer_size: int,
+    steps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    version, u_max, grad_accum_u_max = _compute_manifest_u_stats(steps)
     return {
         "version": version,
         "split": split,
@@ -92,11 +97,71 @@ def build_manifest_payload(
     }
 
 
+def build_manifest_shard_payload(
+    *,
+    shard_index: int,
+    start_step: int,
+    steps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    _, u_max, grad_accum_u_max = _compute_manifest_u_stats(steps)
+    return {
+        "version": SPARSE_MANIFEST_VERSION,
+        "shard_index": int(shard_index),
+        "start_step": int(start_step),
+        "num_steps": len(steps),
+        "u_max": int(u_max),
+        "grad_accum_u_max": int(grad_accum_u_max),
+        "steps": steps,
+    }
+
+
+def build_sharded_manifest_payload(
+    *,
+    split: str,
+    vocab_size: int,
+    device_batch_size: int,
+    max_seq_len: int,
+    total_batch_size: int,
+    grad_accum_steps: int,
+    ddp_world_size: int,
+    num_iterations: int,
+    buffer_size: int,
+    u_max: int,
+    grad_accum_u_max: int,
+    shard_step_count: int,
+    shards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "version": SPARSE_MANIFEST_VERSION,
+        "split": split,
+        "vocab_size": int(vocab_size),
+        "device_batch_size": int(device_batch_size),
+        "max_seq_len": int(max_seq_len),
+        "total_batch_size": int(total_batch_size),
+        "grad_accum_steps": int(grad_accum_steps),
+        "ddp_world_size": int(ddp_world_size),
+        "num_steps": int(num_iterations),
+        "buffer_size": int(buffer_size),
+        "u_max": int(u_max),
+        "grad_accum_u_max": int(grad_accum_u_max),
+        "shard_step_count": int(shard_step_count),
+        "num_shards": len(shards),
+        "shards": shards,
+    }
+
+
 def save_sparse_manifest(path: str | Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f)
+
+
+def _resolve_shard_path(manifest_path: str | Path, shard_entry: dict[str, Any]) -> Path:
+    shard_rel_path = shard_entry.get("path")
+    if not isinstance(shard_rel_path, str) or shard_rel_path == "":
+        raise ValueError("Sparse manifest shard entry must define a non-empty relative path")
+    return Path(manifest_path).parent / shard_rel_path
 
 
 def load_sparse_manifest_header(path: str | Path) -> dict[str, Any]:
@@ -107,7 +172,8 @@ def load_sparse_manifest_header(path: str | Path) -> dict[str, Any]:
         while True:
             chunk = f.read(1 << 16)
             if chunk == "":
-                raise ValueError("Sparse manifest is missing the steps array")
+                payload = json.loads(buffer)
+                return _validate_manifest_version(payload)
             buffer += chunk
             marker_idx = buffer.find(marker)
             if marker_idx < 0:
@@ -145,6 +211,21 @@ def resolve_sparse_manifest_grad_accum_u_max(path: str | Path, header: dict[str,
     if version < 2:
         return u_max
 
+    shards = header.get("shards")
+    if isinstance(shards, list) and len(shards) > 0:
+        shard_grad_accum_u_max = u_max
+        found_shard_stat = False
+        for shard_entry in shards:
+            shard_u_max = int(shard_entry.get("u_max", 0))
+            if shard_u_max > 0:
+                shard_grad_accum_u_max = max(shard_grad_accum_u_max, shard_u_max)
+            shard_grad = shard_entry.get("grad_accum_u_max")
+            if shard_grad is not None:
+                shard_grad_accum_u_max = max(shard_grad_accum_u_max, int(shard_grad))
+                found_shard_stat = True
+        if found_shard_stat:
+            return shard_grad_accum_u_max
+
     grad_accum_u_max = u_max
     found_grad_accum_window = False
     for step_idx, step_entry in enumerate(stream_sparse_manifest_steps(path)):
@@ -162,7 +243,7 @@ def resolve_sparse_manifest_grad_accum_u_max(path: str | Path, header: dict[str,
     return grad_accum_u_max if found_grad_accum_window else u_max
 
 
-def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Iterator[dict[str, Any]]:
+def _stream_sparse_manifest_file_steps(path: str | Path, start_step: int = 0) -> Iterator[dict[str, Any]]:
     path = Path(path)
     if start_step < 0:
         raise ValueError(f"Sparse manifest start_step must be non-negative, got {start_step}")
@@ -227,6 +308,30 @@ def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Itera
             step_idx += 1
 
 
+def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Iterator[dict[str, Any]]:
+    path = Path(path)
+    if start_step < 0:
+        raise ValueError(f"Sparse manifest start_step must be non-negative, got {start_step}")
+
+    header = load_sparse_manifest_header(path)
+    shards = header.get("shards")
+    if not isinstance(shards, list) or len(shards) == 0:
+        yield from _stream_sparse_manifest_file_steps(path, start_step=start_step)
+        return
+
+    steps_to_skip = int(start_step)
+    for shard_entry in shards:
+        shard_num_steps = int(shard_entry.get("num_steps", 0))
+        if shard_num_steps <= 0:
+            raise ValueError("Sparse manifest shard entry must define a positive num_steps")
+        if steps_to_skip >= shard_num_steps:
+            steps_to_skip -= shard_num_steps
+            continue
+        shard_path = _resolve_shard_path(path, shard_entry)
+        yield from _stream_sparse_manifest_file_steps(shard_path, start_step=steps_to_skip)
+        steps_to_skip = 0
+
+
 def load_sparse_manifest(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
@@ -277,8 +382,42 @@ def validate_sparse_manifest(
     if num_steps <= 0:
         raise ValueError("Sparse manifest must define a positive num_steps")
     steps = payload.get("steps")
+    shards = payload.get("shards")
     if steps is not None and len(steps) != num_steps:
         raise ValueError("Sparse manifest num_steps does not match the number of stored steps")
+    if shards is not None:
+        if not isinstance(shards, list) or len(shards) == 0:
+            raise ValueError("Sparse manifest shards must be a non-empty list")
+        shard_total_steps = 0
+        for shard_idx, shard_entry in enumerate(shards):
+            shard_num_steps = int(shard_entry.get("num_steps", 0))
+            if shard_num_steps <= 0:
+                raise ValueError(f"Sparse manifest shard {shard_idx} must define a positive num_steps")
+            shard_total_steps += shard_num_steps
+            shard_u_max = int(shard_entry.get("u_max", 0))
+            if shard_u_max <= 0:
+                raise ValueError(f"Sparse manifest shard {shard_idx} must define a positive u_max")
+            if shard_u_max > u_max:
+                raise ValueError(
+                    f"Sparse manifest shard {shard_idx} u_max exceeds manifest u_max: {shard_u_max} > {u_max}"
+                )
+            shard_grad_accum_u_max = int(shard_entry.get("grad_accum_u_max", shard_u_max))
+            if shard_grad_accum_u_max < shard_u_max:
+                raise ValueError(
+                    f"Sparse manifest shard {shard_idx} grad_accum_u_max must be at least shard u_max, found {shard_grad_accum_u_max} < {shard_u_max}"
+                )
+            if shard_grad_accum_u_max > grad_accum_u_max:
+                raise ValueError(
+                    f"Sparse manifest shard {shard_idx} grad_accum_u_max exceeds manifest grad_accum_u_max: {shard_grad_accum_u_max} > {grad_accum_u_max}"
+                )
+            shard_path = shard_entry.get("path")
+            if not isinstance(shard_path, str) or shard_path == "":
+                raise ValueError(f"Sparse manifest shard {shard_idx} must define a non-empty path")
+        if shard_total_steps != num_steps:
+            raise ValueError("Sparse manifest num_steps does not match summed shard num_steps")
+        num_shards = payload.get("num_shards")
+        if num_shards is not None and int(num_shards) != len(shards):
+            raise ValueError("Sparse manifest num_shards does not match the number of shard entries")
     version = int(payload.get("version", 1))
     if version == 2 and steps is not None:
         for step_idx, step_entry in enumerate(steps):

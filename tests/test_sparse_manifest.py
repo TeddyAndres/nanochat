@@ -4,8 +4,11 @@ from scripts.build_sparse_manifest import resolve_batch_geometry
 
 from nanochat.sparse_manifest import (
     build_manifest_payload,
+    build_manifest_shard_payload,
+    build_sharded_manifest_payload,
     load_sparse_manifest_header,
     resolve_sparse_manifest_grad_accum_u_max,
+    save_sparse_manifest,
     stream_sparse_manifest_steps,
     validate_sparse_manifest,
 )
@@ -173,6 +176,116 @@ def test_sparse_manifest_resolves_grad_accum_u_max_from_legacy_v2_steps(tmp_path
     header = load_sparse_manifest_header(manifest_path)
     assert "grad_accum_u_max" not in header
     assert resolve_sparse_manifest_grad_accum_u_max(manifest_path, header) == 5
+
+
+def test_sparse_manifest_streams_across_shards(tmp_path):
+    steps = [
+        {
+            "step": 0,
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [1, 2, 3, 4],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "u_size": 3,
+                    "active_ids": [1, 2, 3],
+                    "next_common_ids": [2, 3],
+                    "next_leaving_ids": [1],
+                    "next_new_ids": [4],
+                },
+                {
+                    "microstep": 1,
+                    "u_size": 3,
+                    "active_ids": [2, 3, 4],
+                    "next_common_ids": [3, 4],
+                    "next_leaving_ids": [2],
+                    "next_new_ids": [5],
+                },
+            ],
+        },
+        {
+            "step": 1,
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [3, 4, 5, 6],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "u_size": 3,
+                    "active_ids": [3, 4, 5],
+                    "next_common_ids": [4, 5],
+                    "next_leaving_ids": [3],
+                    "next_new_ids": [6],
+                },
+                {
+                    "microstep": 1,
+                    "u_size": 3,
+                    "active_ids": [4, 5, 6],
+                    "next_common_ids": [],
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                },
+            ],
+        },
+    ]
+    shard_dir = tmp_path / "manifest_shards"
+    shard_entries = []
+    for shard_index, step_entry in enumerate(steps):
+        shard_payload = build_manifest_shard_payload(
+            shard_index=shard_index,
+            start_step=step_entry["step"],
+            steps=[step_entry],
+        )
+        shard_path = shard_dir / f"manifest.shard{shard_index:05d}.json"
+        save_sparse_manifest(shard_path, shard_payload)
+        shard_entries.append(
+            {
+                "shard_index": shard_index,
+                "path": str(shard_path.relative_to(tmp_path)),
+                "start_step": step_entry["step"],
+                "num_steps": 1,
+                "u_max": shard_payload["u_max"],
+                "grad_accum_u_max": shard_payload["grad_accum_u_max"],
+            }
+        )
+
+    manifest_path = tmp_path / "manifest.json"
+    save_sparse_manifest(
+        manifest_path,
+        build_sharded_manifest_payload(
+            split="train",
+            vocab_size=16,
+            device_batch_size=2,
+            max_seq_len=8,
+            total_batch_size=32,
+            grad_accum_steps=2,
+            ddp_world_size=1,
+            num_iterations=2,
+            buffer_size=32,
+            u_max=3,
+            grad_accum_u_max=4,
+            shard_step_count=1,
+            shards=shard_entries,
+        ),
+    )
+
+    header = load_sparse_manifest_header(manifest_path)
+    validate_sparse_manifest(
+        header,
+        split="train",
+        vocab_size=16,
+        device_batch_size=2,
+        max_seq_len=8,
+        grad_accum_steps=2,
+        ddp_world_size=1,
+        num_iterations=2,
+    )
+
+    assert header["version"] == 3
+    assert header["num_shards"] == 2
+    assert header["u_max"] == 3
+    assert resolve_sparse_manifest_grad_accum_u_max(manifest_path, header) == 4
+    assert list(stream_sparse_manifest_steps(manifest_path)) == steps
+    assert list(stream_sparse_manifest_steps(manifest_path, start_step=1)) == steps[1:]
 
 
 def test_resolve_batch_geometry_defaults_to_one_microbatch():
