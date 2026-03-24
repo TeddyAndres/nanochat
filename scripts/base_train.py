@@ -42,6 +42,8 @@ from nanochat.sparse_manifest import load_sparse_manifest_header, resolve_sparse
 from scripts.base_eval import evaluate_core
 print_banner()
 
+SPARSE_RUNTIME_CAPACITY_MULTIPLE = 128
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
@@ -414,11 +416,13 @@ if args.sparse_mode:
     sparse_fixed_u_max = None
     sparse_lm_head_u_max = None
     sparse_grad_accum_u_max = None
+    sparse_runtime_capacity_multiple = 1
     if hybrid_sparse:
         assert sparse_manifest is not None
         sparse_fixed_u_max = int(sparse_manifest["u_max"])
         sparse_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
         sparse_lm_head_u_max = sparse_fixed_u_max if not sparse_lm_head_clouds else int(args.sparse_cloud_max_u)
+        sparse_runtime_capacity_multiple = SPARSE_RUNTIME_CAPACITY_MULTIPLE
         if sparse_lm_head_u_max < sparse_fixed_u_max:
             raise ValueError(
                 f"--sparse-cloud-max-u must be at least manifest u_max={sparse_fixed_u_max}, got {sparse_lm_head_u_max}"
@@ -443,12 +447,20 @@ if args.sparse_mode:
         fixed_u_max=sparse_fixed_u_max,
         lm_head_u_max=sparse_lm_head_u_max,
         grad_accum_u_max=sparse_grad_accum_u_max,
+        capacity_round_multiple=sparse_runtime_capacity_multiple,
         cold_bias_reference_tokens=B_REF,
         unembedding_warm_lr=(None if args.sparse_unembedding_warm_lr < 0.0 else args.sparse_unembedding_warm_lr),
         unembedding_cold_lr=(None if args.sparse_unembedding_cold_lr < 0.0 else args.sparse_unembedding_cold_lr),
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
+    if hybrid_sparse:
+        print0(
+            f"Sparse runtime capacity alignment: multiple={sparse_runtime_capacity_multiple} | "
+            f"fixed_u_max {sparse_fixed_u_max:,}->{dynamic_vocab.fixed_u_max:,} | "
+            f"lm_head_u_max {sparse_lm_head_u_max:,}->{dynamic_vocab.lm_head_u_max:,} | "
+            f"grad_accum_u_max {sparse_grad_accum_u_max:,}->{dynamic_vocab.grad_accum_u_max:,}"
+        )
     if resuming:
         optimizer.load_state_dict(optimizer_data["base_optimizer"])
         optimizer_data_sparse = optimizer_data["dynamic_vocab"]
@@ -650,8 +662,11 @@ if hybrid_sparse:
     )
     print0(
         f"Sparse hybrid manifest: {args.sparse_manifest} | "
-        f"U_max={int(sparse_manifest['u_max']):,} | "
-        f"grad_accum_U_max={resolved_grad_accum_u_max:,}"
+        f"manifest_U_max={int(sparse_manifest['u_max']):,} | "
+        f"model_U_max={dynamic_vocab.fixed_u_max:,} | "
+        f"model_lm_head_U_max={dynamic_vocab.lm_head_u_max:,} | "
+        f"manifest_grad_accum_U_max={resolved_grad_accum_u_max:,} | "
+        f"model_grad_accum_U_max={dynamic_vocab.grad_accum_u_max:,}"
     )
 
 # Go!

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from concurrent.futures import Future
 
-from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, DynamicVocabRuntime
+from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, DynamicVocabRuntime, round_capacity_up
 from nanochat.gpt import GPT, GPTConfig
 
 
@@ -172,6 +172,45 @@ def test_dynamic_vocab_dense_materialization_round_trip():
 
     assert runtime.table_specs["wte"]["param"].data.device.type == "cpu"
     assert runtime.table_specs["wte"]["param"].data.data_ptr() == wte_before.data_ptr()
+
+
+def test_round_capacity_up_and_runtime_alignment_are_opt_in():
+    assert round_capacity_up(None, 128) is None
+    assert round_capacity_up(0, 128) == 0
+    assert round_capacity_up(129, 128) == 256
+    assert round_capacity_up(256, 128) == 256
+
+    model = build_tiny_model(vocab_size=16)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=3,
+        lm_head_u_max=5,
+        grad_accum_u_max=4,
+        capacity_round_multiple=8,
+    )
+
+    assert runtime.fixed_u_max == 8
+    assert runtime.lm_head_u_max == 8
+    assert runtime.grad_accum_u_max == 8
+
+    reference_runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=3,
+        lm_head_u_max=5,
+        grad_accum_u_max=4,
+    )
+
+    assert reference_runtime.fixed_u_max == 3
+    assert reference_runtime.lm_head_u_max == 5
+    assert reference_runtime.grad_accum_u_max == 4
 
 
 def test_fixed_u_runtime_delays_common_writeback_until_final_step():

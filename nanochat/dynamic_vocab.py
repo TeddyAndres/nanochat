@@ -13,6 +13,16 @@ COLD_LOGIT_BIAS_CLAMP_MIN = -3.0
 COLD_LOGIT_BIAS_CLAMP_MAX = 3.0
 
 
+def round_capacity_up(value: int | None, multiple: int) -> int | None:
+    if value is None:
+        return None
+    value = int(value)
+    multiple = int(multiple)
+    if multiple <= 1 or value <= 0:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 @dataclass
 class DynamicVocabStep:
     active_ids_cpu: torch.Tensor
@@ -100,6 +110,7 @@ class DynamicVocabRuntime:
         fixed_u_max=None,
         lm_head_u_max=None,
         grad_accum_u_max=None,
+        capacity_round_multiple=1,
         cold_bias_reference_tokens=2**19,
         value_embedding_lr=None,
         unembedding_warm_lr=None,
@@ -118,14 +129,20 @@ class DynamicVocabRuntime:
         self.first_hot_unembedding_lr = None if first_hot_unembedding_lr is None or first_hot_unembedding_lr <= 0.0 else float(first_hot_unembedding_lr)
         self.hot_unembedding_ramp_activations = max(0, int(hot_unembedding_ramp_activations))
         self.hot_unembedding_ramp_start_lr = None if hot_unembedding_ramp_start_lr is None or hot_unembedding_ramp_start_lr <= 0.0 else float(hot_unembedding_ramp_start_lr)
-        self.fixed_u_max = 0 if fixed_u_max is None else int(fixed_u_max)
+        self.capacity_round_multiple = max(1, int(capacity_round_multiple))
+        fixed_u_max_value = 0 if fixed_u_max is None else round_capacity_up(int(fixed_u_max), self.capacity_round_multiple)
+        assert fixed_u_max_value is not None
+        self.fixed_u_max = int(fixed_u_max_value)
         self.fixed_u_mode = self.fixed_u_max > 0
-        requested_lm_head_u_max = self.fixed_u_max if lm_head_u_max is None else int(lm_head_u_max)
+        requested_lm_head_u_max = self.fixed_u_max if lm_head_u_max is None else round_capacity_up(int(lm_head_u_max), self.capacity_round_multiple)
+        assert requested_lm_head_u_max is not None
         self.lm_head_u_max = max(self.fixed_u_max, requested_lm_head_u_max)
         if self.lm_head_u_max < 0:
             raise ValueError(f"lm_head_u_max must be non-negative, got {self.lm_head_u_max}")
         default_grad_accum_u_max = self.fixed_u_max if self.fixed_u_mode else 0
-        self.grad_accum_u_max = default_grad_accum_u_max if grad_accum_u_max is None else int(grad_accum_u_max)
+        grad_accum_u_max_value = default_grad_accum_u_max if grad_accum_u_max is None else round_capacity_up(int(grad_accum_u_max), self.capacity_round_multiple)
+        assert grad_accum_u_max_value is not None
+        self.grad_accum_u_max = int(grad_accum_u_max_value)
         if self.grad_accum_u_max < 0:
             raise ValueError(f"grad_accum_u_max must be non-negative, got {self.grad_accum_u_max}")
         if self.fixed_u_mode and self.grad_accum_u_max < self.fixed_u_max:
