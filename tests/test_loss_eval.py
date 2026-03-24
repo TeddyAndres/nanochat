@@ -9,6 +9,7 @@ import math
 
 import torch
 
+from nanochat.core_eval import forward_model
 from nanochat.loss_eval import evaluate_bpb, evaluate_bpb_and_ece
 
 
@@ -47,6 +48,18 @@ class ChunkedEvalModel(DummyEvalModel):
         if logit_scale != 1.0:
             return x * logit_scale
         return x
+
+    def iter_logits(self, x, active_vocab=None, logit_scale=1.0, logit_bias=None, force_float=True, vocab_chunk_size=None):
+        total_vocab = x.size(-1)
+        chunk_size = total_vocab if vocab_chunk_size is None or vocab_chunk_size <= 0 else vocab_chunk_size
+        for start in range(0, total_vocab, chunk_size):
+            end = min(start + chunk_size, total_vocab)
+            logits = x[..., start:end]
+            if logit_bias is not None:
+                logits = logits + logit_bias[start:end].view(1, -1)
+            if logit_scale != 1.0:
+                logits = logits * logit_scale
+            yield start, end, logits.float() if force_float else logits
 
 
 def test_evaluate_bpb_and_ece_perfectly_calibrated_bucket():
@@ -281,3 +294,23 @@ def test_logit_bias_matches_manual_shifted_logits_in_eval_paths():
     assert math.isclose(chunked_actual_bpb, chunked_expected_bpb, rel_tol=1e-6)
     assert math.isclose(chunked_actual_ece, chunked_expected_ece, rel_tol=1e-6)
     assert math.isclose(chunked_actual_bpb_only, chunked_expected_bpb_only, rel_tol=1e-6)
+
+
+def test_core_forward_model_streaming_matches_dense_path():
+    torch.manual_seed(0)
+    logits = torch.randn(3, 6, 7, dtype=torch.float32)
+    input_ids = torch.tensor([
+        [0, 1, 2, 3, 4, 5],
+        [5, 4, 3, 2, 1, 0],
+        [1, 3, 5, 0, 2, 4],
+    ], dtype=torch.long)
+
+    dense_model = DummyEvalModel(logits)
+    chunked_model = ChunkedEvalModel(logits)
+
+    dense_losses, dense_predictions = forward_model(dense_model, input_ids)
+    chunked_losses, chunked_predictions = forward_model(chunked_model, input_ids)
+
+    assert torch.allclose(chunked_predictions, dense_predictions)
+    assert torch.allclose(chunked_losses[:, :-1], dense_losses[:, :-1], atol=1e-6, rtol=1e-6)
+    assert torch.isnan(chunked_losses[:, -1]).all()

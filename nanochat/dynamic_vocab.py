@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-COLD_LOGIT_BIAS_CLAMP_MIN = -6.0
-COLD_LOGIT_BIAS_CLAMP_MAX = 6.0
+COLD_LOGIT_BIAS_CLAMP_MIN = -3.0
+COLD_LOGIT_BIAS_CLAMP_MAX = 3.0
 
 
 @dataclass

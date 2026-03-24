@@ -474,6 +474,65 @@ class GPT(nn.Module):
             logits = logits * logit_scale
         return logits
 
+    def iter_logits(self, x, active_vocab=None, logit_scale=1.0, logit_bias=None, force_float=True, vocab_chunk_size=None):
+        if active_vocab is None:
+            total_vocab = self.config.vocab_size
+            if vocab_chunk_size is None or vocab_chunk_size <= 0 or vocab_chunk_size >= total_vocab:
+                yield 0, total_vocab, self.compute_logits(
+                    x,
+                    active_vocab=active_vocab,
+                    logit_scale=logit_scale,
+                    logit_bias=logit_bias,
+                    force_float=force_float,
+                )
+                return
+            lm_head_weight = self.lm_head.weight
+        else:
+            lm_head_weight = active_vocab["lm_head"]
+            total_vocab = lm_head_weight.size(0)
+            if vocab_chunk_size is None or vocab_chunk_size <= 0 or vocab_chunk_size >= total_vocab:
+                yield 0, total_vocab, self.compute_logits(
+                    x,
+                    active_vocab=active_vocab,
+                    logit_scale=logit_scale,
+                    logit_bias=logit_bias,
+                    force_float=force_float,
+                )
+                return
+
+        softcap = 20
+        cold_logit_bias = None
+        logit_mask = None
+        if active_vocab is not None and "cold_logit_bias" in active_vocab:
+            cold_logit_bias = active_vocab["cold_logit_bias"]
+        if active_vocab is not None and "logit_mask" in active_vocab:
+            logit_mask = active_vocab["logit_mask"]
+        if logit_bias is not None:
+            logit_bias = logit_bias.to(device=x.device)
+
+        expand_shape = [1] * (x.ndim - 1)
+        for start in range(0, total_vocab, vocab_chunk_size):
+            end = min(start + vocab_chunk_size, total_vocab)
+            weight_chunk = lm_head_weight[start:end]
+            if weight_chunk.dtype != x.dtype:
+                weight_chunk = weight_chunk.to(dtype=x.dtype)
+            logits = F.linear(x, weight_chunk)
+            if force_float:
+                logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+            if cold_logit_bias is not None:
+                bias_chunk = cold_logit_bias[start:end].to(device=logits.device, dtype=logits.dtype)
+                logits = logits + bias_chunk.view(*expand_shape, -1)
+            if logit_bias is not None:
+                bias_chunk = logit_bias[start:end].to(dtype=logits.dtype)
+                logits = logits + bias_chunk.view(*expand_shape, -1)
+            if logit_mask is not None:
+                mask_chunk = logit_mask[start:end].to(device=logits.device, dtype=torch.bool)
+                logits = logits.masked_fill(~mask_chunk.view(*expand_shape, -1), -1e9)
+            if logit_scale != 1.0:
+                logits = logits * logit_scale
+            yield start, end, logits
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None, logit_scale=1.0, logit_bias=None):
         x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
         logits = self.compute_logits(
