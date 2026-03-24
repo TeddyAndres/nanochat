@@ -1273,6 +1273,19 @@ class DynamicVocabRuntime:
         )
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
+        manifest_fixed_u_max = int(slot_to_global_cpu.numel())
+        if manifest_fixed_u_max > self.fixed_u_max:
+            raise ValueError(
+                f"Manifest fixed-U metadata exceeds runtime capacity: manifest_u_max={manifest_fixed_u_max}, runtime_fixed_u_max={self.fixed_u_max}"
+            )
+        if manifest_fixed_u_max < self.fixed_u_max:
+            padded_slot_to_global_cpu = torch.full((self.fixed_u_max,), -1, dtype=torch.long)
+            padded_slot_to_global_cpu[:manifest_fixed_u_max].copy_(slot_to_global_cpu)
+            slot_to_global_cpu = padded_slot_to_global_cpu
+
+            padded_active_mask_cpu = torch.zeros(self.fixed_u_max, dtype=torch.bool)
+            padded_active_mask_cpu[:manifest_fixed_u_max].copy_(active_mask_cpu)
+            active_mask_cpu = padded_active_mask_cpu
         stage_ids_cpu = step_meta["stage_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
         stage_slot_ids_cpu = step_meta["stage_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
         writeback_ids_cpu = step_meta["writeback_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
