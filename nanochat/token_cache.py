@@ -298,7 +298,17 @@ def prepare_token_cache_writer(
         bos_token_id=bos_token_id,
         ddp_world_size=ddp_world_size,
     ):
-        return None
+        existing_metadata = load_token_cache_metadata(resolved_dir, split) or {}
+        existing_metadata.setdefault("next_shard_index", len(existing_metadata.get("shards", [])))
+        existing_metadata.setdefault("num_batches", 0)
+        existing_metadata.setdefault("num_docs", 0)
+        print0(f"Extending token cache for split='{split}' at {_cache_split_dir(resolved_dir, split)}")
+        return TokenCacheWriter(
+            resolved_dir,
+            split,
+            metadata=existing_metadata,
+            shard_batch_count=shard_batch_count,
+        )
 
     split_dir = _cache_split_dir(resolved_dir, split)
     split_dir.mkdir(parents=True, exist_ok=True)

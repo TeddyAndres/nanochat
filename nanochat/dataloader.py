@@ -70,18 +70,17 @@ def _iter_tokenized_document_batches(
             last_cached_state = state
             yield token_lists, state
         live_resume_state = resume_state_dict if last_cached_state is None else last_cached_state
-        writer = None
     else:
         live_resume_state = resume_state_dict
-        writer = prepare_token_cache_writer(
-            resolved_cache_dir,
-            split,
-            tokenizer=tokenizer,
-            tokenizer_batch_size=tokenizer_batch_size,
-            bos_token_id=bos_token,
-            ddp_world_size=ddp_world_size,
-            shard_batch_count=token_cache_shard_batches,
-        )
+    writer = prepare_token_cache_writer(
+        resolved_cache_dir,
+        split,
+        tokenizer=tokenizer,
+        tokenizer_batch_size=tokenizer_batch_size,
+        bos_token_id=bos_token,
+        ddp_world_size=ddp_world_size,
+        shard_batch_count=token_cache_shard_batches,
+    )
 
     live_text_batches = iter_document_text_batches(
         split,

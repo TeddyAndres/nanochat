@@ -16,7 +16,7 @@ from nanochat.sparse_manifest import (
     stream_sparse_manifest_steps,
     validate_sparse_manifest,
 )
-from nanochat.token_cache import ensure_token_cache, iter_token_batches_from_cache
+from nanochat.token_cache import ensure_token_cache, iter_token_batches_from_cache, load_token_cache_metadata
 
 
 class _FakeTokenizer:
@@ -451,6 +451,83 @@ def test_token_cache_replay_skips_resumed_row_group(tmp_path, monkeypatch):
     assert second_state == {"pq_idx": 1, "rg_idx": 0, "epoch": 1}
     with pytest.raises(StopIteration):
         next(replay)
+
+
+def test_loader_extends_existing_token_cache(tmp_path, monkeypatch):
+    initial_batches = [
+        (["aa"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
+        (["bb"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1, "text_batch_index": 0}),
+    ]
+    extended_batches = initial_batches + [
+        (["cc"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1, "text_batch_index": 0}),
+        (["dd"], {"pq_idx": 0, "rg_idx": 3, "epoch": 1, "text_batch_index": 0}),
+    ]
+
+    def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
+        source = initial_batches if resume_state_dict is None else extended_batches
+        started = resume_state_dict is None
+        resume_key = None if resume_state_dict is None else (
+            int(resume_state_dict["pq_idx"]),
+            int(resume_state_dict["rg_idx"]),
+            int(resume_state_dict.get("epoch", 1)),
+            int(resume_state_dict.get("text_batch_index", -1)),
+        )
+        for texts, state in source:
+            state_key = (state["pq_idx"], state["rg_idx"], state["epoch"], state.get("text_batch_index", -1))
+            if not started:
+                if state_key == resume_key:
+                    continue
+                if state_key > resume_key:
+                    started = True
+                else:
+                    continue
+            yield texts, state
+
+    monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    monkeypatch.setattr(dataloader_module, "iter_document_text_batches", fake_iter_document_text_batches)
+    tokenizer = _FakeTokenizer()
+
+    ensure_token_cache(
+        tmp_path,
+        "train",
+        tokenizer=tokenizer,
+        tokenizer_threads=1,
+        tokenizer_batch_size=1,
+        bos_token_id=tokenizer.get_bos_token_id(),
+        ddp_rank=0,
+        ddp_world_size=1,
+        shard_batch_count=1,
+    )
+    metadata_before = load_token_cache_metadata(tmp_path, "train")
+    assert metadata_before is not None
+    shard_count_before = len(metadata_before["shards"])
+
+    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
+        tokenizer,
+        1,
+        2,
+        split="train",
+        tokenizer_threads=1,
+        tokenizer_batch_size=1,
+        device="cpu",
+        resume_state_dict=None,
+        buffer_size=1,
+        vocab_size=128,
+        token_cache_dir=tmp_path,
+        token_cache_shard_batches=1,
+    )
+    next(loader)
+    next(loader)
+    next(loader)
+    next(loader)
+
+    metadata_after = load_token_cache_metadata(tmp_path, "train")
+    assert metadata_after is not None
+    assert len(metadata_after["shards"]) > shard_count_before
+    replayed = list(iter_token_batches_from_cache(tmp_path, "train"))
+    assert len(replayed) == 4
+    assert [row.tolist() for row in replayed[0][0]] == tokenizer.encode(["aa"], prepend=99)
+    assert [row.tolist() for row in replayed[3][0]] == tokenizer.encode(["dd"], prepend=99)
 
 
 def test_resolve_batch_geometry_defaults_to_one_microbatch():
