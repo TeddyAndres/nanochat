@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shard-steps",
         type=int,
-        default=64,
+        default=500,
         help="number of completed optimizer steps to buffer per shard before flushing to disk",
     )
     return parser

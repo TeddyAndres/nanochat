@@ -16,6 +16,9 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+
 import torch
 
 from nanochat.common import get_dist_info
@@ -27,6 +30,14 @@ from nanochat.token_cache import (
     resolve_token_cache_dir,
     token_cache_is_valid,
 )
+
+
+def _tokenize_document_batch(tokenizer, text_batch, state, bos_token, tokenizer_threads):
+    token_lists = [
+        torch.tensor(tokens, dtype=torch.long)
+        for tokens in tokenizer.encode(text_batch, prepend=bos_token, num_threads=tokenizer_threads)
+    ]
+    return token_lists, state
 
 def _iter_tokenized_document_batches(
     tokenizer,
@@ -72,18 +83,41 @@ def _iter_tokenized_document_batches(
             shard_batch_count=token_cache_shard_batches,
         )
 
+    live_text_batches = iter_document_text_batches(
+        split,
+        live_resume_state,
+        tokenizer_batch_size,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size,
+    )
+    prefetch_futures: deque[Future] = deque()
+
+    def enqueue_prefetch(executor: ThreadPoolExecutor) -> None:
+        while len(prefetch_futures) < 2:
+            try:
+                text_batch, state = next(live_text_batches)
+            except StopIteration:
+                break
+            prefetch_futures.append(
+                executor.submit(
+                    _tokenize_document_batch,
+                    tokenizer,
+                    text_batch,
+                    state,
+                    bos_token,
+                    tokenizer_threads,
+                )
+            )
+
     try:
-        for text_batch, state in iter_document_text_batches(
-            split,
-            live_resume_state,
-            tokenizer_batch_size,
-            ddp_rank=ddp_rank,
-            ddp_world_size=ddp_world_size,
-        ):
-            token_lists = [torch.tensor(tokens, dtype=torch.long) for tokens in tokenizer.encode(text_batch, prepend=bos_token, num_threads=tokenizer_threads)]
-            if writer is not None:
-                writer.append(token_lists, state)
-            yield token_lists, state
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="tokenize-prefetch") as executor:
+            enqueue_prefetch(executor)
+            while prefetch_futures:
+                token_lists, state = prefetch_futures.popleft().result()
+                enqueue_prefetch(executor)
+                if writer is not None:
+                    writer.append(token_lists, state)
+                yield token_lists, state
     finally:
         if writer is not None:
             writer.close()
