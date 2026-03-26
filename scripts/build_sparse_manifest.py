@@ -46,6 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-batch-size", type=int, default=128, help="documents per tokenizer batch")
     parser.add_argument("--buffer-size", type=int, default=1000, help="best-fit document buffer size")
     parser.add_argument(
+        "--token-cache-dir",
+        type=str,
+        default="",
+        help="token cache directory (empty = sibling folder next to the dataset)",
+    )
+    parser.add_argument(
+        "--token-cache-shard-batches",
+        type=int,
+        default=256,
+        help="number of tokenized document batches to store per cache shard",
+    )
+    parser.add_argument(
         "--shard-steps",
         type=int,
         default=64,
@@ -120,6 +132,8 @@ def main() -> None:
         resume_state_dict=None,
         buffer_size=args.buffer_size,
         vocab_size=vocab_size,
+        token_cache_dir=args.token_cache_dir,
+        token_cache_shard_batches=args.token_cache_shard_batches,
     )
 
     print0(

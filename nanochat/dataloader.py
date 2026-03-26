@@ -17,59 +17,76 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 """
 
 import torch
-import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
-from nanochat.dataset import list_parquet_files
 from nanochat.sparse_manifest import load_sparse_manifest_header, stream_sparse_manifest_steps, validate_sparse_manifest
+from nanochat.token_cache import (
+    iter_cached_token_batches,
+    iter_document_text_batches,
+    prepare_token_cache_writer,
+    resolve_token_cache_dir,
+    token_cache_is_valid,
+)
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
-    """
-    Infinite iterator over document batches (list of text strings) from parquet files.
-
-    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
-    where text_batch is a list of document strings, indices track position for resumption,
-    and epoch counts how many times we've cycled through the dataset (starts at 1).
-    """
+def _iter_tokenized_document_batches(
+    tokenizer,
+    *,
+    split,
+    tokenizer_threads,
+    tokenizer_batch_size,
+    resume_state_dict,
+    token_cache_dir,
+    token_cache_shard_batches,
+):
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    bos_token = tokenizer.get_bos_token_id()
+    resolved_cache_dir = resolve_token_cache_dir(token_cache_dir)
+    cache_valid = token_cache_is_valid(
+        resolved_cache_dir,
+        split,
+        tokenizer=tokenizer,
+        tokenizer_batch_size=tokenizer_batch_size,
+        bos_token_id=bos_token,
+        ddp_world_size=ddp_world_size,
+    )
+    last_cached_state = None
+    if cache_valid:
+        for token_lists, state in iter_cached_token_batches(
+            resolved_cache_dir,
+            split,
+            resume_state_dict=resume_state_dict,
+        ):
+            last_cached_state = state
+            yield token_lists, state
+        live_resume_state = resume_state_dict if last_cached_state is None else last_cached_state
+        writer = None
+    else:
+        live_resume_state = resume_state_dict
+        writer = prepare_token_cache_writer(
+            resolved_cache_dir,
+            split,
+            tokenizer=tokenizer,
+            tokenizer_batch_size=tokenizer_batch_size,
+            bos_token_id=bos_token,
+            ddp_world_size=ddp_world_size,
+            shard_batch_count=token_cache_shard_batches,
+        )
 
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
-    parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
-    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
-
-    resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
-    resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
-    resume_epoch = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
-    first_pass = True
-    pq_idx = resume_pq_idx
-    epoch = resume_epoch
-
-    while True:  # iterate infinitely (multi-epoch)
-        pq_idx = resume_pq_idx if first_pass else 0
-        while pq_idx < len(parquet_paths):
-            filepath = parquet_paths[pq_idx]
-            pf = pq.ParquetFile(filepath)
-            # Start from resume point if resuming on same file, otherwise from DDP rank
-            if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                base_idx = resume_rg_idx // ddp_world_size
-                base_idx += 1  # advance by 1 so we don't repeat data after resuming
-                rg_idx = base_idx * ddp_world_size + ddp_rank
-                if rg_idx >= pf.num_row_groups:
-                    pq_idx += 1
-                    continue
-                resume_rg_idx = None  # only do this once
-            else:
-                rg_idx = ddp_rank
-            while rg_idx < pf.num_row_groups:
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += ddp_world_size
-            pq_idx += 1
-        first_pass = False
-        epoch += 1
+    try:
+        for text_batch, state in iter_document_text_batches(
+            split,
+            live_resume_state,
+            tokenizer_batch_size,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+        ):
+            token_lists = [torch.tensor(tokens, dtype=torch.long) for tokens in tokenizer.encode(text_batch, prepend=bos_token, num_threads=tokenizer_threads)]
+            if writer is not None:
+                writer.append(token_lists, state)
+            yield token_lists, state
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
@@ -79,6 +96,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     buffer_size=1000,
     return_active_vocab=False,
     vocab_size=None,
+    token_cache_dir="",
+    token_cache_shard_batches=256,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -99,15 +118,24 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
-    bos_token = tokenizer.get_bos_token_id()
+    token_batches = _iter_tokenized_document_batches(
+        tokenizer,
+        split=split,
+        tokenizer_threads=tokenizer_threads,
+        tokenizer_batch_size=tokenizer_batch_size,
+        resume_state_dict=resume_state_dict,
+        token_cache_dir=token_cache_dir,
+        token_cache_shard_batches=token_cache_shard_batches,
+    )
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
-        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        token_lists, state = next(token_batches)
+        pq_idx = int(state["pq_idx"])
+        rg_idx = int(state["rg_idx"])
+        epoch = int(state["epoch"])
         for tokens in token_lists:
             doc_buffer.append(tokens)
 
@@ -147,13 +175,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
                     doc_len = len(doc)
-                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + doc_len] = torch.as_tensor(doc, dtype=torch.long)
                     pos += doc_len
                 else:
                     # No doc fits - crop shortest in buffer to fill remaining and minimize waste
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.as_tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
         # Copy to pinned CPU buffer, then single HtoD transfer
@@ -199,6 +227,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     buffer_size=1000,
     vocab_size=None,
     include_local_batch=False,
+    token_cache_dir="",
+    token_cache_shard_batches=256,
 ):
     """Manifest-driven sparse loader with fixed logical U slots.
 
@@ -245,6 +275,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         device="cpu",
         resume_state_dict=base_resume_state,
         buffer_size=buffer_size,
+        token_cache_dir=token_cache_dir,
+        token_cache_shard_batches=token_cache_shard_batches,
     )
 
     use_cuda = torch.device(device).type == "cuda"

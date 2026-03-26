@@ -1,7 +1,11 @@
 import json
 
+import pytest
+import torch
+
 from scripts.build_sparse_manifest import resolve_batch_geometry
 
+from nanochat import dataloader as dataloader_module
 from nanochat.sparse_manifest import (
     build_manifest_payload,
     build_manifest_shard_payload,
@@ -12,6 +16,26 @@ from nanochat.sparse_manifest import (
     stream_sparse_manifest_steps,
     validate_sparse_manifest,
 )
+from nanochat.token_cache import ensure_token_cache, iter_token_batches_from_cache
+
+
+class _FakeTokenizer:
+    def get_vocab_size(self):
+        return 128
+
+    def get_bos_token_id(self):
+        return 99
+
+    def encode(self, text, prepend=None, append=None, num_threads=8):
+        rows = []
+        for item in text:
+            ids = [ord(ch) % 31 + 1 for ch in item]
+            if prepend is not None:
+                ids.insert(0, int(prepend))
+            if append is not None:
+                ids.append(int(append))
+            rows.append(ids)
+        return rows
 
 
 def test_sparse_manifest_header_and_streaming_steps(tmp_path):
@@ -286,6 +310,147 @@ def test_sparse_manifest_streams_across_shards(tmp_path):
     assert resolve_sparse_manifest_grad_accum_u_max(manifest_path, header) == 4
     assert list(stream_sparse_manifest_steps(manifest_path)) == steps
     assert list(stream_sparse_manifest_steps(manifest_path, start_step=1)) == steps[1:]
+
+
+def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch):
+    fake_batches = [
+        (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1}),
+        (["c", "dddd"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1}),
+    ]
+
+    def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
+        assert split == "train"
+        assert tokenizer_batch_size == 2
+        assert ddp_rank == 0
+        assert ddp_world_size == 1
+        yield from fake_batches
+
+    monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    tokenizer = _FakeTokenizer()
+    ensure_token_cache(
+        tmp_path,
+        "train",
+        tokenizer=tokenizer,
+        tokenizer_threads=2,
+        tokenizer_batch_size=2,
+        bos_token_id=tokenizer.get_bos_token_id(),
+        ddp_rank=0,
+        ddp_world_size=1,
+        shard_batch_count=1,
+    )
+
+    cached_iter = iter_token_batches_from_cache(tmp_path, "train")
+    first_cached = next(cached_iter)
+    second_cached = next(cached_iter)
+    assert first_cached[1] == fake_batches[0][1]
+    assert second_cached[1] == fake_batches[1][1]
+    assert [row.tolist() for row in first_cached[0]] == tokenizer.encode(["aa", "bbb"], prepend=99)
+    assert [row.tolist() for row in second_cached[0]] == tokenizer.encode(["c", "dddd"], prepend=99)
+
+
+def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
+    fake_batches = [
+        (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1}),
+        (["cc", "d"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1}),
+        (["eee", "f"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1}),
+    ]
+
+    def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
+        for batch in fake_batches:
+            yield batch
+        for text_batch, state in fake_batches:
+            yield text_batch, {**state, "epoch": 2}
+
+    monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    monkeypatch.setattr(dataloader_module, "iter_document_text_batches", fake_iter_document_text_batches)
+    tokenizer = _FakeTokenizer()
+    live_loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
+        tokenizer,
+        2,
+        4,
+        split="train",
+        tokenizer_threads=2,
+        tokenizer_batch_size=2,
+        device="cpu",
+        resume_state_dict=None,
+        buffer_size=2,
+        vocab_size=128,
+    )
+    live_inputs, live_targets, live_active_ids, live_state = next(live_loader)
+
+    ensure_token_cache(
+        tmp_path,
+        "train",
+        tokenizer=tokenizer,
+        tokenizer_threads=2,
+        tokenizer_batch_size=2,
+        bos_token_id=tokenizer.get_bos_token_id(),
+        ddp_rank=0,
+        ddp_world_size=1,
+        shard_batch_count=2,
+    )
+    cache_loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
+        tokenizer,
+        2,
+        4,
+        split="train",
+        tokenizer_threads=2,
+        tokenizer_batch_size=2,
+        device="cpu",
+        resume_state_dict=None,
+        buffer_size=2,
+        vocab_size=128,
+        token_cache_dir=tmp_path,
+        token_cache_shard_batches=2,
+    )
+    cache_inputs, cache_targets, cache_active_ids, cache_state = next(cache_loader)
+
+    assert torch.equal(live_inputs, cache_inputs)
+    assert torch.equal(live_targets, cache_targets)
+    assert torch.equal(live_active_ids, cache_active_ids)
+    assert live_state == cache_state
+
+
+def test_token_cache_replay_skips_resumed_row_group(tmp_path, monkeypatch):
+    fake_batches = [
+        (["aa"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1}),
+        (["bb"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1}),
+        (["cc"], {"pq_idx": 1, "rg_idx": 0, "epoch": 1}),
+    ]
+
+    def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
+        for batch in fake_batches:
+            yield batch
+        yield ["epoch2"], {"pq_idx": 0, "rg_idx": 0, "epoch": 2}
+
+    monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    tokenizer = _FakeTokenizer()
+    ensure_token_cache(
+        tmp_path,
+        "train",
+        tokenizer=tokenizer,
+        tokenizer_threads=1,
+        tokenizer_batch_size=1,
+        bos_token_id=tokenizer.get_bos_token_id(),
+        ddp_rank=0,
+        ddp_world_size=1,
+        shard_batch_count=2,
+    )
+
+    replay = iter_token_batches_from_cache(
+        tmp_path,
+        "train",
+        resume_state_dict={"pq_idx": 0, "rg_idx": 0, "epoch": 1},
+    )
+    first_tokens, first_state = next(replay)
+    second_tokens, second_state = next(replay)
+
+    assert [row.tolist() for row in first_tokens] == tokenizer.encode(["bb"], prepend=99)
+    assert first_state == {"pq_idx": 0, "rg_idx": 2, "epoch": 1}
+    assert [row.tolist() for row in second_tokens] == tokenizer.encode(["cc"], prepend=99)
+    assert second_state == {"pq_idx": 1, "rg_idx": 0, "epoch": 1}
+    with pytest.raises(StopIteration):
+        next(replay)
 
 
 def test_resolve_batch_geometry_defaults_to_one_microbatch():

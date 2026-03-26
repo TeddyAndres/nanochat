@@ -105,6 +105,18 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument(
+    "--token-cache-dir",
+    type=str,
+    default="",
+    help="token cache directory (empty = sibling folder next to the dataset)",
+)
+parser.add_argument(
+    "--token-cache-shard-batches",
+    type=int,
+    default=256,
+    help="number of tokenized document batches to store per cache shard",
+)
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=5*524288, help="number of tokens to evaluate val loss on")
@@ -496,12 +508,41 @@ if args.sparse_mode:
             resume_state_dict=dataloader_resume_state_dict,
             vocab_size=vocab_size,
             include_local_batch=sparse_lm_head_clouds,
+            token_cache_dir=args.token_cache_dir,
+            token_cache_shard_batches=args.token_cache_shard_batches,
         )
     else:
-        train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, vocab_size=vocab_size)
+        train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
+            tokenizer,
+            args.device_batch_size,
+            args.max_seq_len,
+            split="train",
+            device=device,
+            resume_state_dict=dataloader_resume_state_dict,
+            vocab_size=vocab_size,
+            token_cache_dir=args.token_cache_dir,
+            token_cache_shard_batches=args.token_cache_shard_batches,
+        )
 else:
-    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        split="train",
+        device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+        token_cache_dir=args.token_cache_dir,
+        token_cache_shard_batches=args.token_cache_shard_batches,
+    )
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
+    tokenizer,
+    args.device_batch_size,
+    args.max_seq_len,
+    split="val",
+    device=device,
+    token_cache_dir=args.token_cache_dir,
+    token_cache_shard_batches=args.token_cache_shard_batches,
+)
 
 
 def plan_sparse_batch_meta(step_meta):
@@ -650,6 +691,12 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 if hybrid_sparse:
     assert sparse_manifest is not None
     resolved_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
+    manifest_num_steps = int(sparse_manifest["num_steps"])
+    if num_iterations > manifest_num_steps:
+        raise ValueError(
+            f"Requested num_iterations={num_iterations} exceeds sparse manifest length {manifest_num_steps}. "
+            f"Shorter runs are allowed; longer runs require a longer manifest."
+        )
     validate_sparse_manifest(
         sparse_manifest,
         split="train",
@@ -658,7 +705,6 @@ if hybrid_sparse:
         max_seq_len=args.max_seq_len,
         grad_accum_steps=grad_accum_steps,
         ddp_world_size=ddp_world_size,
-        num_iterations=num_iterations,
     )
     print0(
         f"Sparse hybrid manifest: {args.sparse_manifest} | "
