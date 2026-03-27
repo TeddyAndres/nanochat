@@ -38,6 +38,11 @@ class _FakeTokenizer:
         return rows
 
 
+def _fake_dataset_paths(tmp_path, *names):
+    dataset_dir = tmp_path / "dataset"
+    return [str(dataset_dir / name) for name in names]
+
+
 def test_sparse_manifest_header_and_streaming_steps(tmp_path):
     steps = [
         {
@@ -314,8 +319,8 @@ def test_sparse_manifest_streams_across_shards(tmp_path):
 
 def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch):
     fake_batches = [
-        (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1}),
-        (["c", "dddd"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1}),
+        (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
+        (["c", "dddd"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1, "text_batch_index": 0}),
     ]
 
     def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
@@ -326,6 +331,10 @@ def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch)
         yield from fake_batches
 
     monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    monkeypatch.setattr(
+        "nanochat.token_cache.list_parquet_files",
+        lambda warn_on_legacy=False: _fake_dataset_paths(tmp_path, "train0.parquet", "val.parquet"),
+    )
     tokenizer = _FakeTokenizer()
     ensure_token_cache(
         tmp_path,
@@ -337,6 +346,7 @@ def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch)
         ddp_rank=0,
         ddp_world_size=1,
         shard_batch_count=1,
+        num_workers=1,
     )
 
     def fail_if_materialized(cache_dir, split):
@@ -355,9 +365,9 @@ def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch)
 
 def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
     fake_batches = [
-        (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1}),
-        (["cc", "d"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1}),
-        (["eee", "f"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1}),
+        (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
+        (["cc", "d"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1, "text_batch_index": 0}),
+        (["eee", "f"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1, "text_batch_index": 0}),
     ]
 
     def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
@@ -367,9 +377,12 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
             yield text_batch, {**state, "epoch": 2}
 
     monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    monkeypatch.setattr(
+        "nanochat.token_cache.list_parquet_files",
+        lambda warn_on_legacy=False: _fake_dataset_paths(tmp_path, "train0.parquet", "val.parquet"),
+    )
     monkeypatch.setattr(dataloader_module, "iter_document_text_batches", fake_iter_document_text_batches)
     tokenizer = _FakeTokenizer()
-    live_cache_dir = tmp_path / "live-cache"
     live_loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
         tokenizer,
         2,
@@ -381,8 +394,6 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
         resume_state_dict=None,
         buffer_size=2,
         vocab_size=128,
-        token_cache_dir=live_cache_dir,
-        token_cache_shard_batches=2,
     )
     live_inputs, live_targets, live_active_ids, live_state = next(live_loader)
 
@@ -396,6 +407,7 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
         ddp_rank=0,
         ddp_world_size=1,
         shard_batch_count=2,
+        num_workers=1,
     )
     cache_loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
         tokenizer,
@@ -410,6 +422,7 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
         vocab_size=128,
         token_cache_dir=tmp_path,
         token_cache_shard_batches=2,
+        token_cache_workers=1,
     )
     cache_inputs, cache_targets, cache_active_ids, cache_state = next(cache_loader)
 
@@ -421,9 +434,9 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
 
 def test_token_cache_replay_skips_resumed_row_group(tmp_path, monkeypatch):
     fake_batches = [
-        (["aa"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1}),
-        (["bb"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1}),
-        (["cc"], {"pq_idx": 1, "rg_idx": 0, "epoch": 1}),
+        (["aa"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
+        (["bb"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1, "text_batch_index": 0}),
+        (["cc"], {"pq_idx": 1, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
     ]
 
     def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
@@ -432,6 +445,10 @@ def test_token_cache_replay_skips_resumed_row_group(tmp_path, monkeypatch):
         yield ["epoch2"], {"pq_idx": 0, "rg_idx": 0, "epoch": 2}
 
     monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
+    monkeypatch.setattr(
+        "nanochat.token_cache.list_parquet_files",
+        lambda warn_on_legacy=False: _fake_dataset_paths(tmp_path, "train0.parquet", "train1.parquet", "val.parquet"),
+    )
     tokenizer = _FakeTokenizer()
     ensure_token_cache(
         tmp_path,
@@ -443,6 +460,7 @@ def test_token_cache_replay_skips_resumed_row_group(tmp_path, monkeypatch):
         ddp_rank=0,
         ddp_world_size=1,
         shard_batch_count=2,
+        num_workers=1,
     )
 
     replay = iter_token_batches_from_cache(
@@ -454,45 +472,31 @@ def test_token_cache_replay_skips_resumed_row_group(tmp_path, monkeypatch):
     second_tokens, second_state = next(replay)
 
     assert [row.tolist() for row in first_tokens] == tokenizer.encode(["bb"], prepend=99)
-    assert first_state == {"pq_idx": 0, "rg_idx": 2, "epoch": 1}
+    assert first_state == {"pq_idx": 0, "rg_idx": 2, "epoch": 1, "text_batch_index": 0}
     assert [row.tolist() for row in second_tokens] == tokenizer.encode(["cc"], prepend=99)
-    assert second_state == {"pq_idx": 1, "rg_idx": 0, "epoch": 1}
+    assert second_state == {"pq_idx": 1, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}
     with pytest.raises(StopIteration):
         next(replay)
 
 
-def test_loader_extends_existing_token_cache(tmp_path, monkeypatch):
-    initial_batches = [
+def test_shared_cache_replays_ddp_row_group_stride(tmp_path, monkeypatch):
+    all_batches = [
         (["aa"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
         (["bb"], {"pq_idx": 0, "rg_idx": 1, "epoch": 1, "text_batch_index": 0}),
-    ]
-    extended_batches = initial_batches + [
         (["cc"], {"pq_idx": 0, "rg_idx": 2, "epoch": 1, "text_batch_index": 0}),
         (["dd"], {"pq_idx": 0, "rg_idx": 3, "epoch": 1, "text_batch_index": 0}),
     ]
 
     def fake_iter_document_text_batches(split, resume_state_dict, tokenizer_batch_size, *, ddp_rank, ddp_world_size):
-        source = initial_batches if resume_state_dict is None else extended_batches
-        started = resume_state_dict is None
-        resume_key = None if resume_state_dict is None else (
-            int(resume_state_dict["pq_idx"]),
-            int(resume_state_dict["rg_idx"]),
-            int(resume_state_dict.get("epoch", 1)),
-            int(resume_state_dict.get("text_batch_index", -1)),
-        )
-        for texts, state in source:
-            state_key = (state["pq_idx"], state["rg_idx"], state["epoch"], state.get("text_batch_index", -1))
-            if not started:
-                if state_key == resume_key:
-                    continue
-                if state_key > resume_key:
-                    started = True
-                else:
-                    continue
-            yield texts, state
+        del resume_state_dict, tokenizer_batch_size, ddp_rank, ddp_world_size
+        yield from all_batches
+        yield ["epoch2"], {"pq_idx": 0, "rg_idx": 0, "epoch": 2, "text_batch_index": 0}
 
     monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
-    monkeypatch.setattr(dataloader_module, "iter_document_text_batches", fake_iter_document_text_batches)
+    monkeypatch.setattr(
+        "nanochat.token_cache.list_parquet_files",
+        lambda warn_on_legacy=False: _fake_dataset_paths(tmp_path, "train0.parquet", "val.parquet"),
+    )
     tokenizer = _FakeTokenizer()
 
     ensure_token_cache(
@@ -505,40 +509,28 @@ def test_loader_extends_existing_token_cache(tmp_path, monkeypatch):
         ddp_rank=0,
         ddp_world_size=1,
         shard_batch_count=1,
+        num_workers=1,
     )
-    metadata_before = load_token_cache_metadata(tmp_path, "train")
-    assert metadata_before is not None
-    shard_count_before = len(metadata_before["shards"])
 
-    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
-        tokenizer,
-        1,
-        2,
-        split="train",
-        tokenizer_threads=1,
-        tokenizer_batch_size=1,
-        device="cpu",
-        resume_state_dict=None,
-        buffer_size=1,
-        vocab_size=128,
-        token_cache_dir=tmp_path,
-        token_cache_shard_batches=1,
+    metadata = load_token_cache_metadata(tmp_path, "train")
+    assert metadata is not None
+    assert metadata["complete"] is True
+    assert len(metadata["files"]) == 1
+
+    rank0 = list(iter_token_batches_from_cache(tmp_path, "train", ddp_rank=0, ddp_world_size=2))
+    rank1 = list(iter_token_batches_from_cache(tmp_path, "train", ddp_rank=1, ddp_world_size=2))
+
+    assert [state["rg_idx"] for _, state in rank0] == [0, 2]
+    assert [state["rg_idx"] for _, state in rank1] == [1, 3]
+    assert [row.tolist() for row in rank0[0][0]] == tokenizer.encode(["aa"], prepend=99)
+    assert [row.tolist() for row in rank1[1][0]] == tokenizer.encode(["dd"], prepend=99)
+
+
+def test_prepare_token_cache_writer_refuses_to_overwrite_incompatible_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "nanochat.token_cache.list_parquet_files",
+        lambda warn_on_legacy=False: _fake_dataset_paths(tmp_path, "train0.parquet", "val.parquet"),
     )
-    next(loader)
-    next(loader)
-    next(loader)
-    next(loader)
-
-    metadata_after = load_token_cache_metadata(tmp_path, "train")
-    assert metadata_after is not None
-    assert len(metadata_after["shards"]) > shard_count_before
-    replayed = list(iter_token_batches_from_cache(tmp_path, "train"))
-    assert len(replayed) == 4
-    assert [row.tolist() for row in replayed[0][0]] == tokenizer.encode(["aa"], prepend=99)
-    assert [row.tolist() for row in replayed[3][0]] == tokenizer.encode(["dd"], prepend=99)
-
-
-def test_prepare_token_cache_writer_refuses_to_overwrite_incompatible_cache(tmp_path):
     split_dir = tmp_path / "train"
     split_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = split_dir / "metadata.json"
@@ -568,6 +560,14 @@ def test_prepare_token_cache_writer_refuses_to_overwrite_incompatible_cache(tmp_
             ddp_world_size=1,
             shard_batch_count=1,
         )
+
+
+def test_resolve_token_cache_dir_rejects_non_dataset_storage(tmp_path, monkeypatch):
+    dataset_paths = _fake_dataset_paths(tmp_path, "train0.parquet", "val.parquet")
+    monkeypatch.setattr("nanochat.token_cache.list_parquet_files", lambda warn_on_legacy=False: dataset_paths)
+
+    with pytest.raises(ValueError, match="dataset-side storage"):
+        dataloader_module.resolve_token_cache_dir("/tmp/not-on-dataset-storage")
 
 
 def test_resolve_batch_geometry_defaults_to_one_microbatch():

@@ -24,11 +24,11 @@ import torch
 from nanochat.common import get_dist_info
 from nanochat.sparse_manifest import load_sparse_manifest_header, stream_sparse_manifest_steps, validate_sparse_manifest
 from nanochat.token_cache import (
+    ensure_token_cache,
     iter_cached_token_batches,
     iter_document_text_batches,
     prepare_token_cache_writer,
     resolve_token_cache_dir,
-    token_cache_is_valid,
 )
 
 
@@ -48,43 +48,37 @@ def _iter_tokenized_document_batches(
     resume_state_dict,
     token_cache_dir,
     token_cache_shard_batches,
+    token_cache_workers,
 ):
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     bos_token = tokenizer.get_bos_token_id()
-    resolved_cache_dir = resolve_token_cache_dir(token_cache_dir)
-    cache_valid = token_cache_is_valid(
-        resolved_cache_dir,
-        split,
-        tokenizer=tokenizer,
-        tokenizer_batch_size=tokenizer_batch_size,
-        bos_token_id=bos_token,
-        ddp_world_size=ddp_world_size,
-    )
-    last_cached_state = None
-    if cache_valid:
-        for token_lists, state in iter_cached_token_batches(
+    if token_cache_dir is not None:
+        resolved_cache_dir = resolve_token_cache_dir(token_cache_dir)
+        ensure_token_cache(
+            resolved_cache_dir,
+            split,
+            tokenizer=tokenizer,
+            tokenizer_threads=tokenizer_threads,
+            tokenizer_batch_size=tokenizer_batch_size,
+            bos_token_id=bos_token,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+            shard_batch_count=token_cache_shard_batches,
+            num_workers=token_cache_workers,
+        )
+        yield from iter_cached_token_batches(
             resolved_cache_dir,
             split,
             resume_state_dict=resume_state_dict,
-        ):
-            last_cached_state = state
-            yield token_lists, state
-        live_resume_state = resume_state_dict if last_cached_state is None else last_cached_state
-    else:
-        live_resume_state = resume_state_dict
-    writer = prepare_token_cache_writer(
-        resolved_cache_dir,
-        split,
-        tokenizer=tokenizer,
-        tokenizer_batch_size=tokenizer_batch_size,
-        bos_token_id=bos_token,
-        ddp_world_size=ddp_world_size,
-        shard_batch_count=token_cache_shard_batches,
-    )
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+            repeat=True,
+        )
+        return
 
     live_text_batches = iter_document_text_batches(
         split,
-        live_resume_state,
+        resume_state_dict,
         tokenizer_batch_size,
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
@@ -114,12 +108,9 @@ def _iter_tokenized_document_batches(
             while prefetch_futures:
                 token_lists, state = prefetch_futures.popleft().result()
                 enqueue_prefetch(executor)
-                if writer is not None:
-                    writer.append(token_lists, state)
                 yield token_lists, state
     finally:
-        if writer is not None:
-            writer.close()
+        pass
 
 
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
@@ -129,8 +120,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     buffer_size=1000,
     return_active_vocab=False,
     vocab_size=None,
-    token_cache_dir="",
+    token_cache_dir=None,
     token_cache_shard_batches=256,
+    token_cache_workers=1,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -159,6 +151,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         resume_state_dict=resume_state_dict,
         token_cache_dir=token_cache_dir,
         token_cache_shard_batches=token_cache_shard_batches,
+        token_cache_workers=token_cache_workers,
     )
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1

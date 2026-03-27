@@ -117,6 +117,12 @@ parser.add_argument(
     default=256,
     help="number of tokenized document batches to store per cache shard",
 )
+parser.add_argument(
+    "--token-cache-workers",
+    type=int,
+    default=0,
+    help="number of worker processes to use when building a token cache (0 = auto)",
+)
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=5*524288, help="number of tokens to evaluate val loss on")
@@ -496,6 +502,7 @@ if args.sparse_mode:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+token_cache_workers = max(1, args.token_cache_workers) if args.token_cache_workers > 0 else max(1, min(8, os.cpu_count() or 1))
 if args.sparse_mode:
     if hybrid_sparse:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
@@ -510,6 +517,7 @@ if args.sparse_mode:
             include_local_batch=sparse_lm_head_clouds,
             token_cache_dir=args.token_cache_dir,
             token_cache_shard_batches=args.token_cache_shard_batches,
+            token_cache_workers=token_cache_workers,
         )
     else:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
@@ -522,6 +530,7 @@ if args.sparse_mode:
             vocab_size=vocab_size,
             token_cache_dir=args.token_cache_dir,
             token_cache_shard_batches=args.token_cache_shard_batches,
+            token_cache_workers=token_cache_workers,
         )
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
@@ -533,6 +542,7 @@ else:
         resume_state_dict=dataloader_resume_state_dict,
         token_cache_dir=args.token_cache_dir,
         token_cache_shard_batches=args.token_cache_shard_batches,
+        token_cache_workers=token_cache_workers,
     )
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
     tokenizer,
@@ -542,6 +552,7 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
     device=device,
     token_cache_dir=args.token_cache_dir,
     token_cache_shard_batches=args.token_cache_shard_batches,
+    token_cache_workers=token_cache_workers,
 )
 
 

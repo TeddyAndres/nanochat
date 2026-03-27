@@ -6,6 +6,7 @@ python -m scripts.build_sparse_manifest --num-iterations 2000 --grad-accum-steps
 """
 
 import argparse
+import os
 from pathlib import Path
 from typing import cast
 
@@ -56,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help="number of tokenized document batches to store per cache shard",
+    )
+    parser.add_argument(
+        "--token-cache-workers",
+        type=int,
+        default=0,
+        help="number of worker processes to use when building a token cache (0 = auto)",
     )
     parser.add_argument(
         "--shard-steps",
@@ -134,6 +141,7 @@ def main() -> None:
         vocab_size=vocab_size,
         token_cache_dir=args.token_cache_dir,
         token_cache_shard_batches=args.token_cache_shard_batches,
+        token_cache_workers=max(1, args.token_cache_workers) if args.token_cache_workers > 0 else max(1, min(8, os.cpu_count() or 1)),
     )
 
     print0(
