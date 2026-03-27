@@ -13,6 +13,7 @@ import subprocess
 import sys
 import os
 import argparse
+import shlex
 from datetime import datetime
 
 
@@ -46,7 +47,7 @@ from datetime import datetime
 
 def parse_cmd_string(cmd_str):
     """Parse a command string (like the one you'd paste into a shell) into args list."""
-    parts = cmd_str.split()
+    parts = shlex.split(cmd_str)
     # Strip leading "-m scripts.base_train" if present
     idx = 0
     while idx < len(parts) - 1:
@@ -67,7 +68,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -76,7 +77,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=100000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 100kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar" '
+            '--run \"sparse d12 65kvoc 2kseq 64batch 32aspect 100kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -96,7 +97,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -105,7 +106,7 @@ RUNS = [
             '--max-seq-len 4096 '
             '--device-batch-size=32 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 4kseq 32batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar" '
+            '--run \"sparse d12 65kvoc 4kseq 32batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
             '--sparse-manifest manifests/65kvocab_4kseq_32batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -125,7 +126,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -134,7 +135,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.010 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar" '
+            '--run \"sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.010 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -154,7 +155,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '  
             '--depth=12 '
@@ -163,7 +164,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.02 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar" '
+            '--run \"sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.02 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -183,7 +184,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -192,7 +193,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.38embedlr 0.027matrix 0.56scalar" '
+            '--run \"sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.38embedlr 0.027matrix 0.56scalar\" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -212,7 +213,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -221,7 +222,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.32embedlr 0.022matrix 0.45scalar" '
+            '--run "sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.32embedlr 0.022matrix 0.45scalar" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -241,7 +242,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -250,7 +251,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar 1.5coldbias" '
+            '--run \"sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar 1.5coldbias\" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '
@@ -270,7 +271,7 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode '
             '--window-pattern L '
-            '--fp8'
+            '--fp8 '
             '--token-cache-dir "" '
             '--token-cache-workers 8 '
             '--depth=12 '
@@ -279,7 +280,7 @@ RUNS = [
             '--max-seq-len 2048 '
             '--device-batch-size=64 '
             '--num-iterations=10000 '            
-            '--run="sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar 2.5coldbias" '
+            '--run \"sparse d12 65kvoc 2kseq 64batch 32aspect 10kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar 2.5coldbias\" '
             '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
             '--warmup-ratio 0.005 '
             '--warmdown-ratio 0.5 '

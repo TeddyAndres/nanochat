@@ -255,6 +255,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     include_local_batch=False,
     token_cache_dir="",
     token_cache_shard_batches=256,
+    token_cache_workers=1,
 ):
     """Manifest-driven sparse loader with fixed logical U slots.
 
@@ -303,6 +304,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         buffer_size=buffer_size,
         token_cache_dir=token_cache_dir,
         token_cache_shard_batches=token_cache_shard_batches,
+        token_cache_workers=token_cache_workers,
     )
 
     use_cuda = torch.device(device).type == "cuda"
