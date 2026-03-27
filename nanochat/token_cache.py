@@ -294,6 +294,7 @@ def prepare_token_cache_writer(
     shard_batch_count: int = 256,
 ) -> TokenCacheWriter | None:
     resolved_dir = resolve_token_cache_dir(cache_dir)
+    existing_metadata = load_token_cache_metadata(resolved_dir, split)
     if token_cache_is_valid(
         resolved_dir,
         split,
@@ -302,7 +303,7 @@ def prepare_token_cache_writer(
         bos_token_id=bos_token_id,
         ddp_world_size=ddp_world_size,
     ):
-        existing_metadata = load_token_cache_metadata(resolved_dir, split) or {}
+        existing_metadata = existing_metadata or {}
         existing_metadata.setdefault("next_shard_index", len(existing_metadata.get("shards", [])))
         existing_metadata.setdefault("num_batches", 0)
         existing_metadata.setdefault("num_docs", 0)
@@ -316,8 +317,12 @@ def prepare_token_cache_writer(
 
     split_dir = _cache_split_dir(resolved_dir, split)
     split_dir.mkdir(parents=True, exist_ok=True)
-    for stale_path in split_dir.glob("*.pt"):
-        stale_path.unlink()
+    existing_shards = sorted(split_dir.glob("*.pt"))
+    if existing_metadata is not None or existing_shards:
+        raise ValueError(
+            "Refusing to overwrite existing token cache contents because they are not compatible with the current run. "
+            f"Use a different --token-cache-dir or remove the cache manually if replacement is intentional: {split_dir}"
+        )
     metadata = {
         "version": TOKEN_CACHE_VERSION,
         "split": split,

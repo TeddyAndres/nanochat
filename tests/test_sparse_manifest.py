@@ -369,6 +369,7 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
     monkeypatch.setattr("nanochat.token_cache.iter_document_text_batches", fake_iter_document_text_batches)
     monkeypatch.setattr(dataloader_module, "iter_document_text_batches", fake_iter_document_text_batches)
     tokenizer = _FakeTokenizer()
+    live_cache_dir = tmp_path / "live-cache"
     live_loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
         tokenizer,
         2,
@@ -380,6 +381,8 @@ def test_loader_cache_path_matches_live_loader(tmp_path, monkeypatch):
         resume_state_dict=None,
         buffer_size=2,
         vocab_size=128,
+        token_cache_dir=live_cache_dir,
+        token_cache_shard_batches=2,
     )
     live_inputs, live_targets, live_active_ids, live_state = next(live_loader)
 
@@ -533,6 +536,38 @@ def test_loader_extends_existing_token_cache(tmp_path, monkeypatch):
     assert len(replayed) == 4
     assert [row.tolist() for row in replayed[0][0]] == tokenizer.encode(["aa"], prepend=99)
     assert [row.tolist() for row in replayed[3][0]] == tokenizer.encode(["dd"], prepend=99)
+
+
+def test_prepare_token_cache_writer_refuses_to_overwrite_incompatible_cache(tmp_path):
+    split_dir = tmp_path / "train"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = split_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "split": "train",
+                "tokenizer_batch_size": 128,
+                "vocab_size": 128,
+                "bos_token_id": 99,
+                "ddp_world_size": 1,
+                "shards": [{"path": "token_cache.00000.pt", "num_batches": 1}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (split_dir / "token_cache.00000.pt").write_bytes(b"placeholder")
+
+    with pytest.raises(ValueError, match="Refusing to overwrite existing token cache contents"):
+        dataloader_module.prepare_token_cache_writer(
+            tmp_path,
+            "train",
+            tokenizer=_FakeTokenizer(),
+            tokenizer_batch_size=64,
+            bos_token_id=99,
+            ddp_world_size=1,
+            shard_batch_count=1,
+        )
 
 
 def test_resolve_batch_geometry_defaults_to_one_microbatch():
