@@ -143,45 +143,49 @@ def load_cached_token_batches(cache_dir: str | Path, split: str) -> list[tuple[l
     return cached_batches
 
 
+def _iter_cached_token_batches_from_shards(
+    cache_dir: str | Path,
+    split: str,
+) -> Iterator[tuple[list[torch.Tensor], dict[str, int]]]:
+    metadata = load_token_cache_metadata(cache_dir, split)
+    if metadata is None:
+        return
+    split_dir = _cache_split_dir(cache_dir, split)
+    for shard_entry in metadata.get("shards", []):
+        shard_path = split_dir / str(shard_entry["path"])
+        payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+        for batch_payload in payload["batches"]:
+            yield _deserialize_token_batch(batch_payload)
+
+
 def iter_cached_token_batches(
     cache_dir: str | Path,
     split: str,
     *,
     resume_state_dict: dict | None = None,
 ) -> Iterator[tuple[list[torch.Tensor], dict[str, int]]]:
-    cached_batches = load_cached_token_batches(cache_dir, split)
-    if not cached_batches:
-        return
-
     resume_state = None if resume_state_dict is None else {
         key: int(value)
         for key, value in resume_state_dict.items()
         if key in {"pq_idx", "rg_idx", "epoch", "text_batch_index"}
     }
-    start_idx = 0
+    started = resume_state is None
     if resume_state is not None:
-        start_idx = len(cached_batches)
-        use_exact_batch_resume = "text_batch_index" in resume_state
         resume_epoch = int(resume_state.get("epoch", 1))
         resume_pq = int(resume_state.get("pq_idx", -1))
         resume_rg = int(resume_state.get("rg_idx", -1))
         resume_batch = int(resume_state.get("text_batch_index", -1))
-        for idx, (_, state) in enumerate(cached_batches):
+
+    for token_lists, state in _iter_cached_token_batches_from_shards(cache_dir, split):
+        if not started:
             state_epoch = int(state["epoch"])
             state_pq = int(state["pq_idx"])
             state_rg = int(state["rg_idx"])
             state_batch = int(state.get("text_batch_index", -1))
-            if use_exact_batch_resume and state == resume_state:
-                start_idx = idx
-                break
-            if (state_epoch, state_pq, state_rg, state_batch) > (resume_epoch, resume_pq, resume_rg, resume_batch):
-                start_idx = idx
-                break
-        if start_idx == len(cached_batches):
-            return
-
-    for idx in range(start_idx, len(cached_batches)):
-        yield cached_batches[idx]
+            if (state_epoch, state_pq, state_rg, state_batch) <= (resume_epoch, resume_pq, resume_rg, resume_batch):
+                continue
+            started = True
+        yield token_lists, state
 
 
 class TokenCacheWriter:
@@ -392,8 +396,10 @@ def iter_token_batches_from_cache(
     *,
     resume_state_dict: dict | None = None,
 ) -> Iterator[tuple[list[torch.Tensor], dict[str, int]]]:
-    cached_batches = load_cached_token_batches(cache_dir, split)
-    if not cached_batches:
+    iterator = iter_cached_token_batches(cache_dir, split, resume_state_dict=resume_state_dict)
+    try:
+        first_item = next(iterator)
+    except StopIteration:
         raise ValueError(f"Token cache for split='{split}' contains no batches")
-
-    yield from iter_cached_token_batches(cache_dir, split, resume_state_dict=resume_state_dict)
+    yield first_item
+    yield from iterator

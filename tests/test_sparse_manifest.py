@@ -339,6 +339,11 @@ def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch)
         shard_batch_count=1,
     )
 
+    def fail_if_materialized(cache_dir, split):
+        raise AssertionError("cache replay should stream shards instead of materializing the whole cache")
+
+    monkeypatch.setattr("nanochat.token_cache.load_cached_token_batches", fail_if_materialized)
+
     cached_iter = iter_token_batches_from_cache(tmp_path, "train")
     first_cached = next(cached_iter)
     second_cached = next(cached_iter)
