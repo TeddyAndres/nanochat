@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,6 +18,7 @@ from nanochat.sparse_manifest import (
     stream_sparse_manifest_steps,
     validate_sparse_manifest,
 )
+import nanochat.token_cache as token_cache_module
 from nanochat.token_cache import ensure_token_cache, iter_token_batches_from_cache, load_token_cache_metadata
 
 
@@ -568,6 +571,13 @@ def test_resolve_token_cache_dir_rejects_non_dataset_storage(tmp_path, monkeypat
 
     with pytest.raises(ValueError, match="dataset-side storage"):
         dataloader_module.resolve_token_cache_dir("/tmp/not-on-dataset-storage")
+
+
+def test_base_train_main_module_disables_spawn_workers(monkeypatch):
+    fake_main = SimpleNamespace(__file__="/home/teddy/Desktop/dev/repo/nanochat/scripts/base_train.py", __spec__=SimpleNamespace(name="scripts.base_train"))
+    monkeypatch.setitem(sys.modules, "__main__", fake_main)
+
+    assert token_cache_module._main_module_supports_spawn_workers() is False
 
 
 def test_resolve_batch_geometry_defaults_to_one_microbatch():

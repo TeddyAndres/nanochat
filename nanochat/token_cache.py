@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Iterator
 
@@ -36,6 +39,16 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _main_module_supports_spawn_workers() -> bool:
+    main_module = sys.modules.get("__main__")
+    main_file = getattr(main_module, "__file__", None)
+    main_spec = getattr(main_module, "__spec__", None)
+    main_name = None if main_spec is None else getattr(main_spec, "name", None)
+    if main_name == "scripts.base_train":
+        return False
+    return isinstance(main_file, str) and main_file != "<stdin>"
 
 
 def default_token_cache_dir() -> Path:
@@ -607,6 +620,11 @@ def ensure_token_cache(
             return _write_split_metadata(resolved_dir, split, metadata)
 
     worker_count = max(1, int(num_workers))
+    if worker_count > 1 and not _main_module_supports_spawn_workers():
+        print0(
+            "Token cache parallel workers are disabled for this Python entrypoint; falling back to serial cache build."
+        )
+        worker_count = 1
     print0(
         f"Building token cache for split='{split}' at {split_dir} "
         f"with {worker_count} worker{'s' if worker_count != 1 else ''} across {len(pending)} parquet file(s)"
@@ -635,10 +653,35 @@ def ensure_token_cache(
             )
             for pq_idx, filepath in pending
         ]
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(_build_parquet_cache_entry_worker, item) for item in work_items]
-            for future in as_completed(futures):
-                new_entries.append(future.result())
+        completed_pq_indices: set[int] = set()
+        try:
+            spawn_context = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=min(worker_count, len(work_items)),
+                mp_context=spawn_context,
+            ) as executor:
+                futures = [executor.submit(_build_parquet_cache_entry_worker, item) for item in work_items]
+                for future in as_completed(futures):
+                    entry = future.result()
+                    new_entries.append(entry)
+                    completed_pq_indices.add(int(entry["pq_idx"]))
+        except BrokenProcessPool:
+            remaining_pq_indices = {int(pq_idx) for pq_idx, _ in pending} - completed_pq_indices
+            print0(
+                "Token cache worker pool terminated unexpectedly; falling back to serial cache build for the remaining parquet files."
+            )
+            if remaining_pq_indices:
+                new_entries.extend(
+                    _build_serial_cache_entries(
+                        resolved_dir,
+                        split,
+                        tokenizer=tokenizer,
+                        tokenizer_threads=tokenizer_threads,
+                        tokenizer_batch_size=tokenizer_batch_size,
+                        bos_token_id=bos_token_id,
+                        pending_pq_indices=remaining_pq_indices,
+                    )
+                )
 
     with lock:
         metadata = load_token_cache_metadata(resolved_dir, split) or {
