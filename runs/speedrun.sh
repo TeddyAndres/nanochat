@@ -11,9 +11,19 @@
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
+set -euo pipefail
+
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
+
+cleanup() {
+    if [ -n "${DATASET_DOWNLOAD_PID:-}" ]; then
+        kill "$DATASET_DOWNLOAD_PID" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT INT TERM
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
@@ -68,6 +78,7 @@ python -m scripts.tok_eval
 # Base model (pretraining)
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
+unset DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 9.5)
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=9.5 --device-batch-size=16 --fp8 --run=$WANDB_RUN

@@ -14,6 +14,9 @@ import sys
 import os
 import argparse
 import shlex
+import signal
+import time
+import gc
 from datetime import datetime
 
 
@@ -318,6 +321,40 @@ def build_full_command(args):
     return [sys.executable, "-m", "scripts.base_train"] + args
 
 
+def _process_group_alive(process_group_id):
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _cleanup_process_group(process_group_id, *, run_name, reason, grace_seconds=5.0):
+    if process_group_id is None or not _process_group_alive(process_group_id):
+        return
+
+    print(f"Cleaning up process group for '{run_name}' ({reason})")
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.monotonic() + float(grace_seconds)
+    while time.monotonic() < deadline:
+        if not _process_group_alive(process_group_id):
+            return
+        time.sleep(0.1)
+
+    if _process_group_alive(process_group_id):
+        print(f"Escalating to SIGKILL for lingering processes in '{run_name}'")
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+
 def run_training(name, args, run_idx, total_runs):
     """Execute a single training run."""
     cmd = build_full_command(args)
@@ -329,16 +366,37 @@ def run_training(name, args, run_idx, total_runs):
     print()
 
     start_time = datetime.now()
+    process = None
+    process_group_id = None
 
     try:
-        result = subprocess.run(cmd, check=True, capture_output=False)
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        process_group_id = os.getpgid(process.pid)
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, cmd)
         elapsed = datetime.now() - start_time
+        _cleanup_process_group(process_group_id, run_name=name, reason="post-run cleanup")
+        gc.collect()
         print(f"\nCompleted successfully ({elapsed})")
         return True
     except subprocess.CalledProcessError as e:
         elapsed = datetime.now() - start_time
+        _cleanup_process_group(process_group_id, run_name=name, reason=f"exit code {e.returncode}")
+        gc.collect()
         print(f"\nFailed after {elapsed} (exit code {e.returncode})")
         return False
+    except KeyboardInterrupt:
+        elapsed = datetime.now() - start_time
+        _cleanup_process_group(process_group_id, run_name=name, reason="keyboard interrupt")
+        gc.collect()
+        print(f"\nInterrupted after {elapsed}")
+        raise
 
 
 def main():
@@ -380,13 +438,16 @@ def main():
     results = {}
     total = len(RUNS)
 
-    for i, run in enumerate(RUNS[args.start_from:], start=args.start_from + 1):
-        name = run.get("name", f"run_{i}")
-        success = run_training(name, run["args"], i, total)
-        results[name] = success
+    try:
+        for i, run in enumerate(RUNS[args.start_from:], start=args.start_from + 1):
+            name = run.get("name", f"run_{i}")
+            success = run_training(name, run["args"], i, total)
+            results[name] = success
 
-        if not success:
-            print(f"Warning: Training failed for run '{name}'")
+            if not success:
+                print(f"Warning: Training failed for run '{name}'")
+    except KeyboardInterrupt:
+        print("\nSweep interrupted by user")
 
     print(f"\n{'='*60}")
     print("SWEEP COMPLETED")
