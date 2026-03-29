@@ -1733,9 +1733,11 @@ class DynamicVocabRuntime:
         grad_accum_count = self._grad_accum_count
         live_count = int(grad_accum_ids_cpu.numel())
         live_slot_ids_cpu = torch.empty(0, dtype=torch.long)
+        live_global_ids_cpu = torch.empty(0, dtype=torch.long)
         live_union_row_ids_cpu = torch.empty(0, dtype=torch.long)
         live_union_mask_cpu = torch.zeros(grad_accum_count, dtype=torch.bool)
         live_lm_head_slot_ids_cpu = torch.empty(0, dtype=torch.long)
+        live_lm_head_global_ids_cpu = torch.empty(0, dtype=torch.long)
         live_lm_head_union_row_ids_cpu = torch.empty(0, dtype=torch.long)
         if self.fixed_u_mode and self._fixed_live_state:
             assert self.fixed_slot_to_global_cpu is not None
@@ -1860,6 +1862,14 @@ class DynamicVocabRuntime:
         d2h_launch_ms = 0.0
         d2h_sync_ms = 0.0
         cpu_writeback_ms = 0.0
+        if live_slot_ids_cpu.numel() > 0:
+            self._writeback_fixed_rows_(
+                live_global_ids_cpu,
+                live_slot_ids_cpu,
+                table_names=tuple(name for name in self.table_specs if name != "lm_head"),
+            )
+        if live_lm_head_slot_ids_cpu.numel() > 0:
+            self._writeback_fixed_lm_head_rows_(live_lm_head_global_ids_cpu, live_lm_head_slot_ids_cpu)
         writeback_id_chunks = [chunk["global_ids_cpu"] for chunk in self._grad_accum_non_live_chunks]
         if staged_non_live_grad_accum_ids_cpu.numel() > 0:
             writeback_id_chunks.append(staged_non_live_grad_accum_ids_cpu)
@@ -1919,16 +1929,19 @@ class DynamicVocabRuntime:
             self._pending_cpu_writeback_future = self._cpu_writeback_executor.submit(_write_segments_when_ready, ready_event, writeback_segments)
             self._pending_cpu_writeback_mask_cpu = pending_mask_cpu
         writeback_ms = (time.perf_counter() - t_writeback_start) * 1000.0
+        total_writeback_count = int(live_lm_head_global_ids_cpu.numel())
+        if total_writeback_count == 0:
+            total_writeback_count = int(writeback_ids_cpu.numel())
 
         metrics = DynamicVocabStep(
             active_ids_cpu=grad_accum_ids_cpu,
             active_vocab=None,
             optimizer_state=None,
             unique_count=int(grad_accum_ids_cpu.numel()),
-            live_count=live_count,
+            live_count=int(live_lm_head_slot_ids_cpu.numel()) if live_lm_head_slot_ids_cpu.numel() > 0 else live_count,
             u_capacity=self.grad_accum_u_max if self.grad_accum_u_max > 0 else int(grad_accum_ids_cpu.numel()),
             stage_count=int(self._grad_accum_stage_count),
-            writeback_count=int(writeback_ids_cpu.numel()),
+            writeback_count=total_writeback_count,
             grad_accum_flush_ms=flush_ms,
             grad_accum_queue_count=max(int(grad_accum_ids_cpu.numel()) - live_count, 0),
             grad_accum_stage_ms=stage_ms,

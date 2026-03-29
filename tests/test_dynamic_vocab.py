@@ -1235,7 +1235,6 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         value_embed.grad[slots1[2]] += 500
     runtime.accumulate_gradients(step1_ctx)
     metrics = runtime.apply_accumulated_gradients()
-    runtime.flush_active_to_cpu()
 
     assert metrics.grad_accum_queue_count == 1
     assert metrics.grad_accum_resident_count == 3
@@ -1268,6 +1267,8 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         reference_param = reference_runtime.table_specs[name]["param"]
         assert torch.allclose(runtime_param[union_ids_tensor], reference_param[union_ids_tensor])
         assert runtime.state[runtime_param]["step"] == reference_runtime.state[reference_param]["step"]
+
+    runtime.flush_active_to_cpu()
 
 
 def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
@@ -1331,7 +1332,7 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
     assert runtime._fixed_live_state
     assert runtime.fixed_slot_to_global_cpu is not None
     assert torch.equal(runtime.fixed_slot_to_global_cpu[:3], torch.tensor([9, 3, 7], dtype=torch.long))
-    assert metrics.live_count == 3
+    assert metrics.live_count == 4
     assert metrics.unique_count == 4
     assert metrics.u_capacity == 4
 
@@ -1485,6 +1486,6 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
     assert torch.equal(runtime.fixed_slot_to_global_cpu[:6], torch.tensor([3, 5, 0, 6, 10, 4], dtype=torch.long))
     assert metrics.grad_accum_queue_count == 3
     assert metrics.grad_accum_resident_count == 6
-    assert metrics.live_count == 6
+    assert metrics.live_count == 9
     assert metrics.unique_count == 9
     assert metrics.u_capacity == 12
