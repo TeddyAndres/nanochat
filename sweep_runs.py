@@ -72,78 +72,10 @@ RUNS = [
             '--sparse-mode --window-pattern L --fp8 '
             '--token-cache-dir "" --token-cache-workers 8 '
             '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
+            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=32 '
             '--num-iterations=5000 '            
-            '--run \"1of5 d6 65kvoc 2kseq 64batch 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0.005 --warmdown-ratio 0.5 '
-            '--embedding-lr 0.35 --unembedding-lr=0.015 --matrix-lr 0.025 --scalar-lr 0.54 '                 
-            '--sparse-cold-bias-scale 0 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 2500 '
-        ),
-    },
-    {
-        "name": "d6_65kvocab_5k_nocoldbias",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=5000 '            
-            '--run \"2of5 d6 65kvoc 2kseq 64batch 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0.005 --warmdown-ratio 0.5 '
-            '--embedding-lr 0.35 --unembedding-lr=0.015 --matrix-lr 0.025 --scalar-lr 0.54 '                 
-            '--sparse-cold-bias-scale 0 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 2500 '
-        ),
-    },
-    {
-        "name": "d6_65kvocab_5k_nocoldbias",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=5000 '            
-            '--run \"3of5 d6 65kvoc 2kseq 64batch 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0.005 --warmdown-ratio 0.5 '
-            '--embedding-lr 0.35 --unembedding-lr=0.015 --matrix-lr 0.025 --scalar-lr 0.54 '                 
-            '--sparse-cold-bias-scale 0 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 2500 '
-        ),
-    },
-    {
-        "name": "d6_65kvocab_5k_nocoldbias",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=5000 '            
-            '--run \"4of5 d6 65kvoc 2kseq 64batch 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0.005 --warmdown-ratio 0.5 '
-            '--embedding-lr 0.35 --unembedding-lr=0.015 --matrix-lr 0.025 --scalar-lr 0.54 '                 
-            '--sparse-cold-bias-scale 0 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 2500 '
-        ),
-    },
-    {
-        "name": "d6_65kvocab_5k_nocoldbias",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=5000 '            
-            '--run \"5of5 d6 65kvoc 2kseq 64batch 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
+            '--run \"d6 65kvoc 2kseq 32batch 2accum 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
+            '--sparse-manifest manifests/65kvocab_2kseq_32batch_2accum_5kstep.json '
             '--warmup-ratio 0.005 --warmdown-ratio 0.5 '
             '--embedding-lr 0.35 --unembedding-lr=0.015 --matrix-lr 0.025 --scalar-lr 0.54 '                 
             '--sparse-cold-bias-scale 0 '            

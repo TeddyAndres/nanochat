@@ -643,20 +643,38 @@ def capture_peak_memory_bytes():
 
 
 @torch.no_grad()
-def compute_global_grad_norm(optimizer):
+def iter_grad_params(optimizer, extra_params=None):
+    seen = set()
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            yield param
+    if extra_params is None:
+        return
+    for param in extra_params:
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+        yield param
+
+
+def compute_global_grad_norm(optimizer, extra_params=None):
     """Compute the global L2 norm of the averaged gradient without mutating optimizer grads."""
     total_sq = torch.tensor(0.0, dtype=torch.float64, device=device)
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    for group in optimizer.param_groups:
-        for param in group["params"]:
-            if param.grad is None:
-                continue
-            grad = param.grad.detach()
-            if world_size > 1:
-                grad = grad.float().clone()
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
-                grad /= world_size
-            total_sq += grad.float().pow(2).sum(dtype=torch.float64)
+    for param in iter_grad_params(optimizer, extra_params=extra_params):
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        if world_size > 1:
+            grad = grad.float().clone()
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            grad /= world_size
+        total_sq += grad.float().pow(2).sum(dtype=torch.float64)
     return total_sq.sqrt().item()
 
 # -----------------------------------------------------------------------------
@@ -935,14 +953,29 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    if args.sparse_mode:
+        dynamic_vocab.table_specs["wte"]["lr"] = sparse_embedding_lr * lrm
+        for name in dynamic_vocab.table_specs:
+            if name.startswith("value_embeds."):
+                dynamic_vocab.table_specs[name]["lr"] = sparse_value_embedding_lr * lrm
+        scheduled_unembedding_lr = sparse_unembedding_lr * lrm
+        if args.sparse_unembed_warmup_steps > 0:
+            warmup_scale = min(1.0, (step + 1) / args.sparse_unembed_warmup_steps)
+            scheduled_unembedding_lr *= warmup_scale
+        dynamic_vocab.table_specs["lm_head"]["lr"] = scheduled_unembedding_lr
+        warm_unembedding_lr = sparse_unembedding_lr if args.sparse_unembedding_warm_lr < 0.0 else args.sparse_unembedding_warm_lr * batch_lr_scale
+        cold_unembedding_lr = sparse_unembedding_lr if args.sparse_unembedding_cold_lr < 0.0 else args.sparse_unembedding_cold_lr * batch_lr_scale
+        dynamic_vocab.table_specs["lm_head"]["warm_lr"] = warm_unembedding_lr * lrm
+        dynamic_vocab.table_specs["lm_head"]["cold_lr"] = cold_unembedding_lr * lrm
     should_log_grad_norm = args.grad_norm_every > 0 and (step == 0 or step == num_iterations - 1 or step % args.grad_norm_every == 0)
     grad_norm = None
+    sparse_grad_params = None if not args.sparse_mode else dynamic_vocab.fixed_params.values()
     if scaler is not None:
         scaler.unscale_(optimizer)
         if should_log_grad_norm:
-            grad_norm = compute_global_grad_norm(optimizer)
+            grad_norm = compute_global_grad_norm(optimizer, extra_params=sparse_grad_params)
         if args.max_grad_norm > 0.0:
-            params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+            params_to_clip = [p for p in iter_grad_params(optimizer, extra_params=sparse_grad_params) if p.grad is not None]
             torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
@@ -954,15 +987,12 @@ while True:
         scaler.update()
     else:
         if should_log_grad_norm:
-            grad_norm = compute_global_grad_norm(optimizer)
+            grad_norm = compute_global_grad_norm(optimizer, extra_params=sparse_grad_params)
         if args.max_grad_norm > 0.0:
-            params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+            params_to_clip = [p for p in iter_grad_params(optimizer, extra_params=sparse_grad_params) if p.grad is not None]
             torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
         optimizer.step()
     if args.sparse_mode:
-        if args.sparse_unembed_warmup_steps > 0:
-            warmup_scale = min(1.0, (step + 1) / args.sparse_unembed_warmup_steps)
-            dynamic_vocab.table_specs["lm_head"]["lr"] = sparse_unembedding_lr * warmup_scale
         if grad_accum_steps > 1:
             sparse_apply_t0 = time.perf_counter()
             sparse_metrics = dynamic_vocab.apply_accumulated_gradients()
