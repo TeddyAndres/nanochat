@@ -205,6 +205,9 @@ class DynamicVocabRuntime:
         self._grad_accum_stage_count = 0
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
+        self._grad_accum_cached_lm_head_cold_bias_cpu = None
+        self._grad_accum_cached_lm_head_cold_bias_clamped_count = 0
+        self._grad_accum_cached_lm_head_cold_bias_abs_max = 0.0
         self._grad_accum_pending_transfers = []
         self._grad_accum_transfer_stream = torch.cuda.Stream(device=self.device) if self.use_cuda else None
         self._cpu_writeback_executor = ThreadPoolExecutor(max_workers=1)
@@ -845,6 +848,9 @@ class DynamicVocabRuntime:
         self._grad_accum_live = False
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
+        self._grad_accum_cached_lm_head_cold_bias_cpu = None
+        self._grad_accum_cached_lm_head_cold_bias_clamped_count = 0
+        self._grad_accum_cached_lm_head_cold_bias_abs_max = 0.0
 
     def _ensure_grad_accum_buffers(self, capacity: int) -> None:
         needs_new = self._grad_accum_buffers is None
@@ -955,6 +961,9 @@ class DynamicVocabRuntime:
         self._grad_accum_stage_count = 0
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = torch.zeros(grad_accum_count, dtype=torch.bool)
+        self._grad_accum_cached_lm_head_cold_bias_cpu = None
+        self._grad_accum_cached_lm_head_cold_bias_clamped_count = 0
+        self._grad_accum_cached_lm_head_cold_bias_abs_max = 0.0
 
     def _cache_grad_accum_leaving_rows_(
         self,
@@ -1188,9 +1197,16 @@ class DynamicVocabRuntime:
     def _stage_rows_to_gpu(self, cpu_tensor_map):
         gpu_tensor_map = {}
         for name, tensor in cpu_tensor_map.items():
-            staged = tensor.pin_memory() if self.use_cuda else tensor
-            gpu_tensor_map[name] = staged.to(self.device, non_blocking=self.use_cuda)
+            gpu_tensor_map[name] = self._stage_cpu_tensor_to_device(name, tensor)
         return gpu_tensor_map
+
+    def _stage_cpu_tensor_to_device(self, name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        cpu_tensor = cpu_tensor.detach()
+        if not self.use_cuda:
+            return cpu_tensor.to(self.device)
+        stage_buffer = self._get_cpu_receive_buffer(f"stage:{name}", tuple(cpu_tensor.shape), cpu_tensor.dtype)
+        stage_buffer.copy_(cpu_tensor)
+        return stage_buffer.to(self.device, non_blocking=True)
 
     def _get_cpu_receive_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype):
         buffer = self._cpu_receive_buffers.get(name)
@@ -1289,17 +1305,6 @@ class DynamicVocabRuntime:
         warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
-        if grad_accum_steps > 1:
-            lm_head_last_seen_cpu = self.last_seen_step_cpu.index_select(0, grad_accum_ids_cpu)
-            lm_head_cold_steps_cpu = (self.runtime_step - lm_head_last_seen_cpu - 1).clamp_min(0)
-            lm_head_cold_steps_cpu.masked_fill_(lm_head_last_seen_cpu < 0, 0)
-        else:
-            lm_head_cold_steps_cpu = cold_steps_cpu
-        cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
-            lm_head_cold_steps_cpu,
-            cold_bias_scale=cold_bias_scale,
-            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-        )
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
         manifest_fixed_u_max = int(slot_to_global_cpu.numel())
@@ -1401,6 +1406,27 @@ class DynamicVocabRuntime:
             torch.equal(self._grad_accum_ids_cpu, grad_accum_ids_cpu)
         )
 
+        if grad_accum_steps > 1 and preserve_resident_grads and self._grad_accum_cached_lm_head_cold_bias_cpu is not None:
+            cold_logit_bias_cpu = self._grad_accum_cached_lm_head_cold_bias_cpu
+            cold_bias_clamped_count = self._grad_accum_cached_lm_head_cold_bias_clamped_count
+            cold_bias_abs_max = self._grad_accum_cached_lm_head_cold_bias_abs_max
+        else:
+            if grad_accum_steps > 1:
+                lm_head_last_seen_cpu = self.last_seen_step_cpu.index_select(0, grad_accum_ids_cpu)
+                lm_head_cold_steps_cpu = (self.runtime_step - lm_head_last_seen_cpu - 1).clamp_min(0)
+                lm_head_cold_steps_cpu.masked_fill_(lm_head_last_seen_cpu < 0, 0)
+            else:
+                lm_head_cold_steps_cpu = cold_steps_cpu
+            cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
+                lm_head_cold_steps_cpu,
+                cold_bias_scale=cold_bias_scale,
+                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+            )
+            if grad_accum_steps > 1:
+                self._grad_accum_cached_lm_head_cold_bias_cpu = cold_logit_bias_cpu
+                self._grad_accum_cached_lm_head_cold_bias_clamped_count = cold_bias_clamped_count
+                self._grad_accum_cached_lm_head_cold_bias_abs_max = cold_bias_abs_max
+
         required_cpu_ids = []
         if stage_ids_cpu.numel() > 0:
             required_cpu_ids.append(stage_ids_cpu)
@@ -1442,40 +1468,52 @@ class DynamicVocabRuntime:
             rows = param.index_select(0, stage_ids_for_name)
             exp_avg = state["exp_avg"].index_select(0, stage_ids_for_name)
             exp_avg_sq = state["exp_avg_sq"].index_select(0, stage_ids_for_name)
-            rows_gpu = rows.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else rows.to(self.device)
-            exp_avg_gpu = exp_avg.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg.to(self.device)
-            exp_avg_sq_gpu = exp_avg_sq.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg_sq.to(self.device)
+            stage_suffix = f"fixed:{grad_accum_micro_step}:{name}"
+            rows_gpu = self._stage_cpu_tensor_to_device(f"{stage_suffix}:param", rows)
+            exp_avg_gpu = self._stage_cpu_tensor_to_device(f"{stage_suffix}:exp_avg", exp_avg)
+            exp_avg_sq_gpu = self._stage_cpu_tensor_to_device(f"{stage_suffix}:exp_avg_sq", exp_avg_sq)
             self.fixed_params[name].data.index_copy_(0, stage_slot_ids_device, rows_gpu)
             self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
             self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
 
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
-        self.fixed_lm_head_slot_to_global_cpu.fill_(-1)
         if grad_accum_steps > 1:
-            self.fixed_lm_head_slot_to_global_cpu[:grad_accum_ids_cpu.numel()].copy_(grad_accum_ids_cpu)
+            if not preserve_resident_grads:
+                self.fixed_lm_head_slot_to_global_cpu.fill_(-1)
+                self.fixed_lm_head_slot_to_global_cpu[:grad_accum_ids_cpu.numel()].copy_(grad_accum_ids_cpu)
         else:
+            self.fixed_lm_head_slot_to_global_cpu.fill_(-1)
             self.fixed_lm_head_slot_to_global_cpu[:self.fixed_u_max].copy_(slot_to_global_cpu)
         if grad_accum_steps == 1 and cloud_ids_cpu.numel() > 0:
             self.fixed_lm_head_slot_to_global_cpu.index_copy_(0, cloud_slot_ids_cpu, cloud_ids_cpu)
         self.fixed_active_mask_cpu.copy_(active_mask_cpu)
         use_logit_mask = (grad_accum_steps > 1) or (lm_head_active_ids_cpu.numel() < self.lm_head_u_max)
         if use_logit_mask:
-            self.fixed_logit_mask.zero_()
             if grad_accum_steps > 1:
-                if grad_accum_ids_cpu.numel() > 0:
-                    self.fixed_logit_mask[:grad_accum_ids_cpu.numel()].fill_(True)
+                if not preserve_resident_grads:
+                    self.fixed_logit_mask.zero_()
+                    if grad_accum_ids_cpu.numel() > 0:
+                        self.fixed_logit_mask[:grad_accum_ids_cpu.numel()].fill_(True)
             else:
+                self.fixed_logit_mask.zero_()
                 self.fixed_logit_mask[:self.fixed_u_max].copy_(active_mask_cpu.to(self.device, non_blocking=self.use_cuda))
             if grad_accum_steps == 1 and cloud_slot_ids_cpu.numel() > 0:
                 cloud_slot_ids_device = cloud_slot_ids_cpu.to(self.device)
                 self.fixed_logit_mask.index_fill_(0, cloud_slot_ids_device, True)
         use_cold_logit_bias = cold_bias_scale > 0.0
         if use_cold_logit_bias:
-            self.fixed_cold_logit_bias.zero_()
-            bias_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long) if grad_accum_steps > 1 else active_slot_ids_cpu
-            if bias_slot_ids_cpu.numel() > 0:
-                bias_slot_ids_device = bias_slot_ids_cpu.to(self.device)
-                self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
+            if grad_accum_steps > 1:
+                if not preserve_resident_grads:
+                    self.fixed_cold_logit_bias.zero_()
+                    bias_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+                    if bias_slot_ids_cpu.numel() > 0:
+                        bias_slot_ids_device = bias_slot_ids_cpu.to(self.device)
+                        self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
+            else:
+                self.fixed_cold_logit_bias.zero_()
+                if active_slot_ids_cpu.numel() > 0:
+                    bias_slot_ids_device = active_slot_ids_cpu.to(self.device)
+                    self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
         self._fixed_live_state = True
 
         union_targets = None
@@ -1862,15 +1900,17 @@ class DynamicVocabRuntime:
         d2h_launch_ms = 0.0
         d2h_sync_ms = 0.0
         cpu_writeback_ms = 0.0
-        if live_slot_ids_cpu.numel() > 0:
-            self._writeback_fixed_rows_(
-                live_global_ids_cpu,
-                live_slot_ids_cpu,
-                table_names=tuple(name for name in self.table_specs if name != "lm_head"),
+        live_writeback_ids_cpu = torch.empty(0, dtype=torch.long)
+        if live_global_ids_cpu.numel() > 0 or live_lm_head_global_ids_cpu.numel() > 0:
+            live_writeback_ids_cpu = torch.cat(
+                tuple(
+                    ids for ids in (live_global_ids_cpu, live_lm_head_global_ids_cpu)
+                    if ids.numel() > 0
+                )
             )
-        if live_lm_head_slot_ids_cpu.numel() > 0:
-            self._writeback_fixed_lm_head_rows_(live_lm_head_global_ids_cpu, live_lm_head_slot_ids_cpu)
         writeback_id_chunks = [chunk["global_ids_cpu"] for chunk in self._grad_accum_non_live_chunks]
+        if live_writeback_ids_cpu.numel() > 0:
+            writeback_id_chunks.insert(0, live_writeback_ids_cpu)
         if staged_non_live_grad_accum_ids_cpu.numel() > 0:
             writeback_id_chunks.append(staged_non_live_grad_accum_ids_cpu)
         if writeback_id_chunks:
@@ -1878,9 +1918,40 @@ class DynamicVocabRuntime:
         else:
             writeback_ids_cpu = torch.empty(0, dtype=torch.long)
         if writeback_ids_cpu.numel() > 0:
-            self._flush_pending_cpu_writeback()
+            self._flush_pending_cpu_writeback(writeback_ids_cpu)
             t_d2h_launch_start = time.perf_counter()
             writeback_segments = []
+            if live_slot_ids_cpu.numel() > 0:
+                live_slot_ids_device = live_slot_ids_cpu.to(self.device)
+                for name in self.table_specs:
+                    if name == "lm_head":
+                        continue
+                    param = self.table_specs[name]["param"]
+                    state = self.state[param]
+                    row_source = self.fixed_params[name].detach().index_select(0, live_slot_ids_device)
+                    exp_avg_source = self.fixed_optimizer_state[name]["exp_avg"].detach().index_select(0, live_slot_ids_device)
+                    exp_avg_sq_source = self.fixed_optimizer_state[name]["exp_avg_sq"].detach().index_select(0, live_slot_ids_device)
+                    row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}:live", tuple(row_source.shape), row_source.dtype)
+                    exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}:live", tuple(exp_avg_source.shape), exp_avg_source.dtype)
+                    exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}:live", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
+                    row_buffer.copy_(row_source, non_blocking=self.use_cuda)
+                    exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
+                    exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
+                    writeback_segments.append((name, param, state, live_global_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
+            if live_lm_head_slot_ids_cpu.numel() > 0:
+                live_lm_head_slot_ids_device = live_lm_head_slot_ids_cpu.to(self.device)
+                param = self.table_specs["lm_head"]["param"]
+                state = self.state[param]
+                row_source = self.fixed_params["lm_head"].detach().index_select(0, live_lm_head_slot_ids_device)
+                exp_avg_source = self.fixed_optimizer_state["lm_head"]["exp_avg"].detach().index_select(0, live_lm_head_slot_ids_device)
+                exp_avg_sq_source = self.fixed_optimizer_state["lm_head"]["exp_avg_sq"].detach().index_select(0, live_lm_head_slot_ids_device)
+                row_buffer = self._get_cpu_receive_buffer("rows:accum:lm_head:live", tuple(row_source.shape), row_source.dtype)
+                exp_avg_buffer = self._get_cpu_receive_buffer("exp_avg:accum:lm_head:live", tuple(exp_avg_source.shape), exp_avg_source.dtype)
+                exp_avg_sq_buffer = self._get_cpu_receive_buffer("exp_avg_sq:accum:lm_head:live", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
+                row_buffer.copy_(row_source, non_blocking=self.use_cuda)
+                exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
+                exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
+                writeback_segments.append(("lm_head", param, state, live_lm_head_global_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
             for name, spec in self.table_specs.items():
                 param = spec["param"]
                 state = self.state[param]
