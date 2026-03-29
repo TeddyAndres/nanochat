@@ -1168,14 +1168,20 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
     step0_ctx = runtime.prepare_step(step0)
     slots0 = step0_ctx.active_slot_ids_cpu
     assert slots0 is not None
+    assert step0_ctx.lm_head_active_ids_cpu is not None
+    assert step0_ctx.lm_head_active_slot_ids_cpu is not None
+    lm_head_slots0 = {
+        int(token_id): int(slot_id)
+        for token_id, slot_id in zip(step0_ctx.lm_head_active_ids_cpu.tolist(), step0_ctx.lm_head_active_slot_ids_cpu.tolist())
+    }
     step0_ctx.active_vocab["wte"].grad = torch.zeros_like(step0_ctx.active_vocab["wte"])
     step0_ctx.active_vocab["wte"].grad[slots0[0]] = 1
     step0_ctx.active_vocab["wte"].grad[slots0[1]] = 2
     step0_ctx.active_vocab["wte"].grad[slots0[2]] = 3
     step0_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step0_ctx.active_vocab["lm_head"])
-    step0_ctx.active_vocab["lm_head"].grad[slots0[0]] = 10
-    step0_ctx.active_vocab["lm_head"].grad[slots0[1]] = 20
-    step0_ctx.active_vocab["lm_head"].grad[slots0[2]] = 30
+    step0_ctx.active_vocab["lm_head"].grad[lm_head_slots0[1]] = 10
+    step0_ctx.active_vocab["lm_head"].grad[lm_head_slots0[3]] = 20
+    step0_ctx.active_vocab["lm_head"].grad[lm_head_slots0[7]] = 30
     for value_embed in step0_ctx.active_vocab["value_embeds"].values():
         value_embed.grad = torch.zeros_like(value_embed)
         value_embed.grad[slots0[0]] = 100
@@ -1208,14 +1214,20 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
     step1_ctx = runtime.prepare_step(step1)
     slots1 = step1_ctx.active_slot_ids_cpu
     assert slots1 is not None
+    assert step1_ctx.lm_head_active_ids_cpu is not None
+    assert step1_ctx.lm_head_active_slot_ids_cpu is not None
+    lm_head_slots1 = {
+        int(token_id): int(slot_id)
+        for token_id, slot_id in zip(step1_ctx.lm_head_active_ids_cpu.tolist(), step1_ctx.lm_head_active_slot_ids_cpu.tolist())
+    }
     assert step1_ctx.active_vocab["wte"].grad is not None
     step1_ctx.active_vocab["wte"].grad[slots1[0]] += 6
     step1_ctx.active_vocab["wte"].grad[slots1[1]] += 4
     step1_ctx.active_vocab["wte"].grad[slots1[2]] += 5
     assert step1_ctx.active_vocab["lm_head"].grad is not None
-    step1_ctx.active_vocab["lm_head"].grad[slots1[0]] += 60
-    step1_ctx.active_vocab["lm_head"].grad[slots1[1]] += 40
-    step1_ctx.active_vocab["lm_head"].grad[slots1[2]] += 50
+    step1_ctx.active_vocab["lm_head"].grad[lm_head_slots1[9]] += 60
+    step1_ctx.active_vocab["lm_head"].grad[lm_head_slots1[3]] += 40
+    step1_ctx.active_vocab["lm_head"].grad[lm_head_slots1[7]] += 50
     for value_embed in step1_ctx.active_vocab["value_embeds"].values():
         assert value_embed.grad is not None
         value_embed.grad[slots1[0]] += 600
@@ -1403,6 +1415,12 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
             micro["slot_to_global"].index(token_id): token_id
             for token_id in micro["active_ids"]
         }
+        assert step_ctx.lm_head_active_ids_cpu is not None
+        assert step_ctx.lm_head_active_slot_ids_cpu is not None
+        lm_head_slot_by_token = {
+            int(token_id): int(slot_id)
+            for token_id, slot_id in zip(step_ctx.lm_head_active_ids_cpu.tolist(), step_ctx.lm_head_active_slot_ids_cpu.tolist())
+        }
         for name, param in runtime.fixed_params.items():
             if param.grad is None:
                 param.grad = torch.zeros_like(param)
@@ -1411,7 +1429,8 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
                 scale = 100.0
             for slot_id in step_ctx.active_slot_ids_cpu.tolist():
                 token_id = token_by_slot[slot_id]
-                param.grad[slot_id] += scale * (token_id + 1) * (micro_idx + 1) / len(microsteps)
+                target_slot_id = lm_head_slot_by_token[token_id] if name == "lm_head" else slot_id
+                param.grad[target_slot_id] += scale * (token_id + 1) * (micro_idx + 1) / len(microsteps)
         runtime.accumulate_gradients(step_ctx)
 
     metrics = runtime.apply_accumulated_gradients()

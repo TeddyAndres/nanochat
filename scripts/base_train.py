@@ -898,7 +898,8 @@ while True:
             )
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_metrics = sparse_step_ctx
-            loss = model(x, y, active_vocab=sparse_step_ctx.active_vocab, logit_scale=args.sparse_logit_scale)
+            y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
+            loss = model(x, y_for_loss, active_vocab=sparse_step_ctx.active_vocab, logit_scale=args.sparse_logit_scale)
         else:
             loss = model(x, y)
         micro_loss = loss.detach()

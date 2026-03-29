@@ -421,10 +421,19 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         grad_accum_ids_cpu = active_ids_cpu.clone()
         accum_steps = 1
         micro_step_index = 0
+        targets_union_cpu_local = None
         if manifest_version >= 2:
             grad_accum_ids_cpu = torch.tensor(current_step_entry["grad_accum_active_ids"], dtype=torch.long)
             accum_steps = len(current_microsteps)
             micro_step_index = current_micro_idx
+            grad_accum_global_to_slot = torch.full((vocab_size,), -1, dtype=torch.long)
+            if grad_accum_ids_cpu.numel() > 0:
+                grad_accum_global_to_slot[grad_accum_ids_cpu] = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+            targets_union_cpu_local = grad_accum_global_to_slot[slot_to_global.index_select(0, cpu_targets.reshape(-1))].view_as(cpu_targets)
+            if (targets_union_cpu_local < 0).any():
+                raise ValueError(
+                    f"Sparse manifest mismatch at step {manifest_step}: grad-accum union is missing target tokens"
+                )
 
         step_meta = {
             "mode": "fixed-u",
@@ -445,6 +454,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         if include_local_batch:
             step_meta["inputs_cpu_local"] = cpu_inputs.clone()
             step_meta["targets_cpu_local"] = cpu_targets.clone()
+            if targets_union_cpu_local is not None:
+                step_meta["targets_union_cpu_local"] = targets_union_cpu_local.clone()
 
         state_dict = dict(base_state_dict)
         state_dict["manifest_step"] = manifest_step
