@@ -320,6 +320,82 @@ def test_sparse_manifest_streams_across_shards(tmp_path):
     assert list(stream_sparse_manifest_steps(manifest_path, start_step=1)) == steps[1:]
 
 
+def test_manifest_loader_emits_union_targets_without_local_batch_payload(tmp_path, monkeypatch):
+    steps = [
+        {
+            "step": 0,
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [1, 2, 3, 4],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "u_size": 3,
+                    "active_ids": [1, 2, 3],
+                    "next_common_ids": [2, 3],
+                    "next_leaving_ids": [1],
+                    "next_new_ids": [4],
+                },
+                {
+                    "microstep": 1,
+                    "u_size": 3,
+                    "active_ids": [2, 3, 4],
+                    "next_common_ids": [],
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                },
+            ],
+        },
+    ]
+    payload = build_manifest_payload(
+        split="train",
+        vocab_size=16,
+        device_batch_size=1,
+        max_seq_len=2,
+        total_batch_size=4,
+        grad_accum_steps=2,
+        ddp_world_size=1,
+        num_iterations=1,
+        buffer_size=4,
+        steps=steps,
+    )
+    manifest_path = tmp_path / "manifest_v2.json"
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+    def fake_base_loader(*args, **kwargs):
+        yield torch.tensor([[1, 2]], dtype=torch.long), torch.tensor([[2, 3]], dtype=torch.long), {"pq_idx": 0, "rg_idx": 0, "epoch": 0}
+        yield torch.tensor([[2, 3]], dtype=torch.long), torch.tensor([[3, 4]], dtype=torch.long), {"pq_idx": 1, "rg_idx": 0, "epoch": 0}
+
+    monkeypatch.setattr(
+        dataloader_module,
+        "tokenizing_distributed_data_loader_with_state_bos_bestfit",
+        fake_base_loader,
+    )
+
+    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
+        tokenizer=None,
+        B=1,
+        T=2,
+        split="train",
+        manifest_path=manifest_path,
+        device="cpu",
+        vocab_size=16,
+        include_local_batch=False,
+    )
+
+    _, targets0, step_meta0, _ = next(loader)
+    targets0 = targets0.clone()
+    step_meta0 = dict(step_meta0)
+    _, targets1, step_meta1, _ = next(loader)
+    targets1 = targets1.clone()
+    step_meta1 = dict(step_meta1)
+
+    assert torch.equal(targets0, torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(step_meta0["targets_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(targets1, torch.tensor([[2, 0]], dtype=torch.long))
+    assert torch.equal(step_meta1["targets_union_cpu_local"], torch.tensor([[2, 3]], dtype=torch.long))
+
+
 def test_token_cache_roundtrip_matches_live_token_batches(tmp_path, monkeypatch):
     fake_batches = [
         (["aa", "bbb"], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),

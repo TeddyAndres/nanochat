@@ -454,8 +454,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         if include_local_batch:
             step_meta["inputs_cpu_local"] = cpu_inputs.clone()
             step_meta["targets_cpu_local"] = cpu_targets.clone()
-            if targets_union_cpu_local is not None:
-                step_meta["targets_union_cpu_local"] = targets_union_cpu_local.clone()
+        if targets_union_cpu_local is not None:
+            step_meta["targets_union_cpu_local"] = targets_union_cpu_local.clone()
 
         state_dict = dict(base_state_dict)
         state_dict["manifest_step"] = manifest_step
