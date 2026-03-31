@@ -286,7 +286,7 @@ class DynamicVocabRuntime:
             state["exp_avg"].copy_(table_state["exp_avg"].to("cpu"))
             state["exp_avg_sq"].copy_(table_state["exp_avg_sq"].to("cpu"))
 
-    def _capture_cold_steps_cpu(self, active_ids_cpu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _peek_cold_steps_and_hot_counts_cpu(self, active_ids_cpu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         if active_ids_cpu.numel() == 0:
             return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
@@ -294,6 +294,13 @@ class DynamicVocabRuntime:
         hot_activation_counts_cpu = self.hot_activation_count_cpu.index_select(0, active_ids_cpu)
         cold_steps_cpu = (self.runtime_step - last_seen - 1).clamp_min_(0)
         cold_steps_cpu.masked_fill_(last_seen < 0, 0)
+        return cold_steps_cpu, hot_activation_counts_cpu
+
+    def _capture_cold_steps_cpu(self, active_ids_cpu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        cold_steps_cpu, hot_activation_counts_cpu = self._peek_cold_steps_and_hot_counts_cpu(active_ids_cpu)
+        if active_ids_cpu.numel() == 0:
+            return cold_steps_cpu, hot_activation_counts_cpu
         self.last_seen_step_cpu.index_fill_(0, active_ids_cpu, self.runtime_step)
         self.hot_activation_count_cpu.index_copy_(0, active_ids_cpu, hot_activation_counts_cpu + 1)
         return cold_steps_cpu, hot_activation_counts_cpu
@@ -1304,6 +1311,15 @@ class DynamicVocabRuntime:
         union_targets_cpu_local = step_meta.get("targets_union_cpu_local")
         warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
+        preserve_resident_grads = (
+            grad_accum_steps > 1 and
+            self._grad_accum_live and
+            self._grad_accum_ids_cpu is not None and
+            torch.equal(self._grad_accum_ids_cpu, grad_accum_ids_cpu)
+        )
+        lm_head_cold_steps_cpu = self._empty_long_cpu()
+        if grad_accum_steps > 1 and not preserve_resident_grads:
+            lm_head_cold_steps_cpu, _ = self._peek_cold_steps_and_hot_counts_cpu(grad_accum_ids_cpu)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
@@ -1399,22 +1415,14 @@ class DynamicVocabRuntime:
             cloud_stage_ids_cpu = cloud_ids_cpu
             cloud_stage_slot_ids_cpu = cloud_slot_ids_cpu
 
-        preserve_resident_grads = (
-            grad_accum_steps > 1 and
-            self._grad_accum_live and
-            self._grad_accum_ids_cpu is not None and
-            torch.equal(self._grad_accum_ids_cpu, grad_accum_ids_cpu)
-        )
-
         if grad_accum_steps > 1 and preserve_resident_grads and self._grad_accum_cached_lm_head_cold_bias_cpu is not None:
             cold_logit_bias_cpu = self._grad_accum_cached_lm_head_cold_bias_cpu
             cold_bias_clamped_count = self._grad_accum_cached_lm_head_cold_bias_clamped_count
             cold_bias_abs_max = self._grad_accum_cached_lm_head_cold_bias_abs_max
         else:
             if grad_accum_steps > 1:
-                lm_head_last_seen_cpu = self.last_seen_step_cpu.index_select(0, grad_accum_ids_cpu)
-                lm_head_cold_steps_cpu = (self.runtime_step - lm_head_last_seen_cpu - 1).clamp_min(0)
-                lm_head_cold_steps_cpu.masked_fill_(lm_head_last_seen_cpu < 0, 0)
+                if preserve_resident_grads or lm_head_cold_steps_cpu.numel() == 0:
+                    lm_head_cold_steps_cpu, _ = self._peek_cold_steps_and_hot_counts_cpu(grad_accum_ids_cpu)
             else:
                 lm_head_cold_steps_cpu = cold_steps_cpu
             cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(

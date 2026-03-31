@@ -66,20 +66,20 @@ def parse_cmd_string(cmd_str):
 # ============================================================
 RUNS = [
     {
-        "name": "d6_65kvocab_5k_nocoldbias",
+        "name": "d12_65kvocab_10k_nocoldbias",
         "args": parse_cmd_string(
             '-m scripts.base_train '
             '--sparse-mode --window-pattern L --fp8 '
             '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=32 '
-            '--num-iterations=5000 '            
-            '--run \"d6 65kvoc 2kseq 32batch 2accum 64aspect 5kstep unembedlr0.015 0.005warmup 0.5warmdown 0.35embedlr 0.025matrix 0.54scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_32batch_2accum_5kstep.json '
-            '--warmup-ratio 0.005 --warmdown-ratio 0.5 '
-            '--embedding-lr 0.35 --unembedding-lr=0.015 --matrix-lr 0.025 --scalar-lr 0.54 '                 
-            '--sparse-cold-bias-scale 0 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 2500 '
+            '--depth=12 --aspect-ratio 128 '
+            '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
+            '--num-iterations=10000 '            
+            '--run \"d12 65kvoc 2kseq 16batch 8accum 128aspect 10kstep unembedlr0.01 0.001warmup 0.6warmdown 0.2embedlr 0.01matrix 0.27scalar\" '
+            '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
+            '--warmup-ratio 0.001 --warmdown-ratio 0.6 '
+            '--embedding-lr 0.2 --unembedding-lr=0.01 --matrix-lr 0.01 --scalar-lr 0.27 '                 
+            '--sparse-cold-bias-scale 2 '            
+            '--log-every 10 --eval-every 250 --core-metric-every 2500 '
         ),
     },
     # Add more runs below:

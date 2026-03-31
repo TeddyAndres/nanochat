@@ -3,6 +3,7 @@ Build a sparse-manifest JSON for hybrid fixed-U sparse training.
 
 Example:
 python -m scripts.build_sparse_manifest --num-iterations 2000 --grad-accum-steps 1 --output manifests/d6_sparse.json
+python -m scripts.build_sparse_manifest --num-iterations 2000 --grad-accum-steps 4 --output manifests/65kvocab_2kseq_16batch_4accum_2kstep.json --token-cache-dir "" --token-cache-workers 8 --device-batch-size 16
 """
 
 import argparse
