@@ -1054,7 +1054,7 @@ def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
     assert torch.allclose(cold_bias[[0, 2, 4, 5]], torch.zeros(4), atol=1e-6)
 
 
-def test_fixed_u_grad_accum_cold_bias_uses_window_entry_age_once():
+def test_fixed_u_grad_accum_cold_bias_only_applies_on_first_microstep_appearance():
     runtime = DynamicVocabRuntime(
         build_tiny_model(vocab_size=8),
         device="cpu",
@@ -1066,19 +1066,19 @@ def test_fixed_u_grad_accum_cold_bias_uses_window_entry_age_once():
         cold_bias_reference_tokens=8,
     )
 
-    first = build_fixed_step_meta(
-        slot_to_global=[0, -1, -1, -1],
-        stage_slots=[0],
-        stage_ids=[0],
-        writeback_slots=[0],
-        writeback_ids=[0],
+    warm_both = build_fixed_step_meta(
+        slot_to_global=[0, 2, -1, -1],
+        stage_slots=[0, 1],
+        stage_ids=[0, 2],
+        writeback_slots=[0, 1],
+        writeback_ids=[0, 2],
         is_last_step=True,
     )
-    first_ctx = runtime.prepare_step(first, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    set_zero_sparse_grads(first_ctx)
-    runtime.step(first_ctx)
+    warm_both_ctx = runtime.prepare_step(warm_both, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(warm_both_ctx)
+    runtime.step(warm_both_ctx)
 
-    other = build_fixed_step_meta(
+    gap = build_fixed_step_meta(
         slot_to_global=[1, -1, -1, -1],
         stage_slots=[0],
         stage_ids=[1],
@@ -1086,9 +1086,9 @@ def test_fixed_u_grad_accum_cold_bias_uses_window_entry_age_once():
         writeback_ids=[1],
         is_last_step=True,
     )
-    other_ctx = runtime.prepare_step(other, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    set_zero_sparse_grads(other_ctx)
-    runtime.step(other_ctx)
+    gap_ctx = runtime.prepare_step(gap, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(gap_ctx)
+    runtime.step(gap_ctx)
 
     window_micro0 = build_fixed_step_meta(
         slot_to_global=[0, -1, -1, -1],
@@ -1106,8 +1106,7 @@ def test_fixed_u_grad_accum_cold_bias_uses_window_entry_age_once():
     expected = torch.log1p(torch.tensor(1.0))
     assert torch.allclose(window_ctx0.active_vocab["cold_logit_bias"][:2], torch.tensor([expected.item(), 0.0]), atol=1e-6)
     set_zero_sparse_grads(window_ctx0)
-    accum0 = runtime.accumulate_gradients(window_ctx0)
-    assert runtime.state[runtime.table_specs["lm_head"]["param"]]["step"] == 2
+    runtime.accumulate_gradients(window_ctx0)
 
     window_micro1 = build_fixed_step_meta(
         slot_to_global=[2, -1, -1, -1],
@@ -1122,21 +1121,9 @@ def test_fixed_u_grad_accum_cold_bias_uses_window_entry_age_once():
         is_last_step=True,
     )
     window_ctx1 = runtime.prepare_step(window_micro1, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:2], torch.tensor([expected.item(), 0.0]), atol=1e-6)
-    set_zero_sparse_grads(window_ctx1)
-    runtime.accumulate_gradients(window_ctx1)
+    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:2], torch.tensor([0.0, expected.item()]), atol=1e-6)
 
-    lm_head_step_before_apply = runtime.state[runtime.table_specs["lm_head"]["param"]]["step"]
-    metrics = runtime.apply_accumulated_gradients()
-    lm_head_step_after_apply = runtime.state[runtime.table_specs["lm_head"]["param"]]["step"]
-
-    assert accum0.grad_accum_steps == 2
-    assert lm_head_step_before_apply == 2
-    assert lm_head_step_after_apply == 3
-    assert metrics.cold_bias_abs_max == 0.0
-
-
-def test_fixed_u_grad_accum_preserves_cold_bias_for_first_microstep_rows():
+def test_fixed_u_grad_accum_repeated_appearance_gets_zero_cold_bias_later_in_window():
     runtime = DynamicVocabRuntime(
         build_tiny_model(vocab_size=8),
         device="cpu",
@@ -1148,7 +1135,7 @@ def test_fixed_u_grad_accum_preserves_cold_bias_for_first_microstep_rows():
         cold_bias_reference_tokens=8,
     )
 
-    step0 = build_fixed_step_meta(
+    warm = build_fixed_step_meta(
         slot_to_global=[0, -1, -1, -1],
         stage_slots=[0],
         stage_ids=[0],
@@ -1156,9 +1143,9 @@ def test_fixed_u_grad_accum_preserves_cold_bias_for_first_microstep_rows():
         writeback_ids=[0],
         is_last_step=True,
     )
-    step0_ctx = runtime.prepare_step(step0, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    set_zero_sparse_grads(step0_ctx)
-    runtime.step(step0_ctx)
+    warm_ctx = runtime.prepare_step(warm, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(warm_ctx)
+    runtime.step(warm_ctx)
 
     gap = build_fixed_step_meta(
         slot_to_global=[3, -1, -1, -1],
@@ -1172,21 +1159,117 @@ def test_fixed_u_grad_accum_preserves_cold_bias_for_first_microstep_rows():
     set_zero_sparse_grads(gap_ctx)
     runtime.step(gap_ctx)
 
-    window = build_fixed_step_meta(
+    window_micro0 = build_fixed_step_meta(
         slot_to_global=[0, -1, -1, -1],
         stage_slots=[0],
         stage_ids=[0],
-        writeback_slots=[0],
-        writeback_ids=[0],
-        grad_accum_ids=[0, 4],
+        writeback_slots=[],
+        writeback_ids=[],
+        grad_accum_ids=[0],
         grad_accum_steps=2,
         grad_accum_micro_step=0,
         is_grad_accum_boundary=False,
         is_last_step=False,
     )
-    window_ctx = runtime.prepare_step(window, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    window_ctx0 = runtime.prepare_step(window_micro0, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
     expected = torch.log1p(torch.tensor(1.0))
-    assert torch.allclose(window_ctx.active_vocab["cold_logit_bias"][0], expected, atol=1e-6)
+    assert torch.allclose(window_ctx0.active_vocab["cold_logit_bias"][:1], torch.tensor([expected.item()]), atol=1e-6)
+    set_zero_sparse_grads(window_ctx0)
+    runtime.accumulate_gradients(window_ctx0)
+
+    window_micro1 = build_fixed_step_meta(
+        slot_to_global=[0, -1, -1, -1],
+        stage_slots=[0],
+        stage_ids=[0],
+        writeback_slots=[0],
+        writeback_ids=[0],
+        grad_accum_ids=[0],
+        grad_accum_steps=2,
+        grad_accum_micro_step=1,
+        is_grad_accum_boundary=True,
+        is_last_step=True,
+    )
+    window_ctx1 = runtime.prepare_step(window_micro1, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:1], torch.tensor([0.0]), atol=1e-6)
+
+
+def test_fixed_u_grad_accum_apply_metrics_preserve_cold_bias_window_stats():
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=8),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=4,
+        grad_accum_u_max=4,
+        cold_bias_reference_tokens=8,
+    )
+
+    warm_both = build_fixed_step_meta(
+        slot_to_global=[0, 2, -1, -1],
+        stage_slots=[0, 1],
+        stage_ids=[0, 2],
+        writeback_slots=[0, 1],
+        writeback_ids=[0, 2],
+        is_last_step=True,
+    )
+    warm_both_ctx = runtime.prepare_step(warm_both, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(warm_both_ctx)
+    runtime.step(warm_both_ctx)
+
+    gap = build_fixed_step_meta(
+        slot_to_global=[1, -1, -1, -1],
+        stage_slots=[0],
+        stage_ids=[1],
+        writeback_slots=[0],
+        writeback_ids=[1],
+        is_last_step=True,
+    )
+    gap_ctx = runtime.prepare_step(gap, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(gap_ctx)
+    runtime.step(gap_ctx)
+
+    micro0 = build_fixed_step_meta(
+        slot_to_global=[0, -1, -1, -1],
+        stage_slots=[0],
+        stage_ids=[0],
+        writeback_slots=[],
+        writeback_ids=[],
+        grad_accum_ids=[0, 2],
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+        is_last_step=False,
+    )
+    micro0_ctx = runtime.prepare_step(micro0, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(micro0_ctx)
+    runtime.accumulate_gradients(micro0_ctx)
+
+    micro1 = build_fixed_step_meta(
+        slot_to_global=[2, -1, -1, -1],
+        stage_slots=[0],
+        stage_ids=[2],
+        writeback_slots=[0],
+        writeback_ids=[2],
+        grad_accum_ids=[0, 2],
+        grad_accum_steps=2,
+        grad_accum_micro_step=1,
+        is_grad_accum_boundary=True,
+        is_last_step=True,
+    )
+    micro1_ctx = runtime.prepare_step(micro1, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
+    set_zero_sparse_grads(micro1_ctx)
+    runtime.accumulate_gradients(micro1_ctx)
+
+    lm_head_step_before_apply = runtime.state[runtime.table_specs["lm_head"]["param"]]["step"]
+    metrics = runtime.apply_accumulated_gradients()
+    lm_head_step_after_apply = runtime.state[runtime.table_specs["lm_head"]["param"]]["step"]
+
+    assert lm_head_step_before_apply == 2
+    assert lm_head_step_after_apply == 3
+    expected = torch.log1p(torch.tensor(1.0))
+    assert metrics.cold_bias_clamped_count == 0
+    assert metrics.cold_bias_abs_max == expected.item()
 
 
 def test_sparse_cold_logit_bias_clamps_for_extreme_absence():

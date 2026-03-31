@@ -1063,8 +1063,10 @@ while True:
                 f" | warm: {warm_count:,}/{sparse_metrics.warm_budget_target:,}"
                 f" | cold: {cold_count:,}/{sparse_metrics.cold_budget_target:,}"
             )
-        if sparse_metrics.cold_bias_clamped_count > 0:
-            sparse_str += f" | cold_clamped: {sparse_metrics.cold_bias_clamped_count:,} | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
+        if sparse_metrics.cold_bias_abs_max > 0.0 or sparse_metrics.cold_bias_clamped_count > 0:
+            sparse_str += f" | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
+            if sparse_metrics.cold_bias_clamped_count > 0:
+                sparse_str += f" | cold_clamped: {sparse_metrics.cold_bias_clamped_count:,}"
         if args.sparse_debug_timing and sparse_metrics.cloud_plan_ms > 0.0:
             sparse_str += (
                 f" | cloud_ms plan: {sparse_metrics.cloud_plan_ms:.2f}"

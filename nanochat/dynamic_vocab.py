@@ -205,9 +205,8 @@ class DynamicVocabRuntime:
         self._grad_accum_stage_count = 0
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
-        self._grad_accum_cached_lm_head_cold_bias_cpu = None
-        self._grad_accum_cached_lm_head_cold_bias_clamped_count = 0
-        self._grad_accum_cached_lm_head_cold_bias_abs_max = 0.0
+        self._grad_accum_window_cold_bias_clamped_count = 0
+        self._grad_accum_window_cold_bias_abs_max = 0.0
         self._grad_accum_pending_transfers = []
         self._grad_accum_transfer_stream = torch.cuda.Stream(device=self.device) if self.use_cuda else None
         self._cpu_writeback_executor = ThreadPoolExecutor(max_workers=1)
@@ -855,9 +854,8 @@ class DynamicVocabRuntime:
         self._grad_accum_live = False
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
-        self._grad_accum_cached_lm_head_cold_bias_cpu = None
-        self._grad_accum_cached_lm_head_cold_bias_clamped_count = 0
-        self._grad_accum_cached_lm_head_cold_bias_abs_max = 0.0
+        self._grad_accum_window_cold_bias_clamped_count = 0
+        self._grad_accum_window_cold_bias_abs_max = 0.0
 
     def _ensure_grad_accum_buffers(self, capacity: int) -> None:
         needs_new = self._grad_accum_buffers is None
@@ -968,9 +966,8 @@ class DynamicVocabRuntime:
         self._grad_accum_stage_count = 0
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = torch.zeros(grad_accum_count, dtype=torch.bool)
-        self._grad_accum_cached_lm_head_cold_bias_cpu = None
-        self._grad_accum_cached_lm_head_cold_bias_clamped_count = 0
-        self._grad_accum_cached_lm_head_cold_bias_abs_max = 0.0
+        self._grad_accum_window_cold_bias_clamped_count = 0
+        self._grad_accum_window_cold_bias_abs_max = 0.0
 
     def _cache_grad_accum_leaving_rows_(
         self,
@@ -1317,10 +1314,32 @@ class DynamicVocabRuntime:
             self._grad_accum_ids_cpu is not None and
             torch.equal(self._grad_accum_ids_cpu, grad_accum_ids_cpu)
         )
-        lm_head_cold_steps_cpu = self._empty_long_cpu()
         if grad_accum_steps > 1 and not preserve_resident_grads:
-            lm_head_cold_steps_cpu, _ = self._peek_cold_steps_and_hot_counts_cpu(grad_accum_ids_cpu)
+            self._start_grad_accum_window(grad_accum_ids_cpu)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
+        active_union_row_ids_cpu = self._empty_long_cpu()
+        current_cold_logit_bias_cpu = self._empty_long_cpu().to(dtype=torch.float32)
+        cold_bias_clamped_count = 0
+        cold_bias_abs_max = 0.0
+        if grad_accum_steps > 1:
+            assert self._grad_accum_global_to_local_cpu is not None
+            if active_ids_cpu.numel() > 0:
+                active_union_row_ids_cpu = self._grad_accum_global_to_local_cpu[active_ids_cpu]
+                if (active_union_row_ids_cpu < 0).any():
+                    raise ValueError("Sparse grad accumulation map is missing active vocab rows")
+            current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
+                cold_steps_cpu,
+                cold_bias_scale=cold_bias_scale,
+                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+            )
+            self._grad_accum_window_cold_bias_clamped_count += cold_bias_clamped_count
+            self._grad_accum_window_cold_bias_abs_max = max(self._grad_accum_window_cold_bias_abs_max, cold_bias_abs_max)
+        else:
+            current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
+                cold_steps_cpu,
+                cold_bias_scale=cold_bias_scale,
+                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+            )
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
         manifest_fixed_u_max = int(slot_to_global_cpu.numel())
@@ -1415,26 +1434,6 @@ class DynamicVocabRuntime:
             cloud_stage_ids_cpu = cloud_ids_cpu
             cloud_stage_slot_ids_cpu = cloud_slot_ids_cpu
 
-        if grad_accum_steps > 1 and preserve_resident_grads and self._grad_accum_cached_lm_head_cold_bias_cpu is not None:
-            cold_logit_bias_cpu = self._grad_accum_cached_lm_head_cold_bias_cpu
-            cold_bias_clamped_count = self._grad_accum_cached_lm_head_cold_bias_clamped_count
-            cold_bias_abs_max = self._grad_accum_cached_lm_head_cold_bias_abs_max
-        else:
-            if grad_accum_steps > 1:
-                if preserve_resident_grads or lm_head_cold_steps_cpu.numel() == 0:
-                    lm_head_cold_steps_cpu, _ = self._peek_cold_steps_and_hot_counts_cpu(grad_accum_ids_cpu)
-            else:
-                lm_head_cold_steps_cpu = cold_steps_cpu
-            cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
-                lm_head_cold_steps_cpu,
-                cold_bias_scale=cold_bias_scale,
-                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-            )
-            if grad_accum_steps > 1:
-                self._grad_accum_cached_lm_head_cold_bias_cpu = cold_logit_bias_cpu
-                self._grad_accum_cached_lm_head_cold_bias_clamped_count = cold_bias_clamped_count
-                self._grad_accum_cached_lm_head_cold_bias_abs_max = cold_bias_abs_max
-
         required_cpu_ids = []
         if stage_ids_cpu.numel() > 0:
             required_cpu_ids.append(stage_ids_cpu)
@@ -1511,17 +1510,15 @@ class DynamicVocabRuntime:
         use_cold_logit_bias = cold_bias_scale > 0.0
         if use_cold_logit_bias:
             if grad_accum_steps > 1:
-                if not preserve_resident_grads:
-                    self.fixed_cold_logit_bias.zero_()
-                    bias_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
-                    if bias_slot_ids_cpu.numel() > 0:
-                        bias_slot_ids_device = bias_slot_ids_cpu.to(self.device)
-                        self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
+                self.fixed_cold_logit_bias.zero_()
+                if active_union_row_ids_cpu.numel() > 0:
+                    bias_slot_ids_device = active_union_row_ids_cpu.to(self.device)
+                    self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
             else:
                 self.fixed_cold_logit_bias.zero_()
                 if active_slot_ids_cpu.numel() > 0:
                     bias_slot_ids_device = active_slot_ids_cpu.to(self.device)
-                    self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
+                    self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
         self._fixed_live_state = True
 
         union_targets = None
@@ -2033,6 +2030,8 @@ class DynamicVocabRuntime:
             cpu_writeback_ms=cpu_writeback_ms,
             optimizer_ms=apply_ms,
             fixed_u_mode=self.fixed_u_mode,
+            cold_bias_clamped_count=self._grad_accum_window_cold_bias_clamped_count,
+            cold_bias_abs_max=self._grad_accum_window_cold_bias_abs_max,
         )
         self._clear_fixed_grads()
         self._clear_grad_accum_window()
