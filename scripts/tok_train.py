@@ -1,26 +1,32 @@
 """
-Train a tokenizer using our own BPE Tokenizer library.
-In the style of GPT-4 tokenizer.
+Train a tokenizer for nanochat.
 """
 import os
 import time
 import argparse
+from typing import cast
 import torch
-from nanochat.tokenizer import RustBPETokenizer
+from nanochat.tokenizer import RustBPETokenizer, SentencePieceTokenizer
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
 
-parser = argparse.ArgumentParser(description='Train a BPE tokenizer')
-parser.add_argument('--max-chars', type=int, default=2_000_000_000, help='Maximum characters to train on (default: 10B)')
-parser.add_argument('--doc-cap', type=int, default=10_000, help='Maximum characters per document (default: 10,000)')
-parser.add_argument('--vocab-size', type=int, default=32768, help='Vocabulary size (default: 32768 = 2^15)')
+parser = argparse.ArgumentParser(description='Train a tokenizer')
+parser.add_argument('--max-chars', type=int, default=10_000_000_000, help='Maximum characters to train on (default: 10B)')
+parser.add_argument('--doc-cap', type=int, default=20_000, help='Maximum characters per document (default: 20,000)')
+parser.add_argument('--vocab-size', type=int, default=262144, help='Vocabulary size (default: 262,144 = 2^18)')
+parser.add_argument('--backend', choices=['rustbpe', 'sentencepiece'], default='rustbpe', help='Tokenizer backend to train')
+parser.add_argument('--sentencepiece-model-type', choices=['unigram', 'bpe', 'char', 'word'], default='unigram', help='SentencePiece model type (only used when --backend=sentencepiece)')
+parser.add_argument('--tokenizer-dir', default='tokenizer', help='Output tokenizer directory; relative paths are resolved under the nanochat base dir')
 args = parser.parse_args()
 print(f"max_chars: {args.max_chars:,}")
 print(f"doc_cap: {args.doc_cap:,}")
 print(f"vocab_size: {args.vocab_size:,}")
+print(f"backend: {args.backend}")
+if args.backend == 'sentencepiece':
+    print(f"sentencepiece_model_type: {args.sentencepiece_model_type}")
 
 # -----------------------------------------------------------------------------
 # Text iterator
@@ -46,15 +52,24 @@ text_iter = text_iterator()
 # -----------------------------------------------------------------------------
 # Train the tokenizer
 t0 = time.time()
-tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
+if args.backend == 'rustbpe':
+    tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
+else:
+    tokenizer = SentencePieceTokenizer.train_from_iterator(
+        text_iter,
+        args.vocab_size,
+        model_type=args.sentencepiece_model_type,
+    )
 t1 = time.time()
 train_time = t1 - t0
 print(f"Training time: {train_time:.2f}s")
 
 # -----------------------------------------------------------------------------
 # Save the tokenizer to disk
-base_dir = get_base_dir()
-tokenizer_dir = os.path.join(base_dir, "tokenizer")
+base_dir = cast(str, get_base_dir())
+tokenizer_dir = cast(str, args.tokenizer_dir)
+if not os.path.isabs(tokenizer_dir):
+    tokenizer_dir = os.path.join(base_dir, tokenizer_dir)
 tokenizer.save(tokenizer_dir)
 
 # -----------------------------------------------------------------------------

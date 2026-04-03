@@ -66,20 +66,37 @@ def parse_cmd_string(cmd_str):
 # ============================================================
 RUNS = [
     {
-        "name": "d12_65kvocab_10k_nocoldbias",
+        "name": "d6_131kvocab_10k",
         "args": parse_cmd_string(
             '-m scripts.base_train '
             '--sparse-mode --window-pattern L --fp8 '
             '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=12 --aspect-ratio 128 '
+            '--depth=6 --aspect-ratio 64 '
             '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
-            '--num-iterations=10000 '            
-            '--run \"d12 65kvoc 2kseq 16batch 8accum 128aspect 10kstep unembedlr0.01 0.001warmup 0.6warmdown 0.2embedlr 0.01matrix 0.27scalar\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
-            '--warmup-ratio 0.001 --warmdown-ratio 0.6 '
-            '--embedding-lr 0.2 --unembedding-lr=0.01 --matrix-lr 0.01 --scalar-lr 0.27 '                 
+            '--num-iterations=5000 '            
+            '--run \"d6 131kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.01 0warmup 0warmdown 0.24embedlr 0.01matrix 0.27scalar 2coldbias\" '
+            '--sparse-manifest manifests/131kvocab_2kseq_16batch_8accum_15kstep.json '
+            '--warmup-ratio 0 --warmdown-ratio 0 '
+            '--embedding-lr 0.24 --unembedding-lr=0.01 --matrix-lr 0.01 --scalar-lr 0.27 '                 
             '--sparse-cold-bias-scale 2 '            
-            '--log-every 10 --eval-every 250 --core-metric-every 2500 '
+            '--log-every 10 --eval-every 250 --core-metric-every 5000 '
+        ),
+    },
+    {
+        "name": "d6_131kvocab_10k",
+        "args": parse_cmd_string(
+            '-m scripts.base_train '
+            '--sparse-mode --window-pattern L --fp8 '
+            '--token-cache-dir "" --token-cache-workers 8 '
+            '--depth=6 --aspect-ratio 64 '
+            '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
+            '--num-iterations=5000 '            
+            '--run \"d6 131kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.01 0warmup 0warmdown 0.2embedlr 0.3 velr 0.01matrix 0.27scalar 2coldbias\" '
+            '--sparse-manifest manifests/131kvocab_2kseq_16batch_8accum_15kstep.json '
+            '--warmup-ratio 0 --warmdown-ratio 0 '
+            '--embedding-lr 0.2 --value-embed-lr 0.3 --unembedding-lr=0.01 --matrix-lr 0.01 --scalar-lr 0.27 '                 
+            '--sparse-cold-bias-scale 2 '            
+            '--log-every 10 --eval-every 250 --core-metric-every 5000 '
         ),
     },
     # Add more runs below:

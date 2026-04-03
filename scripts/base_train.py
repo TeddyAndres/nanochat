@@ -42,7 +42,7 @@ from nanochat.sparse_manifest import load_sparse_manifest_header, resolve_sparse
 from scripts.base_eval import evaluate_core
 print_banner()
 
-SPARSE_RUNTIME_CAPACITY_MULTIPLE = 128
+SPARSE_RUNTIME_CAPACITY_MULTIPLE = 32
 
 # -----------------------------------------------------------------------------
 # CLI arguments
