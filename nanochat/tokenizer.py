@@ -416,7 +416,22 @@ class SentencePieceTokenizer(ChatTokenizerMixin):
         self.bos_token_id = self.encode_special("<|bos|>")
 
     @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size, model_type="unigram"):
+    def train_from_iterator(
+        cls,
+        text_iterator,
+        vocab_size,
+        model_type="unigram",
+        *,
+        input_sentence_size=100_000,
+        shuffle_input_sentence=True,
+        max_sentence_length=20_000,
+        num_threads=4,
+        split_by_whitespace=True,
+        treat_whitespace_as_suffix=False,
+        allow_whitespace_only_pieces=False,
+        add_dummy_prefix=True,
+        remove_extra_whitespaces=False,
+    ):
         model_buffer = io.BytesIO()
         spm.SentencePieceTrainer.train(
             sentence_iterator=text_iterator,
@@ -424,7 +439,15 @@ class SentencePieceTokenizer(ChatTokenizerMixin):
             vocab_size=vocab_size,
             model_type=model_type,
             normalization_rule_name="identity",
-            remove_extra_whitespaces=False,
+            add_dummy_prefix=add_dummy_prefix,
+            remove_extra_whitespaces=remove_extra_whitespaces,
+            input_sentence_size=input_sentence_size,
+            shuffle_input_sentence=shuffle_input_sentence,
+            max_sentence_length=max_sentence_length,
+            num_threads=num_threads,
+            split_by_whitespace=split_by_whitespace,
+            treat_whitespace_as_suffix=treat_whitespace_as_suffix,
+            allow_whitespace_only_pieces=allow_whitespace_only_pieces,
             byte_fallback=True,
             bos_id=-1,
             eos_id=-1,

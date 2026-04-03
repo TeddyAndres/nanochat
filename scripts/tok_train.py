@@ -1,5 +1,13 @@
 """
 Train a tokenizer for nanochat.
+/home/teddy/Desktop/dev/repo/nanochat/.venv-5090/bin/python -m scripts.tok_train \
+  --backend sentencepiece \
+  --sentencepiece-model-type unigram \
+  --vocab-size 262144 \
+  --doc-cap 20000 \
+  --tokenizer-dir tokenizer-sp-unigram-262k
+
+
 """
 import os
 import time
@@ -16,9 +24,18 @@ from nanochat.dataset import parquets_iter_batched
 parser = argparse.ArgumentParser(description='Train a tokenizer')
 parser.add_argument('--max-chars', type=int, default=10_000_000_000, help='Maximum characters to train on (default: 10B)')
 parser.add_argument('--doc-cap', type=int, default=20_000, help='Maximum characters per document (default: 20,000)')
-parser.add_argument('--vocab-size', type=int, default=262144, help='Vocabulary size (default: 262,144 = 2^18)')
+parser.add_argument('--vocab-size', type=int, default=65536, help='Vocabulary size (default: 65536 = 2^16)')
 parser.add_argument('--backend', choices=['rustbpe', 'sentencepiece'], default='rustbpe', help='Tokenizer backend to train')
 parser.add_argument('--sentencepiece-model-type', choices=['unigram', 'bpe', 'char', 'word'], default='unigram', help='SentencePiece model type (only used when --backend=sentencepiece)')
+parser.add_argument('--sentencepiece-input-sentence-size', type=int, default=100_000, help='Maximum number of training documents sampled by SentencePiece (0 = use all, larger uses more RAM)')
+parser.add_argument('--sentencepiece-max-sentence-length', type=int, default=-1, help='Maximum per-document length SentencePiece sees after doc_cap (-1 = use doc_cap)')
+parser.add_argument('--sentencepiece-num-threads', type=int, default=4, help='SentencePiece trainer threads')
+parser.add_argument('--sentencepiece-shuffle-input-sentence', action=argparse.BooleanOptionalAction, default=True, help='Shuffle/sample documents before SentencePiece training when input_sentence_size is set')
+parser.add_argument('--sentencepiece-split-by-whitespace', action=argparse.BooleanOptionalAction, default=True, help='Prevent SentencePiece pieces from spanning whitespace boundaries')
+parser.add_argument('--sentencepiece-treat-whitespace-as-suffix', action=argparse.BooleanOptionalAction, default=False, help='Attach whitespace marker to the end of pieces instead of the beginning')
+parser.add_argument('--sentencepiece-allow-whitespace-only-pieces', action=argparse.BooleanOptionalAction, default=False, help='Allow standalone whitespace-only pieces in SentencePiece')
+parser.add_argument('--sentencepiece-add-dummy-prefix', action=argparse.BooleanOptionalAction, default=True, help='Add the standard SentencePiece dummy prefix so sentence-initial words share pieces with post-space words')
+parser.add_argument('--sentencepiece-remove-extra-whitespaces', action=argparse.BooleanOptionalAction, default=False, help='Collapse repeated whitespace during SentencePiece normalization')
 parser.add_argument('--tokenizer-dir', default='tokenizer', help='Output tokenizer directory; relative paths are resolved under the nanochat base dir')
 args = parser.parse_args()
 print(f"max_chars: {args.max_chars:,}")
@@ -27,6 +44,15 @@ print(f"vocab_size: {args.vocab_size:,}")
 print(f"backend: {args.backend}")
 if args.backend == 'sentencepiece':
     print(f"sentencepiece_model_type: {args.sentencepiece_model_type}")
+    print(f"sentencepiece_input_sentence_size: {args.sentencepiece_input_sentence_size:,}")
+    print(f"sentencepiece_max_sentence_length: {args.doc_cap if args.sentencepiece_max_sentence_length < 0 else args.sentencepiece_max_sentence_length:,}")
+    print(f"sentencepiece_num_threads: {args.sentencepiece_num_threads}")
+    print(f"sentencepiece_shuffle_input_sentence: {args.sentencepiece_shuffle_input_sentence}")
+    print(f"sentencepiece_split_by_whitespace: {args.sentencepiece_split_by_whitespace}")
+    print(f"sentencepiece_treat_whitespace_as_suffix: {args.sentencepiece_treat_whitespace_as_suffix}")
+    print(f"sentencepiece_allow_whitespace_only_pieces: {args.sentencepiece_allow_whitespace_only_pieces}")
+    print(f"sentencepiece_add_dummy_prefix: {args.sentencepiece_add_dummy_prefix}")
+    print(f"sentencepiece_remove_extra_whitespaces: {args.sentencepiece_remove_extra_whitespaces}")
 
 # -----------------------------------------------------------------------------
 # Text iterator
@@ -55,10 +81,20 @@ t0 = time.time()
 if args.backend == 'rustbpe':
     tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
 else:
+    sentencepiece_max_sentence_length = args.doc_cap if args.sentencepiece_max_sentence_length < 0 else args.sentencepiece_max_sentence_length
     tokenizer = SentencePieceTokenizer.train_from_iterator(
         text_iter,
         args.vocab_size,
         model_type=args.sentencepiece_model_type,
+        input_sentence_size=args.sentencepiece_input_sentence_size,
+        shuffle_input_sentence=args.sentencepiece_shuffle_input_sentence,
+        max_sentence_length=sentencepiece_max_sentence_length,
+        num_threads=args.sentencepiece_num_threads,
+        split_by_whitespace=args.sentencepiece_split_by_whitespace,
+        treat_whitespace_as_suffix=args.sentencepiece_treat_whitespace_as_suffix,
+        allow_whitespace_only_pieces=args.sentencepiece_allow_whitespace_only_pieces,
+        add_dummy_prefix=args.sentencepiece_add_dummy_prefix,
+        remove_extra_whitespaces=args.sentencepiece_remove_extra_whitespaces,
     )
 t1 = time.time()
 train_time = t1 - t0
