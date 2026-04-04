@@ -8,6 +8,22 @@ Train a tokenizer for nanochat.
   --tokenizer-dir tokenizer-sp-unigram-262k
 
 
+/home/teddy/Desktop/dev/repo/nanochat/.venv-5090/bin/python -m scripts.tok_train \
+  --backend sentencepiece \
+  --sentencepiece-model-type unigram \
+  --vocab_size 131072 \                          # 2^17 – your target
+  --sentencepiece-input-sentence-size 500000 \   # Increased from 100k
+  --sentencepiece-seed-sentencepiece-size 2000000 \ # 2M candidates (key for larger vocab)
+  --sentencepiece-max-sentencepiece-length 24 \  # Moderate increase from default 16
+  --sentencepiece-split-by-whitespace True \     # Keep consistent with your 65k baseline for now
+  --sentencepiece-num-threads 8 \                # Scale up if your hardware supports it
+  --sentencepiece-shuffle-input-sentence True \
+  --sentencepiece-remove-extra-whitespaces True \
+  --sentencepiece-add-dummy-prefix True \
+  --train_extremely_large_corpus True \          # Important for your 10B char corpus
+  --sentencepiece-byte-fallback True             # Keep robustness
+
+
 """
 import os
 import time
