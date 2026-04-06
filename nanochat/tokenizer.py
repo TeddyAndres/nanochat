@@ -431,6 +431,7 @@ class SentencePieceTokenizer(ChatTokenizerMixin):
         allow_whitespace_only_pieces=False,
         add_dummy_prefix=True,
         remove_extra_whitespaces=False,
+        train_extremely_large_corpus=False,
     ):
         model_buffer = io.BytesIO()
         spm.SentencePieceTrainer.train(
@@ -448,6 +449,7 @@ class SentencePieceTokenizer(ChatTokenizerMixin):
             split_by_whitespace=split_by_whitespace,
             treat_whitespace_as_suffix=treat_whitespace_as_suffix,
             allow_whitespace_only_pieces=allow_whitespace_only_pieces,
+            train_extremely_large_corpus=train_extremely_large_corpus,
             byte_fallback=True,
             bos_id=-1,
             eos_id=-1,

@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-COLD_LOGIT_BIAS_CLAMP_MIN = -3.0
-COLD_LOGIT_BIAS_CLAMP_MAX = 3.0
+COLD_LOGIT_BIAS_CLAMP_MIN = -5.0
+COLD_LOGIT_BIAS_CLAMP_MAX = 5.0
 
 
 def round_capacity_up(value: int | None, multiple: int) -> int | None:
@@ -176,6 +176,7 @@ class DynamicVocabRuntime:
         self.runtime_step = 0
         self.last_seen_step_cpu = torch.full((model.config.vocab_size,), -1, dtype=torch.long)
         self.hot_activation_count_cpu = torch.zeros((model.config.vocab_size,), dtype=torch.long)
+        self.token_event_step_count_cpu = torch.zeros((model.config.vocab_size,), dtype=torch.long)
         self._cpu_receive_buffers = {}
         for spec in self.table_specs.values():
             param = spec["param"]
@@ -254,10 +255,11 @@ class DynamicVocabRuntime:
                 "lr": spec["lr"],
             }
         return {
-            "version": 3,
+            "version": 4,
             "runtime_step": self.runtime_step,
             "last_seen_step_cpu": self.last_seen_step_cpu,
             "hot_activation_count_cpu": self.hot_activation_count_cpu,
+            "token_event_step_count_cpu": self.token_event_step_count_cpu,
             "global_token_count_cpu": self.global_token_count_cpu,
             "tables": serialized,
         }
@@ -272,6 +274,10 @@ class DynamicVocabRuntime:
             self.hot_activation_count_cpu.copy_(state_dict["hot_activation_count_cpu"].to(device="cpu", dtype=torch.long))
         else:
             self.hot_activation_count_cpu.zero_()
+        if "token_event_step_count_cpu" in state_dict:
+            self.token_event_step_count_cpu.copy_(state_dict["token_event_step_count_cpu"].to(device="cpu", dtype=torch.long))
+        else:
+            self.token_event_step_count_cpu.zero_()
         if "global_token_count_cpu" in state_dict:
             self.global_token_count_cpu.copy_(state_dict["global_token_count_cpu"].to(device="cpu", dtype=torch.long))
         else:
@@ -303,6 +309,27 @@ class DynamicVocabRuntime:
         self.last_seen_step_cpu.index_fill_(0, active_ids_cpu, self.runtime_step)
         self.hot_activation_count_cpu.index_copy_(0, active_ids_cpu, hot_activation_counts_cpu + 1)
         return cold_steps_cpu, hot_activation_counts_cpu
+
+    def _get_token_event_step_values_cpu(self, global_ids_cpu: torch.Tensor) -> torch.Tensor:
+        global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        if global_ids_cpu.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        return self.token_event_step_count_cpu.index_select(0, global_ids_cpu) + 1
+
+    def _increment_token_event_step_counts_(self, global_ids_cpu: torch.Tensor) -> None:
+        global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        if global_ids_cpu.numel() == 0:
+            return
+        unique_ids_cpu = torch.unique(global_ids_cpu, sorted=True)
+        current_counts = self.token_event_step_count_cpu.index_select(0, unique_ids_cpu)
+        self.token_event_step_count_cpu.index_copy_(0, unique_ids_cpu, current_counts + 1)
+
+    def _mark_table_updated_(self, param_name: str, updated_tables: set[str]) -> None:
+        if param_name in updated_tables:
+            return
+        spec = self.table_specs[param_name]
+        self.state[spec["param"]]["step"] += 1
+        updated_tables.add(param_name)
 
     def _get_lm_head_row_lr(self, base_lr: float, hot_activation_counts_cpu: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
         if hot_activation_counts_cpu is None:
@@ -1610,32 +1637,37 @@ class DynamicVocabRuntime:
         param_name: str,
         active_param: nn.Parameter,
         active_state: dict,
+        step_value: int | torch.Tensor,
         slot_ids_cpu: Optional[torch.Tensor] = None,
         hot_activation_counts_cpu: Optional[torch.Tensor] = None,
         lr_override: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         grad = active_param.grad
         if grad is None:
-            return
-        spec = self.table_specs[param_name]
-        state = self.state[spec["param"]]
-        state["step"] += 1
+            return False
+        if slot_ids_cpu is not None:
+            slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+            if slot_ids_cpu.numel() == 0:
+                return False
+        if isinstance(step_value, torch.Tensor) and step_value.numel() == 0:
+            return False
         self._adamw_update_with_step_(
             param_name,
             active_param,
             active_state,
-            state["step"],
+            step_value,
             slot_ids_cpu=slot_ids_cpu,
             hot_activation_counts_cpu=hot_activation_counts_cpu,
             lr_override=lr_override,
         )
+        return True
 
     def _adamw_update_with_step_(
         self,
         param_name: str,
         active_param: nn.Parameter,
         active_state: dict,
-        step_value: int,
+        step_value: int | torch.Tensor,
         slot_ids_cpu: Optional[torch.Tensor] = None,
         hot_activation_counts_cpu: Optional[torch.Tensor] = None,
         lr_override: Optional[float] = None,
@@ -1650,46 +1682,68 @@ class DynamicVocabRuntime:
         row_lr = None
         if param_name == "lm_head":
             row_lr = self._get_lm_head_row_lr(base_lr, hot_activation_counts_cpu, active_param.device, active_param.dtype)
+        slot_ids = None
         if slot_ids_cpu is None:
-            if self.weight_decay != 0.0:
-                active_param.mul_(1 - base_lr * self.weight_decay)
-            exp_avg.lerp_(grad, 1 - self.beta1)
-            exp_avg_sq.lerp_(grad.square(), 1 - self.beta2)
-            bias1 = 1 - self.beta1 ** step_value
-            bias2 = 1 - self.beta2 ** step_value
-            denom = (exp_avg_sq / bias2).sqrt().add_(self.eps)
-            if row_lr is not None:
-                row_lr = row_lr.view((-1,) + (1,) * (active_param.dim() - 1))
-                active_param.add_((exp_avg / denom) * row_lr, alpha=-1.0 / bias1)
-            else:
-                step_size = base_lr / bias1
-                active_param.addcdiv_(exp_avg, denom, value=-step_size)
-            return
-
-        slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        if slot_ids_cpu.numel() == 0:
-            return
-        slot_ids = slot_ids_cpu.to(active_param.device)
-        param_rows = active_param.index_select(0, slot_ids)
-        grad_rows = grad.index_select(0, slot_ids)
-        exp_avg_rows = exp_avg.index_select(0, slot_ids)
-        exp_avg_sq_rows = exp_avg_sq.index_select(0, slot_ids)
+            param_rows = active_param
+            grad_rows = grad
+            exp_avg_rows = exp_avg
+            exp_avg_sq_rows = exp_avg_sq
+        else:
+            slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+            if slot_ids_cpu.numel() == 0:
+                return
+            slot_ids = slot_ids_cpu.to(active_param.device)
+            param_rows = active_param.index_select(0, slot_ids)
+            grad_rows = grad.index_select(0, slot_ids)
+            exp_avg_rows = exp_avg.index_select(0, slot_ids)
+            exp_avg_sq_rows = exp_avg_sq.index_select(0, slot_ids)
         if self.weight_decay != 0.0:
             param_rows.mul_(1 - base_lr * self.weight_decay)
         exp_avg_rows.lerp_(grad_rows, 1 - self.beta1)
         exp_avg_sq_rows.lerp_(grad_rows.square(), 1 - self.beta2)
-        bias1 = 1 - self.beta1 ** step_value
-        bias2 = 1 - self.beta2 ** step_value
-        denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
-        if row_lr is not None:
-            row_lr = row_lr.view((-1,) + (1,) * (param_rows.dim() - 1))
-            param_rows.add_((exp_avg_rows / denom) * row_lr, alpha=-1.0 / bias1)
+
+        if isinstance(step_value, torch.Tensor):
+            step_values = step_value.detach().to(device=param_rows.device, dtype=torch.float32)
+            if step_values.dim() != 1 or step_values.numel() != param_rows.size(0):
+                raise ValueError(
+                    f"Sparse AdamW step values must be a 1D tensor with one entry per row, got shape {tuple(step_values.shape)} for {param_rows.size(0)} rows"
+                )
+            if step_values.numel() > 0 and torch.equal(step_values, step_values[:1].expand_as(step_values)):
+                scalar_step_value = int(step_values[0].item())
+                bias1 = 1 - self.beta1 ** scalar_step_value
+                bias2 = 1 - self.beta2 ** scalar_step_value
+                denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
+                if row_lr is not None:
+                    row_lr = row_lr.view((-1,) + (1,) * (param_rows.dim() - 1))
+                    param_rows.add_((exp_avg_rows / denom) * row_lr, alpha=-1.0 / bias1)
+                else:
+                    step_size = base_lr / bias1
+                    param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
+            else:
+                bias1 = 1 - torch.pow(torch.full_like(step_values, self.beta1), step_values)
+                bias2 = 1 - torch.pow(torch.full_like(step_values, self.beta2), step_values)
+                view_shape = (-1,) + (1,) * (param_rows.dim() - 1)
+                denom = (exp_avg_sq_rows / bias2.view(view_shape)).sqrt().add_(self.eps)
+                if row_lr is not None:
+                    scale = row_lr / bias1.to(dtype=row_lr.dtype)
+                else:
+                    scale = torch.full_like(bias1, base_lr, dtype=torch.float32) / bias1
+                param_rows.add_((exp_avg_rows / denom) * scale.to(dtype=param_rows.dtype).view(view_shape), alpha=-1.0)
         else:
-            step_size = base_lr / bias1
-            param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
-        active_param.index_copy_(0, slot_ids, param_rows)
-        exp_avg.index_copy_(0, slot_ids, exp_avg_rows)
-        exp_avg_sq.index_copy_(0, slot_ids, exp_avg_sq_rows)
+            bias1 = 1 - self.beta1 ** step_value
+            bias2 = 1 - self.beta2 ** step_value
+            denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
+            if row_lr is not None:
+                row_lr = row_lr.view((-1,) + (1,) * (param_rows.dim() - 1))
+                param_rows.add_((exp_avg_rows / denom) * row_lr, alpha=-1.0 / bias1)
+            else:
+                step_size = base_lr / bias1
+                param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
+
+        if slot_ids is not None:
+            active_param.index_copy_(0, slot_ids, param_rows)
+            exp_avg.index_copy_(0, slot_ids, exp_avg_rows)
+            exp_avg_sq.index_copy_(0, slot_ids, exp_avg_sq_rows)
 
     @torch.no_grad()
     def accumulate_gradients(self, step_ctx: DynamicVocabStep) -> DynamicVocabStep:
@@ -1865,13 +1919,15 @@ class DynamicVocabRuntime:
             if not has_live_grad and not has_cached_non_live_grad and not has_staged_non_live_grad:
                 continue
             state["step"] += 1
-            step_value = state["step"]
             if has_live_grad:
+                live_step_values_cpu = self._get_token_event_step_values_cpu(
+                    live_lm_head_global_ids_cpu if name == "lm_head" else live_global_ids_cpu
+                )
                 self._adamw_update_with_step_(
                     name,
                     self.fixed_params[name],
                     self.fixed_optimizer_state[name],
-                    step_value,
+                    live_step_values_cpu,
                     slot_ids_cpu=live_slot_ids_for_name_cpu,
                 )
             if has_cached_non_live_grad:
@@ -1880,6 +1936,7 @@ class DynamicVocabRuntime:
                         continue
                     chunk_param = chunk["tables"][name]["param"]
                     chunk_param.grad = self._grad_accum_buffers[name].index_select(0, chunk["union_row_ids_device"])
+                    chunk_step_values_cpu = self._get_token_event_step_values_cpu(chunk["global_ids_cpu"])
                     self._adamw_update_with_step_(
                         name,
                         chunk_param,
@@ -1887,17 +1944,19 @@ class DynamicVocabRuntime:
                             "exp_avg": chunk["tables"][name]["exp_avg"],
                             "exp_avg_sq": chunk["tables"][name]["exp_avg_sq"],
                         },
-                        step_value,
+                        chunk_step_values_cpu,
                     )
             if has_staged_non_live_grad:
                 non_live_params[name].grad = self._grad_accum_buffers[name].index_select(0, staged_non_live_union_row_ids_device)
+                staged_step_values_cpu = self._get_token_event_step_values_cpu(staged_non_live_grad_accum_ids_cpu)
                 self._adamw_update_with_step_(
                     name,
                     non_live_params[name],
                     non_live_optimizer_state[name],
-                    step_value,
+                    staged_step_values_cpu,
                 )
         apply_ms = (time.perf_counter() - t_apply_start) * 1000.0
+        self._increment_token_event_step_counts_(grad_accum_ids_cpu)
 
         restore_ms = 0.0
 
@@ -2044,38 +2103,66 @@ class DynamicVocabRuntime:
         assert step_ctx.optimizer_state is not None
         if step_ctx.fixed_u_mode:
             assert step_ctx.active_slot_ids_cpu is not None
-            self._adamw_update_("wte", self.fixed_params["wte"], self.fixed_optimizer_state["wte"], slot_ids_cpu=step_ctx.active_slot_ids_cpu)
-            self._adamw_update_(
+            updated_tables: set[str] = set()
+            active_step_values_cpu = self._get_token_event_step_values_cpu(step_ctx.active_ids_cpu)
+            if self._adamw_update_(
+                "wte",
+                self.fixed_params["wte"],
+                self.fixed_optimizer_state["wte"],
+                active_step_values_cpu,
+                slot_ids_cpu=step_ctx.active_slot_ids_cpu,
+            ):
+                self._mark_table_updated_("wte", updated_tables)
+            if self._adamw_update_(
                 "lm_head",
                 self.fixed_params["lm_head"],
                 self.fixed_optimizer_state["lm_head"],
+                active_step_values_cpu,
                 slot_ids_cpu=step_ctx.active_slot_ids_cpu,
                 hot_activation_counts_cpu=step_ctx.hot_activation_counts_cpu,
-            )
+            ):
+                self._mark_table_updated_("lm_head", updated_tables)
             if step_ctx.warm_slot_ids_cpu is not None and step_ctx.warm_slot_ids_cpu.numel() > 0:
-                self._adamw_update_(
+                assert step_ctx.warm_ids_cpu is not None
+                warm_step_values_cpu = self._get_token_event_step_values_cpu(step_ctx.warm_ids_cpu)
+                if self._adamw_update_(
                     "lm_head",
                     self.fixed_params["lm_head"],
                     self.fixed_optimizer_state["lm_head"],
+                    warm_step_values_cpu,
                     slot_ids_cpu=step_ctx.warm_slot_ids_cpu,
                     lr_override=float(self.table_specs["lm_head"]["warm_lr"]),
-                )
+                ):
+                    self._mark_table_updated_("lm_head", updated_tables)
             if step_ctx.cold_slot_ids_cpu is not None and step_ctx.cold_slot_ids_cpu.numel() > 0:
-                self._adamw_update_(
+                assert step_ctx.cold_ids_cpu is not None
+                cold_step_values_cpu = self._get_token_event_step_values_cpu(step_ctx.cold_ids_cpu)
+                if self._adamw_update_(
                     "lm_head",
                     self.fixed_params["lm_head"],
                     self.fixed_optimizer_state["lm_head"],
+                    cold_step_values_cpu,
                     slot_ids_cpu=step_ctx.cold_slot_ids_cpu,
                     lr_override=float(self.table_specs["lm_head"]["cold_lr"]),
-                )
+                ):
+                    self._mark_table_updated_("lm_head", updated_tables)
             for layer_name in step_ctx.active_vocab["value_embeds"]:
                 param_name = f"value_embeds.{layer_name}"
-                self._adamw_update_(
+                if self._adamw_update_(
                     param_name,
                     self.fixed_params[param_name],
                     self.fixed_optimizer_state[param_name],
+                    active_step_values_cpu,
                     slot_ids_cpu=step_ctx.active_slot_ids_cpu,
-                )
+                ):
+                    self._mark_table_updated_(param_name, updated_tables)
+
+            updated_token_ids = [step_ctx.active_ids_cpu]
+            if step_ctx.warm_ids_cpu is not None and step_ctx.warm_ids_cpu.numel() > 0:
+                updated_token_ids.append(step_ctx.warm_ids_cpu)
+            if step_ctx.cold_ids_cpu is not None and step_ctx.cold_ids_cpu.numel() > 0:
+                updated_token_ids.append(step_ctx.cold_ids_cpu)
+            self._increment_token_event_step_counts_(torch.cat(updated_token_ids))
 
             writeback_ids_cpu = step_ctx.active_ids_cpu if step_ctx.is_last_step else step_ctx.writeback_ids_cpu
             writeback_slot_ids_cpu = step_ctx.active_slot_ids_cpu if step_ctx.is_last_step else step_ctx.writeback_slot_ids_cpu
@@ -2112,16 +2199,23 @@ class DynamicVocabRuntime:
             self.runtime_step += 1
             return step_ctx
 
-        self._adamw_update_("wte", step_ctx.active_vocab["wte"], step_ctx.optimizer_state["wte"])
-        self._adamw_update_(
+        updated_tables: set[str] = set()
+        active_step_values_cpu = self._get_token_event_step_values_cpu(step_ctx.active_ids_cpu)
+        if self._adamw_update_("wte", step_ctx.active_vocab["wte"], step_ctx.optimizer_state["wte"], active_step_values_cpu):
+            self._mark_table_updated_("wte", updated_tables)
+        if self._adamw_update_(
             "lm_head",
             step_ctx.active_vocab["lm_head"],
             step_ctx.optimizer_state["lm_head"],
+            active_step_values_cpu,
             hot_activation_counts_cpu=step_ctx.hot_activation_counts_cpu,
-        )
+        ):
+            self._mark_table_updated_("lm_head", updated_tables)
         for layer_name, active_param in step_ctx.active_vocab["value_embeds"].items():
             param_name = f"value_embeds.{layer_name}"
-            self._adamw_update_(param_name, active_param, step_ctx.optimizer_state[param_name])
+            if self._adamw_update_(param_name, active_param, step_ctx.optimizer_state[param_name], active_step_values_cpu):
+                self._mark_table_updated_(param_name, updated_tables)
+        self._increment_token_event_step_counts_(step_ctx.active_ids_cpu)
         step_ctx.writeback_count = step_ctx.active_ids_cpu.numel()
 
         cpu_rows = {}

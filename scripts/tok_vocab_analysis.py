@@ -91,6 +91,36 @@ def safe_decode(tokenizer, token_id):
         return f"<decode_error:{token_id}:{type(exc).__name__}>"
 
 
+def summarize_numeric_series(values):
+    if not values:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "min": 0,
+            "p50": 0,
+            "p90": 0,
+            "max": 0,
+        }
+
+    sorted_values = sorted(values)
+    count = len(sorted_values)
+
+    def percentile(rank):
+        if count == 1:
+            return sorted_values[0]
+        index = int(round(rank * (count - 1)))
+        return sorted_values[index]
+
+    return {
+        "count": count,
+        "mean": sum(sorted_values) / count,
+        "min": sorted_values[0],
+        "p50": percentile(0.50),
+        "p90": percentile(0.90),
+        "max": sorted_values[-1],
+    }
+
+
 def summarize_tokenizer(tokenizer_dir, min_word_chars, top_k):
     tokenizer = load_tokenizer_from_directory(tokenizer_dir)
     token_bytes = load_token_bytes_from_directory(tokenizer_dir, device="cpu")
@@ -102,17 +132,33 @@ def summarize_tokenizer(tokenizer_dir, min_word_chars, top_k):
     bytes_by_category = defaultdict(int)
     total_non_special = 0
     total_complete_words = 0
+    char_lengths_all = []
+    stripped_char_lengths = []
+    whitespace_prefix_lengths = []
+    whitespace_suffix_lengths = []
+    complete_word_lengths = []
+    token_byte_lengths = []
 
     for token_id in range(vocab_size):
         token_str = safe_decode(tokenizer, token_id)
         token_byte_count = int(token_bytes[token_id].item())
         category = classify_token(token_str, token_byte_count, special_tokens, min_word_chars)
+        stripped = token_str.strip()
+        leading_ws = len(token_str) - len(token_str.lstrip())
+        trailing_ws = len(token_str) - len(token_str.rstrip())
+
         counts[category] += 1
         bytes_by_category[category] += token_byte_count
         if category not in {"special", "empty"}:
             total_non_special += 1
+            char_lengths_all.append(len(token_str))
+            stripped_char_lengths.append(len(stripped))
+            whitespace_prefix_lengths.append(leading_ws)
+            whitespace_suffix_lengths.append(trailing_ws)
+            token_byte_lengths.append(token_byte_count)
         if category in {"complete_word", "complete_word_with_space"}:
             total_complete_words += 1
+            complete_word_lengths.append(len(stripped))
         if len(examples[category]) < top_k:
             examples[category].append((token_id, token_str, token_byte_count))
 
@@ -125,6 +171,14 @@ def summarize_tokenizer(tokenizer_dir, min_word_chars, top_k):
         "special_tokens": sorted(special_tokens),
         "total_non_special": total_non_special,
         "total_complete_words": total_complete_words,
+        "length_stats": {
+            "decoded_chars": summarize_numeric_series(char_lengths_all),
+            "stripped_chars": summarize_numeric_series(stripped_char_lengths),
+            "complete_word_chars": summarize_numeric_series(complete_word_lengths),
+            "token_bytes": summarize_numeric_series(token_byte_lengths),
+            "leading_whitespace_chars": summarize_numeric_series(whitespace_prefix_lengths),
+            "trailing_whitespace_chars": summarize_numeric_series(whitespace_suffix_lengths),
+        },
     }
 
 
@@ -140,16 +194,33 @@ def format_examples(rows):
     return ", ".join(f"{token_id}:{token_str!r}" for token_id, token_str, _ in rows)
 
 
+def format_length_stats(stats):
+    return (
+        f"mean={stats['mean']:.2f}, min={stats['min']}, p50={stats['p50']}, "
+        f"p90={stats['p90']}, max={stats['max']}"
+    )
+
+
 def print_summary(summary, top_k):
     counts = summary["counts"]
     vocab_size = summary["vocab_size"]
     total_non_special = summary["total_non_special"]
     total_complete_words = summary["total_complete_words"]
+    length_stats = summary["length_stats"]
 
     print(f"\n=== {summary['tokenizer_dir']} ===")
     print(f"vocab_size: {vocab_size:,}")
     print(f"complete_word_tokens: {total_complete_words:,} / {vocab_size:,} ({pct(total_complete_words, vocab_size):.2f}% of vocab)")
     print(f"complete_word_tokens_non_special: {total_complete_words:,} / {total_non_special:,} ({pct(total_complete_words, total_non_special):.2f}% of non-special vocab)")
+    if total_non_special > 0:
+        print("\nlength stats (non-special tokens):")
+        print(f"  decoded_chars              {format_length_stats(length_stats['decoded_chars'])}")
+        print(f"  stripped_chars             {format_length_stats(length_stats['stripped_chars'])}")
+        print(f"  token_bytes                {format_length_stats(length_stats['token_bytes'])}")
+        print(f"  leading_whitespace_chars   {format_length_stats(length_stats['leading_whitespace_chars'])}")
+        print(f"  trailing_whitespace_chars  {format_length_stats(length_stats['trailing_whitespace_chars'])}")
+    if length_stats["complete_word_chars"]["count"] > 0:
+        print(f"  complete_word_chars        {format_length_stats(length_stats['complete_word_chars'])}")
 
     ordered_categories = [
         "complete_word",
@@ -181,12 +252,12 @@ def print_comparison_table(summaries):
     if len(summaries) < 2:
         return
     print("\n=== Comparison ===")
-    header = (
+    composition_header = (
         f"{'tokenizer':40s} {'vocab':>10s} {'complete':>10s} {'complete%':>10s} "
         f"{'spaced%':>10s} {'alpha_frag%':>12s} {'mixed_frag%':>12s} {'byte_frag%':>11s}"
     )
-    print(header)
-    print("-" * len(header))
+    print(composition_header)
+    print("-" * len(composition_header))
     for summary in summaries:
         counts = summary["counts"]
         vocab_size = summary["vocab_size"]
@@ -200,6 +271,30 @@ def print_comparison_table(summaries):
             f"{pct(counts.get('alpha_fragment', 0), vocab_size):11.2f}% "
             f"{pct(counts.get('mixed_fragment', 0), vocab_size):11.2f}% "
             f"{pct(counts.get('byte_fragment', 0), vocab_size):10.2f}%"
+        )
+        print(row)
+
+    print("\n=== Length Comparison ===")
+    length_header = (
+        f"{'tokenizer':40s} {'mean_chars':>11s} {'p50_chars':>10s} {'p90_chars':>10s} "
+        f"{'max_chars':>10s} {'mean_bytes':>11s} {'mean_lead_ws':>13s} {'mean_trail_ws':>14s}"
+    )
+    print(length_header)
+    print("-" * len(length_header))
+    for summary in summaries:
+        stripped_stats = summary["length_stats"]["stripped_chars"]
+        byte_stats = summary["length_stats"]["token_bytes"]
+        leading_stats = summary["length_stats"]["leading_whitespace_chars"]
+        trailing_stats = summary["length_stats"]["trailing_whitespace_chars"]
+        row = (
+            f"{os.path.basename(summary['tokenizer_dir']):40.40s} "
+            f"{stripped_stats['mean']:10.2f} "
+            f"{stripped_stats['p50']:10d} "
+            f"{stripped_stats['p90']:10d} "
+            f"{stripped_stats['max']:10d} "
+            f"{byte_stats['mean']:10.2f} "
+            f"{leading_stats['mean']:13.2f} "
+            f"{trailing_stats['mean']:14.2f}"
         )
         print(row)
 

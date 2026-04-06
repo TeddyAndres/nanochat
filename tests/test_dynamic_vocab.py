@@ -155,6 +155,51 @@ def test_dynamic_vocab_runtime_state_dict_round_trip():
         assert torch.allclose(runtime_state["exp_avg_sq"], restored_state["exp_avg_sq"])
     assert runtime.runtime_step == restored.runtime_step
     assert torch.equal(runtime.last_seen_step_cpu, restored.last_seen_step_cpu)
+    assert torch.equal(runtime.token_event_step_count_cpu, restored.token_event_step_count_cpu)
+
+
+def test_sparse_step_uses_token_local_event_count_instead_of_table_age():
+    torch.manual_seed(0)
+    model_a = build_tiny_model(vocab_size=10)
+    model_b = build_tiny_model(vocab_size=10)
+    model_b.load_state_dict(model_a.state_dict())
+
+    runtime_a = DynamicVocabRuntime(model_a, device="cpu", embedding_lr=0.05, value_embedding_lr=0.04, unembedding_lr=0.03)
+    runtime_b = DynamicVocabRuntime(model_b, device="cpu", embedding_lr=0.05, value_embedding_lr=0.04, unembedding_lr=0.03)
+
+    token_id = torch.tensor([3], dtype=torch.long)
+    for runtime in (runtime_a, runtime_b):
+        runtime.token_event_step_count_cpu[token_id] = 1
+
+    for name in runtime_a.table_specs:
+        param_a = runtime_a.table_specs[name]["param"]
+        param_b = runtime_b.table_specs[name]["param"]
+        runtime_a.state[param_a]["step"] = 100
+        runtime_b.state[param_b]["step"] = 0
+
+    step_a = runtime_a.prepare_step(token_id)
+    step_b = runtime_b.prepare_step(token_id)
+
+    step_a.active_vocab["wte"].grad = torch.ones_like(step_a.active_vocab["wte"])
+    step_b.active_vocab["wte"].grad = torch.ones_like(step_b.active_vocab["wte"])
+    step_a.active_vocab["lm_head"].grad = 2 * torch.ones_like(step_a.active_vocab["lm_head"])
+    step_b.active_vocab["lm_head"].grad = 2 * torch.ones_like(step_b.active_vocab["lm_head"])
+    for value_embed_a, value_embed_b in zip(step_a.active_vocab["value_embeds"].values(), step_b.active_vocab["value_embeds"].values()):
+        value_embed_a.grad = 3 * torch.ones_like(value_embed_a)
+        value_embed_b.grad = 3 * torch.ones_like(value_embed_b)
+
+    runtime_a.step(step_a)
+    runtime_b.step(step_b)
+
+    for name in runtime_a.table_specs:
+        param_a = runtime_a.table_specs[name]["param"]
+        param_b = runtime_b.table_specs[name]["param"]
+        assert torch.allclose(param_a[token_id], param_b[token_id])
+        assert torch.allclose(runtime_a.state[param_a]["exp_avg"][token_id], runtime_b.state[param_b]["exp_avg"][token_id])
+        assert torch.allclose(runtime_a.state[param_a]["exp_avg_sq"][token_id], runtime_b.state[param_b]["exp_avg_sq"][token_id])
+
+    assert runtime_a.token_event_step_count_cpu[token_id].item() == 2
+    assert runtime_b.token_event_step_count_cpu[token_id].item() == 2
 
 
 def test_dynamic_vocab_dense_materialization_round_trip():
@@ -1485,6 +1530,8 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         reference_param = reference_runtime.table_specs[name]["param"]
         assert torch.allclose(runtime_param[union_ids_tensor], reference_param[union_ids_tensor])
         assert runtime.state[runtime_param]["step"] == reference_runtime.state[reference_param]["step"]
+    assert torch.equal(runtime.token_event_step_count_cpu[union_ids_tensor], torch.ones_like(union_ids_tensor))
+    assert torch.equal(reference_runtime.token_event_step_count_cpu[union_ids_tensor], torch.ones_like(union_ids_tensor))
 
     runtime.flush_active_to_cpu()
 
