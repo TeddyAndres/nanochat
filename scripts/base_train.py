@@ -422,20 +422,29 @@ if args.sparse_mode:
     if args.sparse_logit_scale != 1.0:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
     if args.sparse_cold_bias_scale > 0.0:
+        bias_start = args.sparse_cold_bias_scale * get_lr_multiplier(0)
+        bias_mid = args.sparse_cold_bias_scale * get_lr_multiplier(max(num_iterations // 2, 0))
+        bias_end = args.sparse_cold_bias_scale * get_lr_multiplier(max(num_iterations - 1, 0))
         bias_examples = []
         for cold_steps in (1, 10, 100):
-            raw_bias = args.sparse_cold_bias_scale * math.log1p(cold_steps * total_batch_size / B_REF)
+            raw_bias = bias_mid * math.log1p(cold_steps * total_batch_size / B_REF)
             clamped_bias = max(min(raw_bias, COLD_LOGIT_BIAS_CLAMP_MAX), COLD_LOGIT_BIAS_CLAMP_MIN)
             bias_examples.append(f"{cold_steps}: raw={raw_bias:.2f}, clamped={clamped_bias:.2f}")
         print0(
-            f"Sparse cold-token bias enabled: stale-only scale={args.sparse_cold_bias_scale:.4f}, "
+            f"Sparse cold-token bias enabled: base_scale={args.sparse_cold_bias_scale:.4f}, "
+            f"effective_scale(start/mid/end)={bias_start:.4f}/{bias_mid:.4f}/{bias_end:.4f}, "
             f"first_seen_bias=0, reference_tokens={B_REF:,}, total_batch={total_batch_size:,}, "
             f"clamp=[{COLD_LOGIT_BIAS_CLAMP_MIN:.0f}, {COLD_LOGIT_BIAS_CLAMP_MAX:.0f}], "
-            f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
+            f"bias_examples(midpoint steps -> raw/clamped): {'; '.join(bias_examples)}"
         )
     if args.sparse_cold_row_decay > 0.0:
+        decay_start = args.sparse_cold_row_decay * get_lr_multiplier(0)
+        decay_mid = args.sparse_cold_row_decay * get_lr_multiplier(max(num_iterations // 2, 0))
+        decay_end = args.sparse_cold_row_decay * get_lr_multiplier(max(num_iterations - 1, 0))
         print0(
-            f"Sparse cold-row decay enabled: multiplying CPU lm_head rows outside the next-step sparse table by {1.0 - args.sparse_cold_row_decay:.6f} after each stage"
+            f"Sparse cold-row decay enabled: base_decay={args.sparse_cold_row_decay:.6f}, "
+            f"effective_decay(start/mid/end)={decay_start:.6f}/{decay_mid:.6f}/{decay_end:.6f}, "
+            f"effective_multiplier(start/mid/end)={1.0 - decay_start:.6f}/{1.0 - decay_mid:.6f}/{1.0 - decay_end:.6f}"
         )
     sparse_fixed_u_max = None
     sparse_lm_head_u_max = None
@@ -623,13 +632,13 @@ def get_lr_multiplier(it):
 def get_sparse_cold_bias_scale(it):
     if not args.sparse_mode or args.sparse_cold_bias_scale <= 0.0:
         return 0.0
-    return args.sparse_cold_bias_scale
+    return args.sparse_cold_bias_scale * get_lr_multiplier(it)
 
 
 def get_sparse_cold_row_decay(it):
     if not args.sparse_mode or args.sparse_cold_row_decay <= 0.0:
         return 0.0
-    return args.sparse_cold_row_decay
+    return args.sparse_cold_row_decay * get_lr_multiplier(it)
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
