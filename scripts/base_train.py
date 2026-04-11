@@ -80,7 +80,7 @@ parser.add_argument("--sparse-mode", action="store_true", help="enable first-pas
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
 parser.add_argument("--sparse-cold-bias-scale", type=float, default=0.0, help="sparse-only cold-token bias coefficient; effective magnitude also follows sparse unembedding LR, LR schedule, and total batch size")
-parser.add_argument("--sparse-cold-row-decrement", type=float, default=0.0, help="sparse-only fixed per-step CPU decrement applied to lm_head rows outside the next-step sparse table")
+parser.add_argument("--sparse-cold-row-decay", "--sparse-cold-row-decrement", dest="sparse_cold_row_decay", type=float, default=0.0, help="sparse-only fixed per-step CPU multiplicative decay applied to lm_head rows outside the next-step sparse table")
 parser.add_argument("--sparse-cloud-max-u", type=int, default=0, help="fixed lm_head sparse capacity for step_U + warm + cold rows (0 disables cloud expansion)")
 parser.add_argument("--sparse-cloud-warm-proportion", type=float, default=0.5, help="fraction of lm_head cloud capacity to allocate to warm rows; cold receives the remainder")
 parser.add_argument("--sparse-unembedding-warm-lr", type=float, default=-1.0, help="lm_head LR for warm cloud rows in sparse mode; negative values reuse --unembedding-lr")
@@ -415,7 +415,7 @@ optimizer_data_sparse = None
 if args.sparse_mode:
     assert args.sparse_logit_scale > 0.0, "--sparse-logit-scale must be positive"
     assert args.sparse_cold_bias_scale >= 0.0, "--sparse-cold-bias-scale must be non-negative"
-    assert args.sparse_cold_row_decrement >= 0.0, "--sparse-cold-row-decrement must be non-negative"
+    assert 0.0 <= args.sparse_cold_row_decay <= 1.0, "--sparse-cold-row-decay must be in [0, 1]"
     assert 0.0 <= args.sparse_cloud_warm_proportion <= 1.0, "--sparse-cloud-warm-proportion must be in [0, 1]"
     if sparse_lm_head_clouds:
         assert hybrid_sparse, "--sparse-cloud-max-u requires --sparse-manifest hybrid sparse mode"
@@ -433,9 +433,9 @@ if args.sparse_mode:
             f"clamp=[{COLD_LOGIT_BIAS_CLAMP_MIN:.0f}, {COLD_LOGIT_BIAS_CLAMP_MAX:.0f}], "
             f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
         )
-    if args.sparse_cold_row_decrement > 0.0:
+    if args.sparse_cold_row_decay > 0.0:
         print0(
-            f"Sparse cold-row decrement enabled: subtracting {args.sparse_cold_row_decrement:.6f} from CPU lm_head rows outside the next-step sparse table after each stage"
+            f"Sparse cold-row decay enabled: multiplying CPU lm_head rows outside the next-step sparse table by {1.0 - args.sparse_cold_row_decay:.6f} after each stage"
         )
     sparse_fixed_u_max = None
     sparse_lm_head_u_max = None
@@ -626,10 +626,10 @@ def get_sparse_cold_bias_scale(it):
     return args.sparse_cold_bias_scale
 
 
-def get_sparse_cold_row_decrement(it):
-    if not args.sparse_mode or args.sparse_cold_row_decrement <= 0.0:
+def get_sparse_cold_row_decay(it):
+    if not args.sparse_mode or args.sparse_cold_row_decay <= 0.0:
         return 0.0
-    return args.sparse_cold_row_decrement
+    return args.sparse_cold_row_decay
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
@@ -917,7 +917,7 @@ while True:
     sparse_accum_call_ms = 0.0
     sparse_apply_call_ms = 0.0
     sparse_cold_bias = get_sparse_cold_bias_scale(step)
-    sparse_cold_row_decrement = get_sparse_cold_row_decrement(step)
+    sparse_cold_row_decay = get_sparse_cold_row_decay(step)
     for micro_step in range(grad_accum_steps):
         micro_t0 = time.perf_counter()
         if args.sparse_mode:
@@ -925,7 +925,7 @@ while True:
             sparse_step_ctx = dynamic_vocab.prepare_step(
                 sparse_batch_meta,
                 cold_bias_scale=sparse_cold_bias,
-                cold_row_decrement=sparse_cold_row_decrement,
+                cold_row_decay=sparse_cold_row_decay,
                 cold_bias_tokens_per_step=total_batch_size,
             )
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0

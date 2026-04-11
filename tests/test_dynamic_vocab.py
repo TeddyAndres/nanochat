@@ -1393,7 +1393,7 @@ def test_cold_logit_bias_returns_zeros_for_non_positive_scale():
     assert torch.allclose(cold_bias, torch.zeros_like(cold_steps))
 
 
-def test_fixed_u_cold_row_decrement_updates_cpu_complement_after_staging():
+def test_fixed_u_cold_row_decay_updates_cpu_complement_after_staging():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
     runtime = DynamicVocabRuntime(
@@ -1415,7 +1415,7 @@ def test_fixed_u_cold_row_decrement_updates_cpu_complement_after_staging():
         is_last_step=True,
     )
 
-    step_ctx = runtime.prepare_step(step_meta, cold_row_decrement=0.25)
+    step_ctx = runtime.prepare_step(step_meta, cold_row_decay=0.25)
 
     assert torch.allclose(step_ctx.active_vocab["lm_head"][0], base_lm_head[0])
     assert torch.allclose(step_ctx.active_vocab["lm_head"][1], base_lm_head[2])
@@ -1423,11 +1423,11 @@ def test_fixed_u_cold_row_decrement_updates_cpu_complement_after_staging():
     cpu_lm_head = runtime.table_specs["lm_head"]["param"]
     assert torch.allclose(cpu_lm_head[0], base_lm_head[0])
     assert torch.allclose(cpu_lm_head[2], base_lm_head[2])
-    assert torch.allclose(cpu_lm_head[1], base_lm_head[1] - 0.25)
-    assert torch.allclose(cpu_lm_head[7], base_lm_head[7] - 0.25)
+    assert torch.allclose(cpu_lm_head[1], base_lm_head[1] * 0.75)
+    assert torch.allclose(cpu_lm_head[7], base_lm_head[7] * 0.75)
 
 
-def test_fixed_u_cold_row_decrement_accumulates_across_steps_for_absent_rows():
+def test_fixed_u_cold_row_decay_accumulates_across_steps_for_absent_rows():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
     runtime = DynamicVocabRuntime(
@@ -1449,19 +1449,19 @@ def test_fixed_u_cold_row_decrement_accumulates_across_steps_for_absent_rows():
         is_last_step=True,
     )
 
-    step0_ctx = runtime.prepare_step(step_meta, cold_row_decrement=0.5)
+    step0_ctx = runtime.prepare_step(step_meta, cold_row_decay=0.5)
     set_zero_sparse_grads(step0_ctx)
     runtime.step(step0_ctx)
 
-    step1_ctx = runtime.prepare_step(step_meta, cold_row_decrement=0.5)
+    step1_ctx = runtime.prepare_step(step_meta, cold_row_decay=0.5)
 
     cpu_lm_head = runtime.table_specs["lm_head"]["param"]
     assert torch.allclose(cpu_lm_head[0], base_lm_head[0])
-    assert torch.allclose(cpu_lm_head[1], base_lm_head[1] - 1.0)
+    assert torch.allclose(cpu_lm_head[1], base_lm_head[1] * 0.25)
     assert torch.allclose(step1_ctx.active_vocab["lm_head"][0], base_lm_head[0])
 
 
-def test_fixed_u_cold_row_decrement_runs_once_per_grad_accum_union_stage():
+def test_fixed_u_cold_row_decay_runs_once_per_grad_accum_union_stage():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
     runtime = DynamicVocabRuntime(
@@ -1488,8 +1488,8 @@ def test_fixed_u_cold_row_decrement_runs_once_per_grad_accum_union_stage():
         is_grad_accum_boundary=False,
         is_last_step=False,
     )
-    micro0_ctx = runtime.prepare_step(micro0, cold_row_decrement=0.25)
-    assert torch.allclose(runtime.table_specs["lm_head"]["param"][1], base_lm_head[1] - 0.25)
+    micro0_ctx = runtime.prepare_step(micro0, cold_row_decay=0.25)
+    assert torch.allclose(runtime.table_specs["lm_head"]["param"][1], base_lm_head[1] * 0.75)
     set_zero_sparse_grads(micro0_ctx)
     runtime.accumulate_gradients(micro0_ctx)
 
@@ -1505,14 +1505,14 @@ def test_fixed_u_cold_row_decrement_runs_once_per_grad_accum_union_stage():
         is_grad_accum_boundary=True,
         is_last_step=False,
     )
-    micro1_ctx = runtime.prepare_step(micro1, cold_row_decrement=0.25)
-    assert torch.allclose(runtime.table_specs["lm_head"]["param"][1], base_lm_head[1] - 0.25)
+    micro1_ctx = runtime.prepare_step(micro1, cold_row_decay=0.25)
+    assert torch.allclose(runtime.table_specs["lm_head"]["param"][1], base_lm_head[1] * 0.75)
     set_zero_sparse_grads(micro1_ctx)
     runtime.accumulate_gradients(micro1_ctx)
     runtime.apply_accumulated_gradients()
 
 
-def test_dynamic_sparse_cold_row_decrement_requires_fixed_u_mode():
+def test_dynamic_sparse_cold_row_decay_requires_fixed_u_mode():
     runtime = DynamicVocabRuntime(
         build_tiny_model(vocab_size=8),
         device="cpu",
@@ -1522,7 +1522,7 @@ def test_dynamic_sparse_cold_row_decrement_requires_fixed_u_mode():
     )
 
     with pytest.raises(ValueError, match="fixed-U"):
-        runtime.prepare_step(torch.tensor([0, 1], dtype=torch.long), cold_row_decrement=0.1)
+        runtime.prepare_step(torch.tensor([0, 1], dtype=torch.long), cold_row_decay=0.1)
 
 
 def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
