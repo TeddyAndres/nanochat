@@ -8,7 +8,10 @@ import torch
 
 
 SPARSE_MANIFEST_VERSION = 3
-SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2, 3}
+DUAL_SPARSE_MANIFEST_VERSION = 4
+SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2, 3, 4}
+SPARSE_GROUPING_MANIFEST_KIND = "grouping"
+SPARSE_SEQUENCE_BASE_MANIFEST_KIND = "sequence-base"
 
 
 def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
@@ -18,6 +21,16 @@ def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
             f"Unsupported sparse manifest version {version}; expected one of {sorted(SUPPORTED_SPARSE_MANIFEST_VERSIONS)}"
         )
     return payload
+
+
+def get_sparse_manifest_kind(payload: dict[str, Any]) -> str:
+    version = int(payload.get("version", 1))
+    if version < DUAL_SPARSE_MANIFEST_VERSION:
+        return SPARSE_GROUPING_MANIFEST_KIND
+    manifest_kind = payload.get("manifest_kind", SPARSE_GROUPING_MANIFEST_KIND)
+    if not isinstance(manifest_kind, str) or manifest_kind == "":
+        raise ValueError("Sparse manifest kind must be a non-empty string")
+    return manifest_kind
 
 
 def tensor_ids_to_list(ids: torch.Tensor) -> list[int]:
@@ -150,11 +163,115 @@ def build_sharded_manifest_payload(
     }
 
 
+def build_sequence_manifest_shard_payload(
+    *,
+    shard_index: int,
+    start_sequence_id: int,
+    sequence_units: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "version": DUAL_SPARSE_MANIFEST_VERSION,
+        "manifest_kind": SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
+        "shard_index": int(shard_index),
+        "start_sequence_id": int(start_sequence_id),
+        "num_sequence_units": len(sequence_units),
+        "sequence_units": sequence_units,
+    }
+
+
+def build_sequence_manifest_payload(
+    *,
+    split: str,
+    vocab_size: int,
+    device_batch_size: int,
+    max_seq_len: int,
+    total_batch_size: int,
+    grad_accum_steps: int,
+    ddp_world_size: int,
+    num_iterations: int,
+    buffer_size: int,
+    num_sequence_units: int,
+    shard_sequence_count: int,
+    shards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "version": DUAL_SPARSE_MANIFEST_VERSION,
+        "manifest_kind": SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
+        "split": split,
+        "vocab_size": int(vocab_size),
+        "device_batch_size": int(device_batch_size),
+        "max_seq_len": int(max_seq_len),
+        "total_batch_size": int(total_batch_size),
+        "grad_accum_steps": int(grad_accum_steps),
+        "ddp_world_size": int(ddp_world_size),
+        "num_steps": int(num_iterations),
+        "buffer_size": int(buffer_size),
+        "num_sequence_units": int(num_sequence_units),
+        "shard_sequence_count": int(shard_sequence_count),
+        "num_shards": len(shards),
+        "shards": shards,
+    }
+
+
+def build_grouping_manifest_payload(
+    *,
+    split: str,
+    vocab_size: int,
+    device_batch_size: int,
+    max_seq_len: int,
+    total_batch_size: int,
+    grad_accum_steps: int,
+    ddp_world_size: int,
+    num_iterations: int,
+    buffer_size: int,
+    u_max: int,
+    grad_accum_u_max: int,
+    shard_step_count: int,
+    shards: list[dict[str, Any]],
+    base_manifest_path: str,
+) -> dict[str, Any]:
+    return {
+        "version": DUAL_SPARSE_MANIFEST_VERSION,
+        "manifest_kind": SPARSE_GROUPING_MANIFEST_KIND,
+        "base_manifest_path": base_manifest_path,
+        "split": split,
+        "vocab_size": int(vocab_size),
+        "device_batch_size": int(device_batch_size),
+        "max_seq_len": int(max_seq_len),
+        "total_batch_size": int(total_batch_size),
+        "grad_accum_steps": int(grad_accum_steps),
+        "ddp_world_size": int(ddp_world_size),
+        "num_steps": int(num_iterations),
+        "buffer_size": int(buffer_size),
+        "u_max": int(u_max),
+        "grad_accum_u_max": int(grad_accum_u_max),
+        "shard_step_count": int(shard_step_count),
+        "num_shards": len(shards),
+        "shards": shards,
+    }
+
+
 def save_sparse_manifest(path: str | Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f)
+
+
+def save_sequence_manifest_shard(path: str | Path, payload: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+
+
+def load_sequence_manifest_shard(path: str | Path) -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Sequence manifest shard must deserialize to a dict payload")
+    _validate_manifest_version(payload)
+    if get_sparse_manifest_kind(payload) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
+        raise ValueError("Sequence manifest shard payload must have kind 'sequence-base'")
+    return payload
 
 
 def _resolve_shard_path(manifest_path: str | Path, shard_entry: dict[str, Any]) -> Path:
@@ -193,6 +310,9 @@ def resolve_sparse_manifest_grad_accum_u_max(path: str | Path, header: dict[str,
     path = Path(path)
     if header is None:
         header = load_sparse_manifest_header(path)
+
+    if get_sparse_manifest_kind(header) != SPARSE_GROUPING_MANIFEST_KIND:
+        raise ValueError("grad_accum_u_max is only defined for grouping sparse manifests")
 
     u_max = int(header.get("u_max", 0))
     if u_max <= 0:
@@ -314,6 +434,8 @@ def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Itera
         raise ValueError(f"Sparse manifest start_step must be non-negative, got {start_step}")
 
     header = load_sparse_manifest_header(path)
+    if get_sparse_manifest_kind(header) != SPARSE_GROUPING_MANIFEST_KIND:
+        raise ValueError("Only grouping sparse manifests contain sparse runtime step entries")
     shards = header.get("shards")
     if not isinstance(shards, list) or len(shards) == 0:
         yield from _stream_sparse_manifest_file_steps(path, start_step=start_step)
@@ -350,6 +472,9 @@ def validate_sparse_manifest(
     ddp_world_size: int,
     num_iterations: int | None = None,
 ) -> None:
+    manifest_kind = get_sparse_manifest_kind(payload)
+    if manifest_kind != SPARSE_GROUPING_MANIFEST_KIND:
+        raise ValueError("validate_sparse_manifest only accepts grouping sparse manifests")
     expected = {
         "split": split,
         "vocab_size": int(vocab_size),
@@ -440,3 +565,69 @@ def validate_sparse_manifest(
                 raise ValueError(
                     f"Sparse manifest step {step_idx} grad_accum_u_size exceeds grad_accum_u_max: {grad_accum_u_size} > {grad_accum_u_max}"
                 )
+
+
+def validate_sequence_manifest(
+    payload: dict[str, Any],
+    *,
+    split: str,
+    vocab_size: int,
+    device_batch_size: int,
+    max_seq_len: int,
+    ddp_world_size: int,
+    num_iterations: int | None = None,
+) -> None:
+    manifest_kind = get_sparse_manifest_kind(payload)
+    if manifest_kind != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
+        raise ValueError("validate_sequence_manifest only accepts base sequence manifests")
+    expected = {
+        "split": split,
+        "vocab_size": int(vocab_size),
+        "device_batch_size": int(device_batch_size),
+        "max_seq_len": int(max_seq_len),
+        "ddp_world_size": int(ddp_world_size),
+    }
+    if num_iterations is not None:
+        expected["num_steps"] = int(num_iterations)
+    for key, value in expected.items():
+        found = payload.get(key)
+        if isinstance(value, int):
+            matches = found is not None and int(found) == value
+        else:
+            matches = found == value
+        if not matches:
+            raise ValueError(
+                f"Sequence manifest mismatch for {key}: expected {value}, found {found}"
+            )
+    num_sequence_units = int(payload.get("num_sequence_units", -1))
+    if num_sequence_units <= 0:
+        raise ValueError("Sequence manifest must define a positive num_sequence_units")
+    num_steps = int(payload.get("num_steps", -1))
+    if num_steps <= 0:
+        raise ValueError("Sequence manifest must define a positive num_steps")
+    shards = payload.get("shards")
+    if not isinstance(shards, list) or len(shards) == 0:
+        raise ValueError("Sequence manifest shards must be a non-empty list")
+    shard_total_units = 0
+    for shard_idx, shard_entry in enumerate(shards):
+        shard_num_units = int(shard_entry.get("num_sequence_units", 0))
+        if shard_num_units <= 0:
+            raise ValueError(f"Sequence manifest shard {shard_idx} must define a positive num_sequence_units")
+        shard_total_units += shard_num_units
+        shard_path = shard_entry.get("path")
+        if not isinstance(shard_path, str) or shard_path == "":
+            raise ValueError(f"Sequence manifest shard {shard_idx} must define a non-empty path")
+    if shard_total_units != num_sequence_units:
+        raise ValueError("Sequence manifest num_sequence_units does not match summed shard num_sequence_units")
+
+
+def resolve_grouping_base_manifest_path(path: str | Path, header: dict[str, Any] | None = None) -> Path:
+    path = Path(path)
+    if header is None:
+        header = load_sparse_manifest_header(path)
+    if get_sparse_manifest_kind(header) != SPARSE_GROUPING_MANIFEST_KIND:
+        raise ValueError("Only grouping manifests define a base_manifest_path")
+    base_manifest_path = header.get("base_manifest_path")
+    if not isinstance(base_manifest_path, str) or base_manifest_path == "":
+        raise ValueError("Grouping manifest must define a non-empty base_manifest_path")
+    return path.parent / base_manifest_path

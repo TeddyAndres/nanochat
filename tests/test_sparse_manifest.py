@@ -9,13 +9,18 @@ from scripts.build_sparse_manifest import resolve_batch_geometry
 
 from nanochat import dataloader as dataloader_module
 from nanochat.sparse_manifest import (
+    build_grouping_manifest_payload,
     build_manifest_payload,
     build_manifest_shard_payload,
+    build_sequence_manifest_payload,
+    build_sequence_manifest_shard_payload,
     build_sharded_manifest_payload,
     load_sparse_manifest_header,
     resolve_sparse_manifest_grad_accum_u_max,
+    save_sequence_manifest_shard,
     save_sparse_manifest,
     stream_sparse_manifest_steps,
+    validate_sequence_manifest,
     validate_sparse_manifest,
 )
 import nanochat.token_cache as token_cache_module
@@ -318,6 +323,227 @@ def test_sparse_manifest_streams_across_shards(tmp_path):
     assert resolve_sparse_manifest_grad_accum_u_max(manifest_path, header) == 4
     assert list(stream_sparse_manifest_steps(manifest_path)) == steps
     assert list(stream_sparse_manifest_steps(manifest_path, start_step=1)) == steps[1:]
+
+
+def test_sequence_manifest_header_validation(tmp_path):
+    sequence_units = [
+        {
+            "sequence_id": 0,
+            "inputs": torch.tensor([[1, 2]], dtype=torch.long),
+            "targets": torch.tensor([[2, 3]], dtype=torch.long),
+            "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 1},
+        },
+        {
+            "sequence_id": 1,
+            "inputs": torch.tensor([[2, 3]], dtype=torch.long),
+            "targets": torch.tensor([[3, 4]], dtype=torch.long),
+            "state_dict": {"pq_idx": 1, "rg_idx": 0, "epoch": 1},
+        },
+    ]
+    shard_payload = build_sequence_manifest_shard_payload(
+        shard_index=0,
+        start_sequence_id=0,
+        sequence_units=sequence_units,
+    )
+    shard_path = tmp_path / "sequence_shards" / "sequence.shard00000.pt"
+    save_sequence_manifest_shard(shard_path, shard_payload)
+
+    manifest_path = tmp_path / "sequence_manifest.json"
+    save_sparse_manifest(
+        manifest_path,
+        build_sequence_manifest_payload(
+            split="train",
+            vocab_size=16,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=4,
+            grad_accum_steps=2,
+            ddp_world_size=1,
+            num_iterations=1,
+            buffer_size=4,
+            num_sequence_units=2,
+            shard_sequence_count=2,
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(shard_path.relative_to(tmp_path)),
+                    "start_sequence_id": 0,
+                    "num_sequence_units": 2,
+                }
+            ],
+        ),
+    )
+
+    header = load_sparse_manifest_header(manifest_path)
+    validate_sequence_manifest(
+        header,
+        split="train",
+        vocab_size=16,
+        device_batch_size=1,
+        max_seq_len=2,
+        ddp_world_size=1,
+        num_iterations=1,
+    )
+    assert header["manifest_kind"] == "sequence-base"
+    assert header["num_sequence_units"] == 2
+
+
+def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
+    sequence_units = [
+        {
+            "sequence_id": 0,
+            "inputs": torch.tensor([[1, 2]], dtype=torch.long),
+            "targets": torch.tensor([[2, 3]], dtype=torch.long),
+            "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 1},
+        },
+        {
+            "sequence_id": 1,
+            "inputs": torch.tensor([[2, 3]], dtype=torch.long),
+            "targets": torch.tensor([[3, 4]], dtype=torch.long),
+            "state_dict": {"pq_idx": 1, "rg_idx": 0, "epoch": 1},
+        },
+    ]
+    sequence_shard_payload = build_sequence_manifest_shard_payload(
+        shard_index=0,
+        start_sequence_id=0,
+        sequence_units=sequence_units,
+    )
+    sequence_shard_path = tmp_path / "sequence_manifest_shards" / "sequence_manifest.shard00000.pt"
+    save_sequence_manifest_shard(sequence_shard_path, sequence_shard_payload)
+    base_manifest_path = tmp_path / "sequence_manifest.json"
+    save_sparse_manifest(
+        base_manifest_path,
+        build_sequence_manifest_payload(
+            split="train",
+            vocab_size=16,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=4,
+            grad_accum_steps=2,
+            ddp_world_size=1,
+            num_iterations=1,
+            buffer_size=4,
+            num_sequence_units=2,
+            shard_sequence_count=2,
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(sequence_shard_path.relative_to(tmp_path)),
+                    "start_sequence_id": 0,
+                    "num_sequence_units": 2,
+                }
+            ],
+        ),
+    )
+
+    grouping_steps = [
+        {
+            "step": 0,
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [1, 2, 3, 4],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "sequence_id": 0,
+                    "u_size": 3,
+                    "active_ids": [1, 2, 3],
+                    "next_common_ids": [2, 3],
+                    "next_leaving_ids": [1],
+                    "next_new_ids": [4],
+                },
+                {
+                    "microstep": 1,
+                    "sequence_id": 1,
+                    "u_size": 3,
+                    "active_ids": [2, 3, 4],
+                    "next_common_ids": [],
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                },
+            ],
+        },
+    ]
+    grouping_shard_path = tmp_path / "grouping_manifest_shards" / "grouping_manifest.shard00000.json"
+    save_sparse_manifest(
+        grouping_shard_path,
+        build_manifest_shard_payload(
+            shard_index=0,
+            start_step=0,
+            steps=grouping_steps,
+        ),
+    )
+    grouping_manifest_path = tmp_path / "grouping_manifest.json"
+    save_sparse_manifest(
+        grouping_manifest_path,
+        build_grouping_manifest_payload(
+            split="train",
+            vocab_size=16,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=4,
+            grad_accum_steps=2,
+            ddp_world_size=1,
+            num_iterations=1,
+            buffer_size=4,
+            u_max=3,
+            grad_accum_u_max=4,
+            shard_step_count=1,
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(grouping_shard_path.relative_to(tmp_path)),
+                    "start_step": 0,
+                    "num_steps": 1,
+                    "u_max": 3,
+                    "grad_accum_u_max": 4,
+                }
+            ],
+            base_manifest_path=str(base_manifest_path.relative_to(tmp_path)),
+        ),
+    )
+
+    def fail_if_live_loader_called(*args, **kwargs):
+        raise AssertionError("dual-manifest loader should not consume the live best-fit loader")
+
+    monkeypatch.setattr(
+        dataloader_module,
+        "tokenizing_distributed_data_loader_with_state_bos_bestfit",
+        fail_if_live_loader_called,
+    )
+
+    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
+        tokenizer=None,
+        B=1,
+        T=2,
+        split="train",
+        manifest_path=grouping_manifest_path,
+        device="cpu",
+        vocab_size=16,
+        include_local_batch=False,
+    )
+
+    inputs0, targets0, step_meta0, state0 = next(loader)
+    inputs0 = inputs0.clone()
+    targets0 = targets0.clone()
+    step_meta0 = dict(step_meta0)
+    state0 = dict(state0)
+    inputs1, targets1, step_meta1, state1 = next(loader)
+    inputs1 = inputs1.clone()
+    targets1 = targets1.clone()
+    step_meta1 = dict(step_meta1)
+    state1 = dict(state1)
+
+    assert torch.equal(inputs0, torch.tensor([[0, 1]], dtype=torch.long))
+    assert torch.equal(targets0, torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(step_meta0["targets_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
+    assert state0["manifest_step"] == 0
+    assert state0["pq_idx"] == 0
+
+    assert torch.equal(inputs1, torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(targets1, torch.tensor([[2, 0]], dtype=torch.long))
+    assert torch.equal(step_meta1["targets_union_cpu_local"], torch.tensor([[2, 3]], dtype=torch.long))
+    assert state1["manifest_step"] == 0
+    assert state1["pq_idx"] == 1
 
 
 def test_manifest_loader_emits_union_targets_without_local_batch_payload(tmp_path, monkeypatch):

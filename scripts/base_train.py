@@ -38,7 +38,13 @@ from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CL
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
-from nanochat.sparse_manifest import load_sparse_manifest_header, resolve_sparse_manifest_grad_accum_u_max, validate_sparse_manifest
+from nanochat.sparse_manifest import (
+    load_sparse_manifest_header,
+    resolve_grouping_base_manifest_path,
+    resolve_sparse_manifest_grad_accum_u_max,
+    validate_sequence_manifest,
+    validate_sparse_manifest,
+)
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -221,10 +227,15 @@ output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 sparse_manifest = None
+sparse_base_manifest = None
+sparse_base_manifest_path = ""
 hybrid_sparse = args.sparse_mode and args.sparse_manifest != ""
 sparse_lm_head_clouds = args.sparse_cloud_max_u > 0
 if hybrid_sparse:
     sparse_manifest = load_sparse_manifest_header(args.sparse_manifest)
+    if "base_manifest_path" in sparse_manifest:
+        sparse_base_manifest_path = str(resolve_grouping_base_manifest_path(args.sparse_manifest, sparse_manifest))
+        sparse_base_manifest = load_sparse_manifest_header(sparse_base_manifest_path)
 if args.sparse_mode:
     assert not ddp, "Sparse mode is single-GPU only for now"
     if hybrid_sparse:
@@ -239,6 +250,10 @@ if resuming:
         checkpoint_manifest = meta_data.get("sparse_manifest", "")
         assert checkpoint_manifest == args.sparse_manifest, (
             f"Sparse manifest mismatch on resume: checkpoint uses '{checkpoint_manifest}', current run uses '{args.sparse_manifest}'"
+        )
+        checkpoint_base_manifest = meta_data.get("sparse_base_manifest", "")
+        assert checkpoint_base_manifest == sparse_base_manifest_path, (
+            f"Sparse base manifest mismatch on resume: checkpoint uses '{checkpoint_base_manifest}', current run uses '{sparse_base_manifest_path}'"
         )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
@@ -611,7 +626,7 @@ def get_lr_multiplier(it):
 def get_sparse_cold_bias_scale(it):
     if not args.sparse_mode or args.sparse_cold_bias_scale <= 0.0:
         return 0.0
-    return args.sparse_cold_bias_scale * get_lr_multiplier(it)
+    return args.sparse_cold_bias_scale
 
 
 def get_sparse_cold_row_decay(it):
@@ -621,19 +636,16 @@ def get_sparse_cold_row_decay(it):
 
 
 if args.sparse_mode and args.sparse_cold_bias_scale > 0.0:
-    bias_start = get_sparse_cold_bias_scale(0)
-    bias_mid = get_sparse_cold_bias_scale(max(num_iterations // 2, 0))
-    bias_end = get_sparse_cold_bias_scale(max(num_iterations - 1, 0))
     bias_examples = []
     for cold_steps in (1, 10, 100):
-        raw_bias = bias_mid * math.log1p(cold_steps * total_batch_size / B_REF)
+        raw_bias = args.sparse_cold_bias_scale * math.log1p(cold_steps * total_batch_size / B_REF)
         clamped_bias = max(min(raw_bias, COLD_LOGIT_BIAS_CLAMP_MAX), COLD_LOGIT_BIAS_CLAMP_MIN)
         bias_examples.append(f"{cold_steps}: raw={raw_bias:.2f}, clamped={clamped_bias:.2f}")
     print0(
-        f"Sparse cold-token bias schedule: effective_scale(start/mid/end)={bias_start:.4f}/{bias_mid:.4f}/{bias_end:.4f}, "
+        f"Sparse cold-token bias: scale={args.sparse_cold_bias_scale:.4f}, "
         f"first_seen_bias=0, reference_tokens={B_REF:,}, total_batch={total_batch_size:,}, "
         f"clamp=[{COLD_LOGIT_BIAS_CLAMP_MIN:.0f}, {COLD_LOGIT_BIAS_CLAMP_MAX:.0f}], "
-        f"bias_examples(midpoint steps -> raw/clamped): {'; '.join(bias_examples)}"
+        f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
     )
 
 if args.sparse_mode and args.sparse_cold_row_decay > 0.0:
@@ -761,6 +773,15 @@ if hybrid_sparse:
         grad_accum_steps=grad_accum_steps,
         ddp_world_size=ddp_world_size,
     )
+    if sparse_base_manifest is not None:
+        validate_sequence_manifest(
+            sparse_base_manifest,
+            split="train",
+            vocab_size=vocab_size,
+            device_batch_size=args.device_batch_size,
+            max_seq_len=args.max_seq_len,
+            ddp_world_size=ddp_world_size,
+        )
     print0(
         f"Sparse hybrid manifest: {args.sparse_manifest} | "
         f"manifest_U_max={int(sparse_manifest['u_max']):,} | "
@@ -769,6 +790,11 @@ if hybrid_sparse:
         f"manifest_grad_accum_U_max={resolved_grad_accum_u_max:,} | "
         f"model_grad_accum_U_max={dynamic_vocab.grad_accum_u_max:,}"
     )
+    if sparse_base_manifest is not None:
+        print0(
+            f"Sparse base sequence manifest: {sparse_base_manifest_path} | "
+            f"sequence_units={int(sparse_base_manifest['num_sequence_units']):,}"
+        )
 
 # Go!
 while True:
@@ -897,6 +923,7 @@ while True:
                 "val_ece": val_ece,
                 "sparse_mode": args.sparse_mode,
                 "sparse_manifest": (args.sparse_manifest if hybrid_sparse else ""),
+                "sparse_base_manifest": (sparse_base_manifest_path if hybrid_sparse else ""),
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,

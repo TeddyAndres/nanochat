@@ -22,7 +22,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import torch
 
 from nanochat.common import get_dist_info
-from nanochat.sparse_manifest import load_sparse_manifest_header, stream_sparse_manifest_steps, validate_sparse_manifest
+from nanochat.sparse_manifest import (
+    DUAL_SPARSE_MANIFEST_VERSION,
+    SPARSE_GROUPING_MANIFEST_KIND,
+    SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
+    get_sparse_manifest_kind,
+    load_sequence_manifest_shard,
+    load_sparse_manifest_header,
+    resolve_grouping_base_manifest_path,
+    stream_sparse_manifest_steps,
+    validate_sequence_manifest,
+    validate_sparse_manifest,
+)
 from nanochat.token_cache import (
     ensure_token_cache,
     iter_cached_token_batches,
@@ -266,6 +277,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     manifest = load_sparse_manifest_header(manifest_path)
     manifest_version = int(manifest.get("version", 1))
+    manifest_kind = get_sparse_manifest_kind(manifest)
+    if manifest_kind != SPARSE_GROUPING_MANIFEST_KIND:
+        raise ValueError("Manifest sparse loader requires a grouping sparse manifest")
     validate_sparse_manifest(
         manifest,
         split=split,
@@ -292,20 +306,68 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             f"Sparse manifest step {manifest_step} is out of range for {num_manifest_steps} stored steps"
         )
 
-    base_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-        tokenizer,
-        B,
-        T,
-        split,
-        tokenizer_threads=tokenizer_threads,
-        tokenizer_batch_size=tokenizer_batch_size,
-        device="cpu",
-        resume_state_dict=base_resume_state,
-        buffer_size=buffer_size,
-        token_cache_dir=token_cache_dir,
-        token_cache_shard_batches=token_cache_shard_batches,
-        token_cache_workers=token_cache_workers,
-    )
+    use_dual_manifest = manifest_version >= DUAL_SPARSE_MANIFEST_VERSION and "base_manifest_path" in manifest
+    base_loader = None
+    resolve_sequence_unit = None
+    if use_dual_manifest:
+        base_manifest_path = resolve_grouping_base_manifest_path(manifest_path, manifest)
+        base_manifest = load_sparse_manifest_header(base_manifest_path)
+        if get_sparse_manifest_kind(base_manifest) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
+            raise ValueError("Grouping manifest base_manifest_path must reference a sequence-base manifest")
+        validate_sequence_manifest(
+            base_manifest,
+            split=split,
+            vocab_size=vocab_size,
+            device_batch_size=B,
+            max_seq_len=T,
+            ddp_world_size=ddp_world_size,
+        )
+
+        shard_entries = base_manifest.get("shards")
+        assert isinstance(shard_entries, list) and len(shard_entries) > 0
+        shard_ranges = []
+        for shard_entry in shard_entries:
+            start_sequence_id = int(shard_entry.get("start_sequence_id", -1))
+            shard_num_units = int(shard_entry.get("num_sequence_units", 0))
+            if start_sequence_id < 0 or shard_num_units <= 0:
+                raise ValueError("Sequence manifest shard entries must define start_sequence_id and num_sequence_units")
+            shard_ranges.append((start_sequence_id, start_sequence_id + shard_num_units, shard_entry))
+        loaded_sequence_shard_path = None
+        loaded_sequence_units = None
+
+        def resolve_sequence_unit(sequence_id: int) -> dict:
+            nonlocal loaded_sequence_shard_path, loaded_sequence_units
+            for start_sequence_id, end_sequence_id, shard_entry in shard_ranges:
+                if start_sequence_id <= sequence_id < end_sequence_id:
+                    shard_path = base_manifest_path.parent / str(shard_entry["path"])
+                    if loaded_sequence_shard_path != shard_path:
+                        shard_payload = load_sequence_manifest_shard(shard_path)
+                        units = shard_payload.get("sequence_units")
+                        if not isinstance(units, list):
+                            raise ValueError("Sequence manifest shard must define a sequence_units list")
+                        loaded_sequence_shard_path = shard_path
+                        loaded_sequence_units = {int(unit["sequence_id"]): unit for unit in units}
+                    assert loaded_sequence_units is not None
+                    sequence_unit = loaded_sequence_units.get(sequence_id)
+                    if sequence_unit is None:
+                        raise ValueError(f"Sequence manifest shard is missing sequence_id={sequence_id}")
+                    return sequence_unit
+            raise ValueError(f"Sequence manifest is missing sequence_id={sequence_id}")
+    else:
+        base_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+            tokenizer,
+            B,
+            T,
+            split,
+            tokenizer_threads=tokenizer_threads,
+            tokenizer_batch_size=tokenizer_batch_size,
+            device="cpu",
+            resume_state_dict=base_resume_state,
+            buffer_size=buffer_size,
+            token_cache_dir=token_cache_dir,
+            token_cache_shard_batches=token_cache_shard_batches,
+            token_cache_workers=token_cache_workers,
+        )
 
     use_cuda = torch.device(device).type == "cuda"
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
@@ -395,9 +457,29 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     while True:
         if manifest_step >= num_manifest_steps:
             raise StopIteration
-        base_inputs, base_targets, base_state_dict = next(base_loader)
-        cpu_inputs.copy_(base_inputs)
-        cpu_targets.copy_(base_targets)
+        if use_dual_manifest:
+            assert resolve_sequence_unit is not None
+            sequence_id = int(current_micro_entry.get("sequence_id", -1))
+            if sequence_id < 0:
+                raise ValueError("Dual-manifest microsteps must define a non-negative sequence_id")
+            sequence_unit = resolve_sequence_unit(sequence_id)
+            base_inputs = torch.as_tensor(sequence_unit["inputs"], dtype=torch.long)
+            base_targets = torch.as_tensor(sequence_unit["targets"], dtype=torch.long)
+            if tuple(base_inputs.shape) != (B, T) or tuple(base_targets.shape) != (B, T):
+                raise ValueError(
+                    f"Sequence manifest batch shape mismatch for sequence_id={sequence_id}: "
+                    f"expected {(B, T)}, found inputs={tuple(base_inputs.shape)} targets={tuple(base_targets.shape)}"
+                )
+            base_state_dict = sequence_unit.get("state_dict", {})
+            if not isinstance(base_state_dict, dict):
+                raise ValueError("Sequence manifest state_dict payload must be a dict")
+            cpu_inputs.copy_(base_inputs)
+            cpu_targets.copy_(base_targets)
+        else:
+            assert base_loader is not None
+            base_inputs, base_targets, base_state_dict = next(base_loader)
+            cpu_inputs.copy_(base_inputs)
+            cpu_targets.copy_(base_targets)
         remapped_inputs = global_to_slot[cpu_inputs]
         remapped_targets = global_to_slot[cpu_targets]
         if (remapped_inputs < 0).any() or (remapped_targets < 0).any():
