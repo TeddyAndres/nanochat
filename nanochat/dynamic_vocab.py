@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-COLD_LOGIT_BIAS_CLAMP_MIN = -5.0
-COLD_LOGIT_BIAS_CLAMP_MAX = 5.0
+COLD_LOGIT_BIAS_CLAMP_MIN = -3.0
+COLD_LOGIT_BIAS_CLAMP_MAX = 3.0
 
 
 def round_capacity_up(value: int | None, multiple: int) -> int | None:
@@ -1239,6 +1239,34 @@ class DynamicVocabRuntime:
         stage_buffer.copy_(cpu_tensor)
         return stage_buffer.to(self.device, non_blocking=True)
 
+    @torch.no_grad()
+    def _apply_fixed_lm_head_cold_row_decrement_(
+        self,
+        exempt_global_ids_cpu: torch.Tensor,
+        cold_row_decrement: float,
+    ) -> None:
+        if cold_row_decrement <= 0.0:
+            return
+        vocab_size = int(self.model.config.vocab_size)
+        if vocab_size <= 0:
+            return
+        exempt_global_ids_cpu = exempt_global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        if exempt_global_ids_cpu.numel() > 0:
+            valid_mask = (exempt_global_ids_cpu >= 0) & (exempt_global_ids_cpu < vocab_size)
+            exempt_global_ids_cpu = exempt_global_ids_cpu[valid_mask]
+            if exempt_global_ids_cpu.numel() > 1:
+                exempt_global_ids_cpu = torch.unique(exempt_global_ids_cpu)
+        if exempt_global_ids_cpu.numel() >= vocab_size:
+            return
+        self._flush_pending_cpu_writeback()
+        lm_head_param = self.table_specs["lm_head"]["param"]
+        restore_rows = None
+        if exempt_global_ids_cpu.numel() > 0:
+            restore_rows = lm_head_param.index_select(0, exempt_global_ids_cpu).clone()
+        lm_head_param.narrow(0, 0, vocab_size).sub_(float(cold_row_decrement))
+        if restore_rows is not None:
+            lm_head_param.index_copy_(0, exempt_global_ids_cpu, restore_rows)
+
     def _get_cpu_receive_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype):
         buffer = self._cpu_receive_buffers.get(name)
         is_inference_buffer = bool(buffer is not None and getattr(buffer, "is_inference", lambda: False)())
@@ -1261,8 +1289,11 @@ class DynamicVocabRuntime:
         self,
         active_ids_cpu: torch.Tensor,
         cold_bias_scale: float = 0.0,
+        cold_row_decrement: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
+        if cold_row_decrement > 0.0:
+            raise ValueError("sparse cold-row decrement currently requires fixed-U sparse mode")
         self._flush_pending_cpu_writeback()
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
@@ -1323,6 +1354,7 @@ class DynamicVocabRuntime:
         self,
         step_meta: dict,
         cold_bias_scale: float = 0.0,
+        cold_row_decrement: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
         assert self.fixed_u_mode, "Fixed-U step requested without fixed_u_max runtime configuration"
@@ -1447,6 +1479,7 @@ class DynamicVocabRuntime:
         cold_slot_ids_cpu = cloud_slot_ids_cpu[warm_ids_cpu.numel():] if cold_ids_cpu.numel() > 0 else self._empty_long_cpu()
         lm_head_active_ids_cpu = torch.cat((active_ids_cpu, cloud_ids_cpu)) if cloud_ids_cpu.numel() > 0 else active_ids_cpu.clone()
         lm_head_active_slot_ids_cpu = torch.cat((active_slot_ids_cpu, cloud_slot_ids_cpu)) if cloud_slot_ids_cpu.numel() > 0 else active_slot_ids_cpu.clone()
+        next_step_lm_head_ids_cpu = grad_accum_ids_cpu if grad_accum_steps > 1 else lm_head_active_ids_cpu
 
         assert self.fixed_slot_to_global_cpu is not None
         assert self.fixed_lm_head_slot_to_global_cpu is not None
@@ -1509,6 +1542,9 @@ class DynamicVocabRuntime:
             self.fixed_params[name].data.index_copy_(0, stage_slot_ids_device, rows_gpu)
             self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
             self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
+
+        if cold_row_decrement > 0.0 and (grad_accum_steps == 1 or not preserve_resident_grads):
+            self._apply_fixed_lm_head_cold_row_decrement_(next_step_lm_head_ids_cpu, cold_row_decrement)
 
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         if grad_accum_steps > 1:
@@ -1618,17 +1654,20 @@ class DynamicVocabRuntime:
         self,
         active_ids_cpu,
         cold_bias_scale: float = 0.0,
+        cold_row_decrement: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
         if isinstance(active_ids_cpu, dict):
             return self._prepare_fixed_step(
                 active_ids_cpu,
                 cold_bias_scale=cold_bias_scale,
+                cold_row_decrement=cold_row_decrement,
                 cold_bias_tokens_per_step=cold_bias_tokens_per_step,
             )
         return self._prepare_dynamic_step(
             active_ids_cpu,
             cold_bias_scale=cold_bias_scale,
+            cold_row_decrement=cold_row_decrement,
             cold_bias_tokens_per_step=cold_bias_tokens_per_step,
         )
 

@@ -66,22 +66,36 @@ def parse_cmd_string(cmd_str):
 # ============================================================
 RUNS = [
     {
-        "name": "d12_65kvocab_60k",
+        "name": "d12_65kvocab_10k",
+        "args": parse_cmd_string(
+            '-m scripts.base_train '
+            '--window-pattern L --fp8 '
+            '--depth=6 --aspect-ratio 64 '
+            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=16 '
+            '--num-iterations=5000 '            
+            '--run \"d6 dense 65kvoc 2kseq 64batch 1accum 64aspect 5kstep 0warmup 0.65warmdown\" '
+            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
+            '--log-every 10 --eval-every 500 --core-metric-every 5000 '
+        ),
+    },
+   """ {
+        "name": "d12_65kvocab_10k",
         "args": parse_cmd_string(
             '-m scripts.base_train '
             '--sparse-mode --window-pattern L --fp8 '
             '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=18 --aspect-ratio 64 '
-            '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
-            '--num-iterations=15000 '            
-            '--run \"d18 65kvoc 2kseq 16batch 8accum 64aspect 15kstep unembedlr0.008 0.003warmup 0.6warmdown 0.16embedlr 0.008matrix 0.2scalar 2coldbias5\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_20kstep.json '
-            '--warmup-ratio 0.003 --warmdown-ratio 0.6 '
-            '--embedding-lr 0.16 --unembedding-lr=0.008 --matrix-lr 0.008 --scalar-lr 0.2 '                 
-            '--sparse-cold-bias-scale 2 '            
-            '--log-every 10 --eval-every 250 --core-metric-every 15000 '
+            '--depth=6 --aspect-ratio 64 '
+            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
+            '--num-iterations=5000 '            
+            '--run \"d6 65kvoc 2kseq 64batch 1accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 2coldbias3\" '
+            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
+            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
+            '--embedding-lr 1.2 --unembedding-lr=0.025 --matrix-lr 0.03 --scalar-lr 0.7 --weight-decay 0 '
+            '--adam-beta1 0.7 --adam-beta2 0.95 '
+            '--sparse-cold-bias-scale 2 --sparse-cloud-max-u 23000 --sparse-cloud-warm-proportion 1 '            
+            '--log-every 10 --eval-every 500 --core-metric-every 5000 '
         ),
-    },
+    },"""
     # Add more runs below:
     # {
     #     "name": "d12_sparse_20k_variant",
