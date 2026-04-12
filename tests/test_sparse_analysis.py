@@ -8,6 +8,7 @@ from nanochat.sparse_analysis import (
     INCORRECT_RECORD_COLS,
     SparseLossAnalysisWriter,
     collect_sparse_loss_topk,
+    collect_sparse_loss_topk_from_stats,
     resolve_sparse_analysis_dir,
     merge_topk_records,
     select_topk_records,
@@ -123,6 +124,59 @@ def test_step_level_sparse_loss_aggregation_sums_duplicate_tokens_and_pairs():
     assert bounded_incorrect_records[0, 6].item() == 10
     assert bounded_incorrect_records[0, 8].item() == 20
     assert bounded_incorrect_scores[0].item() > payload0["incorrect_scores"][0].item()
+
+
+def test_collect_sparse_loss_topk_from_stats_matches_full_logits_path():
+    logits = torch.tensor(
+        [
+            [
+                [0.1, 3.0, 0.2],
+                [2.5, 0.1, 1.9],
+                [0.4, 0.3, 2.2],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    targets = torch.tensor([[0, 2, 1]], dtype=torch.long)
+    active_global_ids_cpu = torch.tensor([10, 20, 30], dtype=torch.long)
+    losses = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        targets.view(-1),
+        ignore_index=-1,
+        reduction="none",
+    ).view_as(targets)
+    target_logits = logits.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+    top2_logits, top2_local = torch.topk(logits, k=2, dim=-1)
+
+    full_payload = collect_sparse_loss_topk(
+        logits,
+        targets,
+        active_global_ids_cpu,
+        topk_correct=None,
+        topk_incorrect=None,
+        step=5,
+        micro_step=0,
+        sequence_id=11,
+        losses=losses,
+    )
+    stats_payload = collect_sparse_loss_topk_from_stats(
+        targets,
+        active_global_ids_cpu,
+        topk_correct=None,
+        topk_incorrect=None,
+        step=5,
+        micro_step=0,
+        sequence_id=11,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+    )
+
+    assert torch.equal(stats_payload["correct_records"], full_payload["correct_records"])
+    assert torch.equal(stats_payload["incorrect_records"], full_payload["incorrect_records"])
+    assert torch.allclose(stats_payload["correct_scores"], full_payload["correct_scores"])
+    assert torch.allclose(stats_payload["incorrect_scores"], full_payload["incorrect_scores"])
 
 
 def test_sparse_loss_analysis_writer_persists_cpu_tensors(tmp_path, monkeypatch):

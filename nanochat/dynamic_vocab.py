@@ -1494,13 +1494,40 @@ class DynamicVocabRuntime:
             cloud_stage_ids_cpu = cloud_ids_cpu
             cloud_stage_slot_ids_cpu = cloud_slot_ids_cpu
 
+        grad_accum_stage_ids_cpu = grad_accum_ids_cpu
+        grad_accum_stage_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state:
+            prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
+            prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
+            if prev_lm_head_slot_ids_cpu.numel() > 0:
+                prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
+                prev_lm_head_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+                prev_lm_head_global_to_slot_cpu[prev_lm_head_ids_cpu] = prev_lm_head_slot_ids_cpu
+                reused_old_slot_ids_cpu = prev_lm_head_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
+                reuse_mask_cpu = reused_old_slot_ids_cpu >= 0
+                if reuse_mask_cpu.any():
+                    reused_old_slot_ids_cpu = reused_old_slot_ids_cpu[reuse_mask_cpu]
+                    reused_new_slot_ids_cpu = torch.nonzero(reuse_mask_cpu, as_tuple=False).flatten()
+                    reused_old_slot_ids_device = reused_old_slot_ids_cpu.to(self.device)
+                    reused_new_slot_ids_device = reused_new_slot_ids_cpu.to(self.device)
+                    for source in (
+                        self.fixed_params["lm_head"].data,
+                        self.fixed_optimizer_state["lm_head"]["exp_avg"],
+                        self.fixed_optimizer_state["lm_head"]["exp_avg_sq"],
+                    ):
+                        source_rows = source.index_select(0, reused_old_slot_ids_device)
+                        source.index_copy_(0, reused_new_slot_ids_device, source_rows)
+                    missing_mask_cpu = ~reuse_mask_cpu
+                    grad_accum_stage_ids_cpu = grad_accum_ids_cpu[missing_mask_cpu]
+                    grad_accum_stage_slot_ids_cpu = torch.nonzero(missing_mask_cpu, as_tuple=False).flatten()
+
         required_cpu_ids = []
         if stage_ids_cpu.numel() > 0:
             required_cpu_ids.append(stage_ids_cpu)
         if cloud_stage_ids_cpu.numel() > 0:
             required_cpu_ids.append(cloud_stage_ids_cpu)
-        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0:
-            required_cpu_ids.append(grad_accum_ids_cpu)
+        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_stage_ids_cpu.numel() > 0:
+            required_cpu_ids.append(grad_accum_stage_ids_cpu)
         self._flush_pending_cpu_writeback(
             torch.cat(required_cpu_ids) if required_cpu_ids else None
         )
@@ -1524,8 +1551,8 @@ class DynamicVocabRuntime:
                         stage_ids_for_name = self._empty_long_cpu()
                         stage_slots_for_name = self._empty_long_cpu()
                     else:
-                        stage_ids_for_name = grad_accum_ids_cpu
-                        stage_slots_for_name = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+                        stage_ids_for_name = grad_accum_stage_ids_cpu
+                        stage_slots_for_name = grad_accum_stage_slot_ids_cpu
                 elif cloud_stage_ids_cpu.numel() > 0:
                     stage_ids_for_name = torch.cat((stage_ids_cpu, cloud_stage_ids_cpu)) if stage_ids_cpu.numel() > 0 else cloud_stage_ids_cpu
                     stage_slots_for_name = torch.cat((stage_slot_ids_cpu, cloud_stage_slot_ids_cpu)) if stage_slot_ids_cpu.numel() > 0 else cloud_stage_slot_ids_cpu
@@ -1613,7 +1640,7 @@ class DynamicVocabRuntime:
             stage_count=(
                 stage_ids_cpu.numel() +
                 cloud_stage_ids_cpu.numel() +
-                (grad_accum_ids_cpu.numel() if grad_accum_steps > 1 and not preserve_resident_grads else 0)
+                (grad_accum_stage_ids_cpu.numel() if grad_accum_steps > 1 and not preserve_resident_grads else 0)
             ),
             cloud_residual_capacity=int(step_meta.get("cloud_residual_capacity", 0)),
             warm_budget_target=int(step_meta.get("warm_budget_target", 0)),

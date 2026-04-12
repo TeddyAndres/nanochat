@@ -36,7 +36,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CLAMP_MIN, DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
-from nanochat.sparse_analysis import SparseLossAnalysisWriter, collect_sparse_loss_topk, merge_topk_records, select_topk_records
+from nanochat.sparse_analysis import SparseLossAnalysisWriter, collect_sparse_loss_topk_from_stats, merge_topk_records, select_topk_records
 from nanochat.sparse_replan import SparseFutureWindowPlanner
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -1012,27 +1012,30 @@ while True:
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_metrics = sparse_step_ctx
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
-            analysis_logits = None
-            analysis_token_losses = None
+            analysis_logsumexp = None
+            analysis_top2_logits = None
+            analysis_top2_local = None
+            analysis_target_logits = None
             model_result = model(
                 x,
                 y_for_loss,
                 active_vocab=sparse_step_ctx.active_vocab,
                 logit_scale=args.sparse_logit_scale,
-                return_logits=args.sparse_loss_topk_enable,
-                return_token_losses=args.sparse_loss_topk_enable,
+                return_sparse_analysis=args.sparse_loss_topk_enable,
             )
             if args.sparse_loss_topk_enable:
-                loss, analysis_logits, analysis_token_losses = model_result
+                loss, analysis_logsumexp, analysis_top2_logits, analysis_top2_local, analysis_target_logits = model_result
             else:
                 loss = model_result
             if args.sparse_loss_topk_enable:
                 analysis_active_ids_cpu = sparse_step_ctx.lm_head_active_ids_cpu if sparse_step_ctx.lm_head_active_ids_cpu is not None else sparse_step_ctx.active_ids_cpu
-                assert analysis_logits is not None
-                assert analysis_token_losses is not None
+                assert analysis_logsumexp is not None
+                assert analysis_top2_logits is not None
+                assert analysis_top2_local is not None
+                assert analysis_target_logits is not None
+                analysis_token_losses = analysis_logsumexp.detach() - analysis_target_logits.detach().to(dtype=torch.float32)
                 with torch.no_grad():
-                    analysis_payload = collect_sparse_loss_topk(
-                        analysis_logits.detach(),
+                    analysis_payload = collect_sparse_loss_topk_from_stats(
                         y_for_loss,
                         analysis_active_ids_cpu,
                         topk_correct=None,
@@ -1041,6 +1044,9 @@ while True:
                         micro_step=micro_step,
                         sequence_id=int(sparse_batch_meta.get("sequence_id", -1)),
                         losses=analysis_token_losses.detach(),
+                        top2_logits=analysis_top2_logits.detach(),
+                        top2_local=analysis_top2_local.detach(),
+                        target_logits=analysis_target_logits.detach(),
                     )
                 step_correct_scores_all, step_correct_records_all = merge_topk_records(
                     step_correct_scores_all,

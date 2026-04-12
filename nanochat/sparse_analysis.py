@@ -142,6 +142,67 @@ def collect_sparse_loss_topk(
         if tuple(losses.shape) != tuple(targets.shape):
             raise ValueError("Precomputed sparse token losses must match target shape")
         losses = losses.to(device=device, dtype=torch.float32)
+    safe_targets = targets.clamp_min(0)
+    target_logits = logits.gather(2, safe_targets.unsqueeze(-1)).squeeze(-1)
+    top2_logits, top2_local = torch.topk(logits, k=min(2, logits.size(-1)), dim=-1)
+    if top2_logits.size(-1) < 2:
+        pad_shape = (*top2_logits.shape[:2], 2 - top2_logits.size(-1))
+        top2_logits = torch.cat(
+            (
+                top2_logits,
+                torch.full(pad_shape, -float("inf"), dtype=top2_logits.dtype, device=device),
+            ),
+            dim=-1,
+        )
+        top2_local = torch.cat(
+            (
+                top2_local,
+                torch.full(pad_shape, -1, dtype=top2_local.dtype, device=device),
+            ),
+            dim=-1,
+        )
+    return collect_sparse_loss_topk_from_stats(
+        targets,
+        active_global_ids_cpu,
+        topk_correct=topk_correct,
+        topk_incorrect=topk_incorrect,
+        step=step,
+        micro_step=micro_step,
+        sequence_id=sequence_id,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+    )
+
+
+def collect_sparse_loss_topk_from_stats(
+    targets: torch.Tensor,
+    active_global_ids_cpu: torch.Tensor,
+    *,
+    topk_correct: int | None,
+    topk_incorrect: int | None,
+    step: int,
+    micro_step: int,
+    sequence_id: int = -1,
+    losses: torch.Tensor,
+    top2_logits: torch.Tensor,
+    top2_local: torch.Tensor,
+    target_logits: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if targets.ndim != 2:
+        raise ValueError("Expected targets shape (B, T)")
+    if tuple(losses.shape) != tuple(targets.shape):
+        raise ValueError("Precomputed sparse token losses must match target shape")
+    if tuple(target_logits.shape) != tuple(targets.shape):
+        raise ValueError("Target logits must match target shape")
+    if top2_logits.shape[:2] != targets.shape or top2_local.shape[:2] != targets.shape:
+        raise ValueError("Top-k sparse analysis tensors must match target batch dimensions")
+    if top2_logits.size(-1) != top2_local.size(-1):
+        raise ValueError("Top-k sparse analysis logits and ids must have matching widths")
+
+    device = losses.device
+    active_global_ids = active_global_ids_cpu.to(device=device, dtype=torch.long)
     valid_mask = targets != -1
     if not valid_mask.any():
         correct_scores, correct_records = _empty_records(topk_correct, CORRECT_RECORD_COLS, device=device)
@@ -154,15 +215,19 @@ def collect_sparse_loss_topk(
         }
 
     flat_targets = targets.view(-1)
-    flat_losses = losses.view(-1)
-    flat_logits = logits.view(-1, logits.size(-1))
+    flat_losses = losses.to(device=device, dtype=torch.float32).view(-1)
+    flat_target_logits = target_logits.to(device=device, dtype=torch.float32).view(-1)
+    flat_top2_logits = top2_logits.to(device=device, dtype=torch.float32).view(-1, top2_logits.size(-1))
+    flat_top2_local = top2_local.to(device=device, dtype=torch.long).view(-1, top2_local.size(-1))
     flat_valid = valid_mask.view(-1)
     flat_indices = torch.nonzero(flat_valid, as_tuple=False).flatten()
     valid_targets = flat_targets[flat_valid]
     valid_losses = flat_losses[flat_valid]
-    valid_logits = flat_logits[flat_valid]
+    valid_target_logits = flat_target_logits[flat_valid]
+    valid_top2_logits = flat_top2_logits[flat_valid]
+    valid_top2_local = flat_top2_local[flat_valid]
 
-    pred_local = valid_logits.argmax(dim=-1)
+    pred_local = valid_top2_local[:, 0]
     underpred_mask = pred_local != valid_targets
     row_idx = flat_indices // targets.size(1)
     pos_idx = flat_indices % targets.size(1)
@@ -184,17 +249,15 @@ def collect_sparse_loss_topk(
     correct_candidate_scores, correct_candidate_records = aggregate_sparse_loss_candidates(correct_candidate_scores, correct_candidate_records)
     correct_scores, correct_records = _topk_from_candidates(correct_candidate_scores, correct_candidate_records, topk=topk_correct)
 
-    top2_logits, top2_local = torch.topk(valid_logits, k=min(2, valid_logits.size(-1)), dim=-1)
-    wrong_local = top2_local[:, 0]
-    wrong_logit = top2_logits[:, 0]
-    target_logit = valid_logits.gather(1, valid_targets.unsqueeze(1)).squeeze(1)
-    if top2_local.size(1) > 1:
+    wrong_local = valid_top2_local[:, 0]
+    wrong_logit = valid_top2_logits[:, 0]
+    if valid_top2_local.size(1) > 1:
         choose_second = wrong_local == valid_targets
-        wrong_local = torch.where(choose_second, top2_local[:, 1], wrong_local)
-        wrong_logit = torch.where(choose_second, top2_logits[:, 1], wrong_logit)
-    valid_wrong_mask = wrong_local != valid_targets
-    wrong_global = active_global_ids.index_select(0, wrong_local.to(dtype=torch.long))
-    incorrect_candidate_scores = (wrong_logit - target_logit)[valid_wrong_mask]
+        wrong_local = torch.where(choose_second, valid_top2_local[:, 1], wrong_local)
+        wrong_logit = torch.where(choose_second, valid_top2_logits[:, 1], wrong_logit)
+    valid_wrong_mask = (wrong_local != valid_targets) & (wrong_local >= 0)
+    wrong_global = active_global_ids.index_select(0, wrong_local.clamp_min(0).to(dtype=torch.long))
+    incorrect_candidate_scores = (wrong_logit - valid_target_logits)[valid_wrong_mask]
     incorrect_candidate_records = torch.stack(
         (
             torch.full_like(row_idx[valid_wrong_mask], int(step)),

@@ -542,6 +542,7 @@ class GPT(nn.Module):
         logit_bias=None,
         return_logits=False,
         return_token_losses=False,
+        return_sparse_analysis=False,
     ):
         x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
         logits = self.compute_logits(
@@ -549,7 +550,7 @@ class GPT(nn.Module):
             active_vocab=active_vocab,
             logit_scale=logit_scale,
             logit_bias=logit_bias,
-            force_float=(targets is None or return_logits or return_token_losses),
+            force_float=(targets is None),
         )
 
         if targets is not None:
@@ -572,6 +573,30 @@ class GPT(nn.Module):
             else:
                 # TODO experiment with chunked cross-entropy?
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_sparse_analysis:
+                analysis_logits = logits.detach()
+                safe_targets = targets.clamp_min(0)
+                target_logits = analysis_logits.gather(2, safe_targets.unsqueeze(-1)).squeeze(-1)
+                analysis_logsumexp = torch.logsumexp(analysis_logits.to(dtype=torch.float32), dim=-1)
+                analysis_k = min(2, analysis_logits.size(-1))
+                topk_logits, topk_local = torch.topk(analysis_logits, k=analysis_k, dim=-1)
+                if analysis_k < 2:
+                    pad_shape = (*topk_logits.shape[:2], 2 - analysis_k)
+                    topk_logits = torch.cat(
+                        (
+                            topk_logits,
+                            torch.full(pad_shape, -float("inf"), dtype=topk_logits.dtype, device=topk_logits.device),
+                        ),
+                        dim=-1,
+                    )
+                    topk_local = torch.cat(
+                        (
+                            topk_local,
+                            torch.full(pad_shape, -1, dtype=topk_local.dtype, device=topk_local.device),
+                        ),
+                        dim=-1,
+                    )
+                return loss.float(), analysis_logsumexp, topk_logits, topk_local, target_logits
             if return_logits and return_token_losses:
                 return loss.float(), logits, token_losses
             if return_logits:

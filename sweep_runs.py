@@ -81,7 +81,6 @@ RUNS = [
             '--adam-beta1 0.7 --adam-beta2 0.95 '
             '--sparse-cold-row-decay 0.001 --sparse-cold-bias-scale 2 '            
             '--log-every 10 --eval-every 500 --core-metric-every 5000 '
-            '--sparse-loss-topk-enable '
         ),
     },
     # Add more runs below:
