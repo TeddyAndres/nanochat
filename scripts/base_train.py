@@ -1059,6 +1059,10 @@ while True:
     sparse_batch_h2d_ms = 0.0
     sparse_backward_sync_ms = 0.0
     sparse_accum_call_ms = 0.0
+    sparse_accum_start_ms = 0.0
+    sparse_accum_flush_ms = 0.0
+    sparse_accum_queue_ms = 0.0
+    sparse_accum_rows_queued = 0
     sparse_apply_call_ms = 0.0
     sparse_cold_bias = get_sparse_cold_bias_scale(step)
     sparse_cold_row_decay = get_sparse_cold_row_decay(step)
@@ -1093,6 +1097,7 @@ while True:
             sparse_prep_h2d_bytes += sparse_step_ctx.prep_h2d_bytes
             sparse_prep_prefetch_hits += sparse_step_ctx.prep_prefetch_hit
             sparse_metrics = sparse_step_ctx
+            x_for_model = sparse_step_ctx.union_inputs if sparse_step_ctx.union_inputs is not None else current_x
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
             analysis_logsumexp = None
             analysis_top2_logits = None
@@ -1100,7 +1105,7 @@ while True:
             analysis_target_logits = None
             forward_t0 = time.perf_counter()
             model_result = model(
-                current_x,
+                x_for_model,
                 y_for_loss,
                 active_vocab=sparse_step_ctx.active_vocab,
                 logit_scale=args.sparse_logit_scale,
@@ -1189,6 +1194,10 @@ while True:
             accum_t0 = time.perf_counter()
             sparse_window_metrics = dynamic_vocab.accumulate_gradients(sparse_step_ctx)
             sparse_accum_call_ms += (time.perf_counter() - accum_t0) * 1000.0
+            sparse_accum_start_ms += sparse_window_metrics.grad_accum_start_ms
+            sparse_accum_flush_ms += sparse_window_metrics.grad_accum_flush_ms
+            sparse_accum_queue_ms += sparse_window_metrics.grad_accum_queue_ms
+            sparse_accum_rows_queued += sparse_window_metrics.grad_accum_queue_count
             sparse_step_ctx = None
         if not final_train_step:
             if args.sparse_mode:
@@ -1379,6 +1388,9 @@ while True:
                 f" bwd: {sparse_backward_call_ms:.2f}"
                 f" fetch: {sparse_next_fetch_ms:.2f})"
                 f" bw_sync: {sparse_backward_sync_ms:.2f}"
+                f" accum_start: {sparse_accum_start_ms:.2f}"
+                f" accum_flush: {sparse_accum_flush_ms:.2f}"
+                f" accum_queue: {sparse_accum_queue_ms:.2f}"
                 f" accum: {sparse_accum_call_ms:.2f}"
                 f" apply_call: {sparse_apply_call_ms:.2f}"
                 f" | sparse_ms flush: {sparse_metrics.grad_accum_flush_ms:.2f}"
@@ -1391,6 +1403,7 @@ while True:
                 f" cpu: {sparse_metrics.cpu_writeback_ms:.2f})"
                 f" | union_rows buffered: {sparse_metrics.grad_accum_queue_count:,}"
                 f" resident: {sparse_metrics.grad_accum_resident_count:,}"
+                f" | accum_rows queued: {sparse_accum_rows_queued:,}"
             )
             if sparse_prep_cpu_gather_ms > 0.0 or sparse_prep_h2d_enqueue_ms > 0.0 or sparse_prep_writeback_wait_ms > 0.0 or sparse_prep_prefetch_wait_ms > 0.0 or sparse_prep_prefetch_hits > 0:
                 sparse_str += (
@@ -1417,7 +1430,8 @@ while True:
                 )
             if sparse_window_metrics is not None:
                 sparse_str += (
-                    f" | micro_ms flush: {sparse_window_metrics.grad_accum_flush_ms:.2f}"
+                    f" | micro_ms start: {sparse_window_metrics.grad_accum_start_ms:.2f}"
+                    f" flush: {sparse_window_metrics.grad_accum_flush_ms:.2f}"
                     f" queue: {sparse_window_metrics.grad_accum_queue_ms:.2f}"
                     f" | micro_rows queued: {sparse_window_metrics.grad_accum_queue_count:,}"
                     f" resident: {sparse_window_metrics.grad_accum_resident_count:,}"

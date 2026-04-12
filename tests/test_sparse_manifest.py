@@ -613,12 +613,14 @@ def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
     state1 = dict(state1)
 
     assert torch.equal(inputs0, torch.tensor([[0, 1]], dtype=torch.long))
+    assert torch.equal(step_meta0["inputs_union_cpu_local"], torch.tensor([[0, 1]], dtype=torch.long))
     assert torch.equal(targets0, torch.tensor([[1, 2]], dtype=torch.long))
     assert torch.equal(step_meta0["targets_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
     assert state0["manifest_step"] == 0
     assert state0["pq_idx"] == 0
 
     assert torch.equal(inputs1, torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(step_meta1["inputs_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
     assert torch.equal(targets1, torch.tensor([[2, 0]], dtype=torch.long))
     assert torch.equal(step_meta1["targets_union_cpu_local"], torch.tensor([[2, 3]], dtype=torch.long))
     assert state1["manifest_step"] == 0
@@ -731,8 +733,10 @@ def test_manifest_loader_emits_union_targets_without_local_batch_payload(tmp_pat
     targets1 = targets1.clone()
     step_meta1 = dict(step_meta1)
 
+    assert torch.equal(step_meta0["inputs_union_cpu_local"], torch.tensor([[0, 1]], dtype=torch.long))
     assert torch.equal(targets0, torch.tensor([[1, 2]], dtype=torch.long))
     assert torch.equal(step_meta0["targets_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(step_meta1["inputs_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
     assert torch.equal(targets1, torch.tensor([[2, 0]], dtype=torch.long))
     assert torch.equal(step_meta1["targets_union_cpu_local"], torch.tensor([[2, 3]], dtype=torch.long))
 

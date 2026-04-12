@@ -38,6 +38,7 @@ def build_fixed_step_meta(
     warm_ids=None,
     cold_ids=None,
     inputs_cpu_local=None,
+    inputs_union_cpu_local=None,
     targets_cpu_local=None,
     is_last_step=False,
     grad_accum_ids=None,
@@ -73,6 +74,8 @@ def build_fixed_step_meta(
         step_meta["cold_ids_cpu"] = torch.tensor(cold_ids, dtype=torch.long)
     if inputs_cpu_local is not None:
         step_meta["inputs_cpu_local"] = torch.tensor(inputs_cpu_local, dtype=torch.long)
+    if inputs_union_cpu_local is not None:
+        step_meta["inputs_union_cpu_local"] = torch.tensor(inputs_union_cpu_local, dtype=torch.long)
     if targets_cpu_local is not None:
         step_meta["targets_cpu_local"] = torch.tensor(targets_cpu_local, dtype=torch.long)
     return step_meta
@@ -1548,6 +1551,9 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         unembedding_lr=0.03,
     )
     union_ids = [1, 3, 7, 9]
+    union_slot_ids = torch.tensor([0, 1, 2], dtype=torch.long)
+    union_step1_slot_ids = torch.tensor([3, 1, 2], dtype=torch.long)
+    union_slot_by_token = {token_id: slot_id for slot_id, token_id in enumerate(union_ids)}
 
     step0 = build_fixed_step_meta(
         slot_to_global=[1, 3, 7],
@@ -1571,26 +1577,27 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         for token_id, slot_id in zip(step0_ctx.lm_head_active_ids_cpu.tolist(), step0_ctx.lm_head_active_slot_ids_cpu.tolist())
     }
     step0_ctx.active_vocab["wte"].grad = torch.zeros_like(step0_ctx.active_vocab["wte"])
-    step0_ctx.active_vocab["wte"].grad[slots0[0]] = 1
-    step0_ctx.active_vocab["wte"].grad[slots0[1]] = 2
-    step0_ctx.active_vocab["wte"].grad[slots0[2]] = 3
+    step0_ctx.active_vocab["wte"].grad[union_slot_by_token[1]] = 1
+    step0_ctx.active_vocab["wte"].grad[union_slot_by_token[3]] = 2
+    step0_ctx.active_vocab["wte"].grad[union_slot_by_token[7]] = 3
     step0_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step0_ctx.active_vocab["lm_head"])
     step0_ctx.active_vocab["lm_head"].grad[lm_head_slots0[1]] = 10
     step0_ctx.active_vocab["lm_head"].grad[lm_head_slots0[3]] = 20
     step0_ctx.active_vocab["lm_head"].grad[lm_head_slots0[7]] = 30
     for value_embed in step0_ctx.active_vocab["value_embeds"].values():
         value_embed.grad = torch.zeros_like(value_embed)
-        value_embed.grad[slots0[0]] = 100
-        value_embed.grad[slots0[1]] = 200
-        value_embed.grad[slots0[2]] = 300
+        value_embed.grad[union_slot_by_token[1]] = 100
+        value_embed.grad[union_slot_by_token[3]] = 200
+        value_embed.grad[union_slot_by_token[7]] = 300
     runtime.accumulate_gradients(step0_ctx)
 
-    assert step0_ctx.grad_accum_queue_count == 1
-    assert step0_ctx.grad_accum_resident_count == 2
+    assert step0_ctx.grad_accum_queue_count == 0
+    assert step0_ctx.grad_accum_resident_count == 3
     assert runtime.fixed_params["wte"].grad is not None
-    assert torch.allclose(runtime.fixed_params["wte"].grad[slots0[0]], torch.zeros_like(runtime.fixed_params["wte"].grad[slots0[0]]))
-    assert torch.allclose(runtime.fixed_params["wte"].grad[slots0[1]], torch.ones_like(runtime.fixed_params["wte"].grad[slots0[1]]) * 2)
-    assert torch.allclose(runtime.fixed_params["wte"].grad[slots0[2]], torch.ones_like(runtime.fixed_params["wte"].grad[slots0[2]]) * 3)
+    assert torch.allclose(runtime.fixed_params["wte"].grad[union_slot_by_token[1]], torch.ones_like(runtime.fixed_params["wte"].grad[union_slot_by_token[1]]) * 1)
+    assert torch.allclose(runtime.fixed_params["wte"].grad[union_slot_by_token[3]], torch.ones_like(runtime.fixed_params["wte"].grad[union_slot_by_token[3]]) * 2)
+    assert torch.allclose(runtime.fixed_params["wte"].grad[union_slot_by_token[7]], torch.ones_like(runtime.fixed_params["wte"].grad[union_slot_by_token[7]]) * 3)
+    assert torch.allclose(runtime.fixed_params["wte"].grad[union_slot_by_token[9]], torch.zeros_like(runtime.fixed_params["wte"].grad[union_slot_by_token[9]]))
 
     wte_param = runtime.table_specs["wte"]["param"]
     assert runtime.state[wte_param]["step"] == 0
@@ -1617,23 +1624,23 @@ def test_fixed_u_sparse_grad_accumulation_matches_single_union_update():
         for token_id, slot_id in zip(step1_ctx.lm_head_active_ids_cpu.tolist(), step1_ctx.lm_head_active_slot_ids_cpu.tolist())
     }
     assert step1_ctx.active_vocab["wte"].grad is not None
-    step1_ctx.active_vocab["wte"].grad[slots1[0]] += 6
-    step1_ctx.active_vocab["wte"].grad[slots1[1]] += 4
-    step1_ctx.active_vocab["wte"].grad[slots1[2]] += 5
+    step1_ctx.active_vocab["wte"].grad[union_slot_by_token[9]] += 6
+    step1_ctx.active_vocab["wte"].grad[union_slot_by_token[3]] += 4
+    step1_ctx.active_vocab["wte"].grad[union_slot_by_token[7]] += 5
     assert step1_ctx.active_vocab["lm_head"].grad is not None
     step1_ctx.active_vocab["lm_head"].grad[lm_head_slots1[9]] += 60
     step1_ctx.active_vocab["lm_head"].grad[lm_head_slots1[3]] += 40
     step1_ctx.active_vocab["lm_head"].grad[lm_head_slots1[7]] += 50
     for value_embed in step1_ctx.active_vocab["value_embeds"].values():
         assert value_embed.grad is not None
-        value_embed.grad[slots1[0]] += 600
-        value_embed.grad[slots1[1]] += 400
-        value_embed.grad[slots1[2]] += 500
+        value_embed.grad[union_slot_by_token[9]] += 600
+        value_embed.grad[union_slot_by_token[3]] += 400
+        value_embed.grad[union_slot_by_token[7]] += 500
     runtime.accumulate_gradients(step1_ctx)
     metrics = runtime.apply_accumulated_gradients()
 
-    assert metrics.grad_accum_queue_count == 1
-    assert metrics.grad_accum_resident_count == 3
+    assert metrics.grad_accum_queue_count == 0
+    assert metrics.grad_accum_resident_count == 4
 
     reference_ctx = reference_runtime.prepare_step(torch.tensor(union_ids, dtype=torch.long))
     reference_ctx.active_vocab["wte"].grad = torch.stack([
@@ -1683,6 +1690,8 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
     )
 
     union_ids = [1, 3, 7, 9]
+    union_slot_ids = torch.tensor([0, 1, 2], dtype=torch.long)
+    union_step1_slot_ids = torch.tensor([3, 1, 2], dtype=torch.long)
     step0 = build_fixed_step_meta(
         slot_to_global=[1, 3, 7],
         stage_slots=[0, 1, 2],
@@ -1696,15 +1705,14 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
         is_grad_accum_boundary=False,
     )
     step0_ctx = runtime.prepare_step(step0)
-    slots0 = step0_ctx.active_slot_ids_cpu
-    assert slots0 is not None
+    assert step0_ctx.active_slot_ids_cpu is not None
     for name, param in runtime.fixed_params.items():
         param.grad = torch.zeros_like(param)
-        param.grad[slots0] = 1
+        param.grad[union_slot_ids] = 1
     runtime.accumulate_gradients(step0_ctx)
 
-    assert step0_ctx.grad_accum_queue_count == 1
-    assert step0_ctx.grad_accum_resident_count == 2
+    assert step0_ctx.grad_accum_queue_count == 0
+    assert step0_ctx.grad_accum_resident_count == 3
 
     step1 = build_fixed_step_meta(
         slot_to_global=[9, 3, 7],
@@ -1719,17 +1727,18 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
         is_grad_accum_boundary=True,
     )
     step1_ctx = runtime.prepare_step(step1)
-    slots1 = step1_ctx.active_slot_ids_cpu
-    assert slots1 is not None
+    assert step1_ctx.active_slot_ids_cpu is not None
     for name, param in runtime.fixed_params.items():
         assert param.grad is not None
-        param.grad[slots1] += 2
+        param.grad[union_step1_slot_ids] += 2
     runtime.accumulate_gradients(step1_ctx)
     metrics = runtime.apply_accumulated_gradients()
 
     assert runtime._fixed_live_state
     assert runtime.fixed_slot_to_global_cpu is not None
     assert torch.equal(runtime.fixed_slot_to_global_cpu[:3], torch.tensor([9, 3, 7], dtype=torch.long))
+    assert runtime.fixed_input_slot_to_global_cpu is not None
+    assert torch.equal(runtime.fixed_input_slot_to_global_cpu[:4], torch.tensor(union_ids, dtype=torch.long))
     assert metrics.live_count == 4
     assert metrics.unique_count == 4
     assert metrics.u_capacity == 4
@@ -1793,6 +1802,7 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
         },
     ]
     union_ids = [0, 1, 3, 4, 5, 6, 9, 10, 11]
+    union_slot_by_token = {token_id: slot_id for slot_id, token_id in enumerate(union_ids)}
 
     for micro_idx, micro in enumerate(microsteps):
         step_ctx = runtime.prepare_step(
@@ -1802,6 +1812,7 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
                 stage_ids=micro["stage_ids"],
                 writeback_slots=micro["writeback_slots"],
                 writeback_ids=micro["writeback_ids"],
+                inputs_union_cpu_local=[[union_ids.index(token_id) for token_id in micro["active_ids"]]],
                 is_last_step=False,
                 grad_accum_ids=union_ids,
                 grad_accum_steps=len(microsteps),
@@ -1809,6 +1820,8 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
                 is_grad_accum_boundary=micro_idx == len(microsteps) - 1,
             )
         )
+
+        assert step_ctx.union_inputs is not None
 
         token_by_slot = {
             micro["slot_to_global"].index(token_id): token_id
@@ -1828,7 +1841,7 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
                 scale = 100.0
             for slot_id in step_ctx.active_slot_ids_cpu.tolist():
                 token_id = token_by_slot[slot_id]
-                target_slot_id = lm_head_slot_by_token[token_id] if name == "lm_head" else slot_id
+                target_slot_id = lm_head_slot_by_token[token_id] if name == "lm_head" else union_slot_by_token[token_id]
                 param.grad[target_slot_id] += scale * (token_id + 1) * (micro_idx + 1) / len(microsteps)
         runtime.accumulate_gradients(step_ctx)
 
@@ -1882,8 +1895,42 @@ def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
     assert runtime._fixed_live_state
     assert runtime.fixed_slot_to_global_cpu is not None
     assert torch.equal(runtime.fixed_slot_to_global_cpu[:6], torch.tensor([3, 5, 0, 6, 10, 4], dtype=torch.long))
-    assert metrics.grad_accum_queue_count == 3
-    assert metrics.grad_accum_resident_count == 6
+    assert runtime.fixed_input_slot_to_global_cpu is not None
+    assert torch.equal(runtime.fixed_input_slot_to_global_cpu[:9], torch.tensor(union_ids, dtype=torch.long))
+    assert metrics.grad_accum_queue_count == 0
+    assert metrics.grad_accum_resident_count == 9
     assert metrics.live_count == 9
     assert metrics.unique_count == 9
     assert metrics.u_capacity == 12
+
+
+def test_fixed_u_grad_accum_prepare_emits_union_inputs_for_input_tables():
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=16),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=4,
+        grad_accum_u_max=6,
+    )
+
+    step_ctx = runtime.prepare_step(
+        build_fixed_step_meta(
+            slot_to_global=[4, 7, 9, -1],
+            stage_slots=[0, 1, 2],
+            stage_ids=[4, 7, 9],
+            writeback_slots=[],
+            writeback_ids=[],
+            inputs_union_cpu_local=[[2, 0, 1, 2]],
+            grad_accum_ids=[7, 9, 4],
+            grad_accum_steps=2,
+            grad_accum_micro_step=0,
+            is_grad_accum_boundary=False,
+        )
+    )
+
+    assert step_ctx.union_inputs is not None
+    assert torch.equal(step_ctx.union_inputs.cpu(), torch.tensor([[2, 0, 1, 2]], dtype=torch.long))
+    assert runtime.fixed_input_slot_to_global_cpu is not None
+    assert torch.equal(runtime.fixed_input_slot_to_global_cpu[:3], torch.tensor([7, 9, 4], dtype=torch.long))
