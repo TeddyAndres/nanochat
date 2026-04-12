@@ -1,3 +1,4 @@
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -143,6 +144,7 @@ class DynamicVocabRuntime:
         self.hot_unembedding_ramp_activations = max(0, int(hot_unembedding_ramp_activations))
         self.hot_unembedding_ramp_start_lr = None if hot_unembedding_ramp_start_lr is None or hot_unembedding_ramp_start_lr <= 0.0 else float(hot_unembedding_ramp_start_lr)
         self.capacity_round_multiple = max(1, int(capacity_round_multiple))
+        self.disable_fixed_overlap_reuse = os.getenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "1") == "1"
         fixed_u_max_value = 0 if fixed_u_max is None else round_capacity_up(int(fixed_u_max), self.capacity_round_multiple)
         assert fixed_u_max_value is not None
         self.fixed_u_max = int(fixed_u_max_value)
@@ -1257,9 +1259,24 @@ class DynamicVocabRuntime:
         rows = active_param.detach().index_select(0, slot_ids_device)
         exp_avg = active_state["exp_avg"].detach().index_select(0, slot_ids_device)
         exp_avg_sq = active_state["exp_avg_sq"].detach().index_select(0, slot_ids_device)
-        row_buffer = self._get_cpu_receive_buffer("rows:lm_head:cloud", tuple(rows.shape), rows.dtype)
-        exp_avg_buffer = self._get_cpu_receive_buffer("exp_avg:lm_head:cloud", tuple(exp_avg.shape), exp_avg.dtype)
-        exp_avg_sq_buffer = self._get_cpu_receive_buffer("exp_avg_sq:lm_head:cloud", tuple(exp_avg_sq.shape), exp_avg_sq.dtype)
+        row_buffer = self._get_cpu_receive_buffer(
+            "rows:lm_head:cloud",
+            tuple(rows.shape),
+            rows.dtype,
+            block_reuse_while_pending=True,
+        )
+        exp_avg_buffer = self._get_cpu_receive_buffer(
+            "exp_avg:lm_head:cloud",
+            tuple(exp_avg.shape),
+            exp_avg.dtype,
+            block_reuse_while_pending=True,
+        )
+        exp_avg_sq_buffer = self._get_cpu_receive_buffer(
+            "exp_avg_sq:lm_head:cloud",
+            tuple(exp_avg_sq.shape),
+            exp_avg_sq.dtype,
+            block_reuse_while_pending=True,
+        )
         row_buffer.copy_(rows, non_blocking=self.use_cuda)
         exp_avg_buffer.copy_(exp_avg, non_blocking=self.use_cuda)
         exp_avg_sq_buffer.copy_(exp_avg_sq, non_blocking=self.use_cuda)
@@ -1437,7 +1454,7 @@ class DynamicVocabRuntime:
                     prev_input_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
                     prev_input_global_to_slot_cpu[prev_input_ids_cpu] = prev_input_slot_ids_cpu
                     reused_old_slot_ids_cpu = prev_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
-                    non_lm_head_ids_cpu = grad_accum_ids_cpu[reused_old_slot_ids_cpu < 0]
+                    non_lm_head_ids_cpu = grad_accum_ids_cpu if self.disable_fixed_overlap_reuse else grad_accum_ids_cpu[reused_old_slot_ids_cpu < 0]
                 else:
                     non_lm_head_ids_cpu = grad_accum_ids_cpu
             else:
@@ -1447,7 +1464,7 @@ class DynamicVocabRuntime:
         lm_head_ids_cpu = self._empty_long_cpu()
         if grad_accum_steps > 1:
             lm_head_ids_cpu = grad_accum_ids_cpu
-            if self._fixed_live_state and grad_accum_ids_cpu.numel() > 0:
+            if (not self.disable_fixed_overlap_reuse) and self._fixed_live_state and grad_accum_ids_cpu.numel() > 0:
                 assert self.fixed_lm_head_slot_to_global_cpu is not None
                 prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
                 prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
@@ -1666,6 +1683,9 @@ class DynamicVocabRuntime:
             self._grad_accum_ids_cpu is not None and
             torch.equal(self._grad_accum_ids_cpu, grad_accum_ids_cpu)
         )
+        if self.disable_fixed_overlap_reuse and grad_accum_steps > 1 and not preserve_resident_grads and self._fixed_live_state:
+            self.flush_active_to_cpu()
+            self._fixed_live_state = False
         if grad_accum_steps > 1 and not preserve_resident_grads:
             self._start_grad_accum_window(grad_accum_ids_cpu)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
@@ -1804,7 +1824,7 @@ class DynamicVocabRuntime:
         if union_input_tables:
             input_stage_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else grad_accum_ids_cpu
             input_stage_slot_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
-        if self.use_cuda and grad_accum_steps > 1 and self._fixed_live_state:
+        if self.use_cuda and grad_accum_steps > 1 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             assert self.fixed_input_slot_to_global_cpu is not None
             prev_input_slot_ids_cpu = torch.nonzero(self.fixed_input_slot_to_global_cpu >= 0, as_tuple=False).flatten()
             if prev_input_slot_ids_cpu.numel() > 0:
@@ -1830,7 +1850,7 @@ class DynamicVocabRuntime:
                     kept_prev_lm_head_mask_cpu[kept_prev_lm_head_rows_cpu[valid_prev_lm_head_mask_cpu]] = True
                 deferred_lm_head_writeback_ids_cpu = prev_lm_head_ids_cpu[~kept_prev_lm_head_mask_cpu]
                 deferred_lm_head_writeback_slot_ids_cpu = prev_lm_head_slot_ids_cpu[~kept_prev_lm_head_mask_cpu]
-        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state:
+        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             assert self.fixed_input_slot_to_global_cpu is not None
             prev_input_slot_mask_cpu = self.fixed_input_slot_to_global_cpu >= 0
             prev_input_slot_ids_cpu = torch.nonzero(prev_input_slot_mask_cpu, as_tuple=False).flatten()
@@ -1866,7 +1886,7 @@ class DynamicVocabRuntime:
                 else:
                     input_stage_ids_cpu = grad_accum_ids_cpu
                     input_stage_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
-        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state:
+        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
             prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
             if prev_lm_head_slot_ids_cpu.numel() > 0:

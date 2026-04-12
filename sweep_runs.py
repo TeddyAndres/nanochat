@@ -78,7 +78,8 @@ RUNS = [
             '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
             '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '           
+            '--adam-beta1 0.7 --adam-beta2 0.95 '
+            '--sparse-cold-bias-scale 2 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
         ),
     },
@@ -95,7 +96,8 @@ RUNS = [
             '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
             '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '           
+            '--adam-beta1 0.7 --adam-beta2 0.95 '
+            '--sparse-cold-bias-scale 2 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
             '--sparse-loss-topk-enable '
         ),

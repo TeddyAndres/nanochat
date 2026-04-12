@@ -22,8 +22,6 @@ import json
 import time
 import math
 import argparse
-import queue
-import threading
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -38,6 +36,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CLAMP_MIN, DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
+from nanochat.prefetch import AsyncLoaderPrefetcher
 from nanochat.sparse_analysis import SparseLossAnalysisWriter, collect_sparse_loss_topk_from_stats, merge_topk_records, select_topk_records
 from nanochat.sparse_replan import SparseFutureWindowPlanner
 from nanochat.engine import Engine
@@ -53,37 +52,6 @@ from scripts.base_eval import evaluate_core
 print_banner()
 
 SPARSE_RUNTIME_CAPACITY_MULTIPLE = 32
-
-
-class AsyncLoaderPrefetcher:
-    def __init__(self, loader, max_prefetch=2):
-        self.loader = loader
-        self.queue = queue.Queue(maxsize=max_prefetch)
-        self._error = None
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        try:
-            while True:
-                self.queue.put(next(self.loader))
-        except StopIteration:
-            pass
-        except BaseException as exc:
-            self._error = exc
-        finally:
-            self.queue.put(None)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        item = self.queue.get()
-        if item is None:
-            if self._error is not None:
-                raise self._error
-            raise StopIteration
-        return item
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -285,7 +253,7 @@ if hybrid_sparse:
 if args.sparse_mode:
     assert not ddp, "Sparse mode is single-GPU only for now"
     if hybrid_sparse:
-        print0("Sparse hybrid mode: fixed-U manifest path enabled; dense eval/sample paths materialize from CPU masters and training uses manifest-driven overlap reuse")
+        print0("Sparse hybrid mode: fixed-U manifest path enabled; dense eval/sample paths materialize from CPU masters and training uses manifest-driven sparse staging")
     else:
         print0("Sparse mode first pass: dense eval/sample paths use temporary full-vocab materialization; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
 if resuming:
