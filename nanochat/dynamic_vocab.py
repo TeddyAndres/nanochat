@@ -48,6 +48,16 @@ class DynamicVocabStep:
     d2h_launch_ms: float = 0.0
     d2h_sync_ms: float = 0.0
     cpu_writeback_ms: float = 0.0
+    prep_writeback_wait_ms: float = 0.0
+    prep_prefetch_wait_ms: float = 0.0
+    prep_cpu_gather_ms: float = 0.0
+    prep_h2d_enqueue_ms: float = 0.0
+    prep_h2d_tensor_count: int = 0
+    prep_h2d_bytes: int = 0
+    prep_prefetch_hit: int = 0
+    d2h_segment_count: int = 0
+    d2h_row_count: int = 0
+    d2h_bytes: int = 0
     active_param_bytes: int = 0
     active_grad_bytes: int = 0
     active_optimizer_bytes: int = 0
@@ -210,9 +220,14 @@ class DynamicVocabRuntime:
         self._grad_accum_window_cold_bias_abs_max = 0.0
         self._grad_accum_pending_transfers = []
         self._grad_accum_transfer_stream = torch.cuda.Stream(device=self.device) if self.use_cuda else None
-        self._cpu_writeback_executor = ThreadPoolExecutor(max_workers=1)
+        self._cpu_writeback_executor = ThreadPoolExecutor(max_workers=max(2, min(8, len(self.table_specs))))
+        self._pending_cpu_writeback_futures = None
         self._pending_cpu_writeback_future = None
         self._pending_cpu_writeback_mask_cpu = None
+        self._stage_prefetch_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_stage_prefetch_future = None
+        self._pending_stage_prefetch_key = None
+        self._gpu_stage_buffers = {}
         self._last_hidden_query_ms = 0.0
         self.global_token_count_cpu = torch.zeros((model.config.vocab_size,), dtype=torch.long)
         if self.fixed_u_mode:
@@ -423,6 +438,7 @@ class DynamicVocabRuntime:
             return
         counts = torch.ones_like(valid_ids, dtype=self.global_token_count_cpu.dtype)
         self.global_token_count_cpu.index_add_(0, valid_ids, counts)
+        self.token_event_step_count_cpu.index_add_(0, valid_ids, counts)
 
     def _rank_tokens_by_frequency(self, excluded_mask_cpu: torch.Tensor, limit: int) -> torch.Tensor:
         if limit <= 0:
@@ -836,16 +852,36 @@ class DynamicVocabRuntime:
             param.grad = None
 
     def _flush_pending_cpu_writeback(self, required_ids_cpu: Optional[torch.Tensor] = None) -> None:
-        future = self._pending_cpu_writeback_future
-        if future is None:
+        futures = self._pending_cpu_writeback_futures
+        if futures is None and self._pending_cpu_writeback_future is not None:
+            futures = [self._pending_cpu_writeback_future]
+        if not futures:
             return
         if required_ids_cpu is not None and self._pending_cpu_writeback_mask_cpu is not None:
             required_ids_cpu = required_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-            if required_ids_cpu.numel() > 0 and not self._pending_cpu_writeback_mask_cpu[required_ids_cpu].any() and not future.done():
+            if required_ids_cpu.numel() > 0 and not self._pending_cpu_writeback_mask_cpu[required_ids_cpu].any() and not all(future.done() for future in futures):
                 return
-        future.result()
+        for future in futures:
+            future.result()
+        self._pending_cpu_writeback_futures = None
         self._pending_cpu_writeback_future = None
         self._pending_cpu_writeback_mask_cpu = None
+
+    def _append_pending_cpu_writeback_futures(self, futures, ids_cpu: torch.Tensor) -> None:
+        if not futures:
+            return
+        ids_cpu = ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        if self._pending_cpu_writeback_futures is None:
+            self._pending_cpu_writeback_futures = []
+        self._pending_cpu_writeback_futures.extend(futures)
+        self._pending_cpu_writeback_future = self._pending_cpu_writeback_futures[0]
+        if self._pending_cpu_writeback_mask_cpu is None:
+            pending_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
+            if ids_cpu.numel() > 0:
+                pending_mask_cpu[ids_cpu] = True
+            self._pending_cpu_writeback_mask_cpu = pending_mask_cpu
+        elif ids_cpu.numel() > 0:
+            self._pending_cpu_writeback_mask_cpu[ids_cpu] = True
 
     def _zero_fixed_grad_slots_(self, slot_ids_cpu: Optional[torch.Tensor], table_names: Optional[tuple[str, ...]] = None) -> None:
         if not self.fixed_u_mode or slot_ids_cpu is None:
@@ -1117,7 +1153,7 @@ class DynamicVocabRuntime:
         if not self.use_cuda:
             self._writeback_fixed_rows_(global_ids_cpu, slot_ids_cpu)
             return
-        self._flush_pending_cpu_writeback()
+        self._flush_pending_cpu_writeback(global_ids_cpu)
         slot_ids_device = slot_ids_cpu.to(self.device)
         writeback_segments = []
         for name, spec in self.table_specs.items():
@@ -1137,9 +1173,6 @@ class DynamicVocabRuntime:
             writeback_segments.append((param, state, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
         ready_event = torch.cuda.Event()
         ready_event.record(torch.cuda.current_stream(self.device))
-        pending_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        pending_mask_cpu[global_ids_cpu] = True
-
         def _write_rows_when_ready(event, ids_cpu, segments) -> None:
             event.synchronize()
             with torch.no_grad():
@@ -1148,20 +1181,23 @@ class DynamicVocabRuntime:
                     state["exp_avg"].index_copy_(0, ids_cpu, exp_avg_buffer)
                     state["exp_avg_sq"].index_copy_(0, ids_cpu, exp_avg_sq_buffer)
 
-        self._pending_cpu_writeback_future = self._cpu_writeback_executor.submit(
-            _write_rows_when_ready,
-            ready_event,
-            global_ids_cpu,
-            writeback_segments,
-        )
-        self._pending_cpu_writeback_mask_cpu = pending_mask_cpu
+        futures = [
+            self._cpu_writeback_executor.submit(
+                _write_rows_when_ready,
+                ready_event,
+                global_ids_cpu,
+                [segment],
+            )
+            for segment in writeback_segments
+        ]
+        self._append_pending_cpu_writeback_futures(futures, global_ids_cpu)
 
     def _queue_fixed_lm_head_writeback_(self, global_ids_cpu: torch.Tensor, slot_ids_cpu: torch.Tensor) -> None:
         global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         if global_ids_cpu.numel() == 0:
             return
-        self._flush_pending_cpu_writeback()
+        self._flush_pending_cpu_writeback(global_ids_cpu)
         slot_ids_device = slot_ids_cpu.to(self.device)
         active_param = self.fixed_params["lm_head"]
         active_state = self.fixed_optimizer_state["lm_head"]
@@ -1180,9 +1216,6 @@ class DynamicVocabRuntime:
             ready_event.record(torch.cuda.current_stream(self.device))
         param = self.table_specs["lm_head"]["param"]
         state = self.state[param]
-        pending_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        pending_mask_cpu[global_ids_cpu] = True
-
         def _write_lm_head_rows_when_ready(event, ids_cpu, row_buf, exp_avg_buf, exp_avg_sq_buf) -> None:
             if event is not None:
                 event.synchronize()
@@ -1191,15 +1224,17 @@ class DynamicVocabRuntime:
                 state["exp_avg"].index_copy_(0, ids_cpu, exp_avg_buf)
                 state["exp_avg_sq"].index_copy_(0, ids_cpu, exp_avg_sq_buf)
 
-        self._pending_cpu_writeback_future = self._cpu_writeback_executor.submit(
-            _write_lm_head_rows_when_ready,
-            ready_event,
-            global_ids_cpu,
-            row_buffer,
-            exp_avg_buffer,
-            exp_avg_sq_buffer,
-        )
-        self._pending_cpu_writeback_mask_cpu = pending_mask_cpu
+        futures = [
+            self._cpu_writeback_executor.submit(
+                _write_lm_head_rows_when_ready,
+                ready_event,
+                global_ids_cpu,
+                row_buffer,
+                exp_avg_buffer,
+                exp_avg_sq_buffer,
+            )
+        ]
+        self._append_pending_cpu_writeback_futures(futures, global_ids_cpu)
 
     @torch.no_grad()
     def flush_active_to_cpu(self):
@@ -1231,6 +1266,51 @@ class DynamicVocabRuntime:
             gpu_tensor_map[name] = self._stage_cpu_tensor_to_device(name, tensor)
         return gpu_tensor_map
 
+    def _get_gpu_stage_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        buffer = self._gpu_stage_buffers.get(name)
+        needs_new = (
+            buffer is None or
+            buffer.dtype != dtype or
+            buffer.dim() != len(shape) or
+            any(buffer.size(dim) < shape_dim for dim, shape_dim in enumerate(shape))
+        )
+        if needs_new:
+            buffer = torch.empty(shape, dtype=dtype, device=self.device)
+            self._gpu_stage_buffers[name] = buffer
+        assert buffer is not None
+        slices = tuple(slice(0, dim) for dim in shape)
+        return buffer[slices]
+
+    def _stage_index_select_to_device(self, name: str, source_cpu: torch.Tensor, index_cpu: torch.Tensor) -> tuple[torch.Tensor, float, float, int]:
+        source_cpu = source_cpu.detach()
+        index_cpu = index_cpu.detach().to(device="cpu", dtype=torch.long)
+        gather_t0 = time.perf_counter()
+        if index_cpu.numel() == 0:
+            shape = (0,) + tuple(source_cpu.shape[1:])
+            if not self.use_cuda:
+                gather_ms = (time.perf_counter() - gather_t0) * 1000.0
+                return torch.empty(shape, dtype=source_cpu.dtype, device=self.device), gather_ms, 0.0, 0
+            stage_buffer = self._get_cpu_receive_buffer(f"stage:{name}", shape, source_cpu.dtype)
+            gather_ms = (time.perf_counter() - gather_t0) * 1000.0
+            enqueue_t0 = time.perf_counter()
+            gpu_buffer = self._get_gpu_stage_buffer(f"stage:{name}", shape, source_cpu.dtype)
+            gpu_buffer.copy_(stage_buffer, non_blocking=True)
+            enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
+            return gpu_buffer, gather_ms, enqueue_ms, 0
+        if not self.use_cuda:
+            gathered = source_cpu.index_select(0, index_cpu).to(self.device)
+            gather_ms = (time.perf_counter() - gather_t0) * 1000.0
+            return gathered, gather_ms, 0.0, gathered.numel() * gathered.element_size()
+        shape = (int(index_cpu.numel()),) + tuple(source_cpu.shape[1:])
+        stage_buffer = self._get_cpu_receive_buffer(f"stage:{name}", shape, source_cpu.dtype)
+        torch.index_select(source_cpu, 0, index_cpu, out=stage_buffer)
+        gather_ms = (time.perf_counter() - gather_t0) * 1000.0
+        enqueue_t0 = time.perf_counter()
+        gpu_buffer = self._get_gpu_stage_buffer(f"stage:{name}", shape, source_cpu.dtype)
+        gpu_buffer.copy_(stage_buffer, non_blocking=True)
+        enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
+        return gpu_buffer, gather_ms, enqueue_ms, stage_buffer.numel() * stage_buffer.element_size()
+
     def _stage_cpu_tensor_to_device(self, name: str, cpu_tensor: torch.Tensor) -> torch.Tensor:
         cpu_tensor = cpu_tensor.detach()
         if not self.use_cuda:
@@ -1238,6 +1318,139 @@ class DynamicVocabRuntime:
         stage_buffer = self._get_cpu_receive_buffer(f"stage:{name}", tuple(cpu_tensor.shape), cpu_tensor.dtype)
         stage_buffer.copy_(cpu_tensor)
         return stage_buffer.to(self.device, non_blocking=True)
+
+    def _stage_prefetched_cpu_tensor_to_device(self, name: str, cpu_tensor: torch.Tensor) -> tuple[torch.Tensor, float, int]:
+        cpu_tensor = cpu_tensor.detach()
+        if not self.use_cuda:
+            gpu_tensor = cpu_tensor.to(self.device)
+            return gpu_tensor, 0.0, gpu_tensor.numel() * gpu_tensor.element_size()
+        enqueue_t0 = time.perf_counter()
+        gpu_buffer = self._get_gpu_stage_buffer(f"stage:{name}", tuple(cpu_tensor.shape), cpu_tensor.dtype)
+        gpu_buffer.copy_(cpu_tensor, non_blocking=True)
+        enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
+        return gpu_buffer, enqueue_ms, cpu_tensor.numel() * cpu_tensor.element_size()
+
+    @torch.inference_mode()
+    def _stage_mixed_prefetched_cpu_tensor_to_device(
+        self,
+        name: str,
+        source_cpu: torch.Tensor,
+        stage_ids_cpu: torch.Tensor,
+        prefetched_cpu: torch.Tensor,
+        prefetched_global_to_local_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, float, float, int]:
+        source_cpu = source_cpu.detach()
+        prefetched_cpu = prefetched_cpu.detach()
+        gather_t0 = time.perf_counter()
+        shape = (int(stage_ids_cpu.numel()),) + tuple(source_cpu.shape[1:])
+        stage_buffer = self._get_cpu_receive_buffer(f"stage:{name}", shape, source_cpu.dtype)
+        prefetched_local_ids_cpu = prefetched_global_to_local_cpu.index_select(0, stage_ids_cpu)
+        prefetched_mask_cpu = prefetched_local_ids_cpu >= 0
+        if prefetched_mask_cpu.any():
+            prefetched_positions_cpu = torch.nonzero(prefetched_mask_cpu, as_tuple=False).flatten()
+            prefetched_rows_cpu = prefetched_cpu.index_select(0, prefetched_local_ids_cpu[prefetched_mask_cpu])
+            stage_buffer.index_copy_(0, prefetched_positions_cpu, prefetched_rows_cpu)
+        missing_mask_cpu = ~prefetched_mask_cpu
+        if missing_mask_cpu.any():
+            missing_ids_cpu = stage_ids_cpu[missing_mask_cpu]
+            missing_shape = (int(missing_ids_cpu.numel()),) + tuple(source_cpu.shape[1:])
+            missing_buffer = self._get_cpu_receive_buffer(f"stage-miss:{name}", missing_shape, source_cpu.dtype)
+            torch.index_select(source_cpu, 0, missing_ids_cpu, out=missing_buffer)
+            missing_positions_cpu = torch.nonzero(missing_mask_cpu, as_tuple=False).flatten()
+            stage_buffer.index_copy_(0, missing_positions_cpu, missing_buffer)
+        gather_ms = (time.perf_counter() - gather_t0) * 1000.0
+        if not self.use_cuda:
+            gathered = stage_buffer.to(self.device)
+            return gathered, gather_ms, 0.0, gathered.numel() * gathered.element_size()
+        enqueue_t0 = time.perf_counter()
+        gpu_buffer = self._get_gpu_stage_buffer(f"stage:{name}", shape, source_cpu.dtype)
+        gpu_buffer.copy_(stage_buffer, non_blocking=True)
+        enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
+        return gpu_buffer, gather_ms, enqueue_ms, stage_buffer.numel() * stage_buffer.element_size()
+
+    def _build_fixed_prefetch_requests(self, step_meta: dict) -> dict[str, torch.Tensor]:
+        active_ids_cpu = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        grad_accum_ids_cpu = step_meta.get("grad_accum_ids_cpu", active_ids_cpu).detach().to(device="cpu", dtype=torch.long)
+        grad_accum_steps = int(step_meta.get("grad_accum_steps", 1))
+        stage_ids_cpu = step_meta["stage_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
+        cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
+        cloud_ids_cpu = torch.cat((warm_ids_cpu, cold_ids_cpu)) if warm_ids_cpu.numel() > 0 or cold_ids_cpu.numel() > 0 else self._empty_long_cpu()
+        non_lm_head_ids_cpu = stage_ids_cpu if self._fixed_live_state else active_ids_cpu
+        lm_head_ids_cpu = self._empty_long_cpu()
+        if grad_accum_steps > 1:
+            lm_head_ids_cpu = grad_accum_ids_cpu
+            if self._fixed_live_state and grad_accum_ids_cpu.numel() > 0:
+                prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
+                prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
+                if prev_lm_head_slot_ids_cpu.numel() > 0:
+                    prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
+                    prev_lm_head_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+                    prev_lm_head_global_to_slot_cpu[prev_lm_head_ids_cpu] = prev_lm_head_slot_ids_cpu
+                    reused_old_slot_ids_cpu = prev_lm_head_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
+                    lm_head_ids_cpu = grad_accum_ids_cpu[reused_old_slot_ids_cpu < 0]
+        else:
+            if self._fixed_live_state:
+                lm_head_ids_cpu = torch.cat((stage_ids_cpu, cloud_ids_cpu)) if cloud_ids_cpu.numel() > 0 else stage_ids_cpu
+            else:
+                lm_head_ids_cpu = torch.cat((active_ids_cpu, cloud_ids_cpu)) if cloud_ids_cpu.numel() > 0 else active_ids_cpu
+
+        requests = {}
+        if non_lm_head_ids_cpu.numel() > 0:
+            requests["__non_lm_head__"] = non_lm_head_ids_cpu
+        if lm_head_ids_cpu.numel() > 0:
+            requests["lm_head"] = lm_head_ids_cpu
+        return requests
+
+    @torch.inference_mode()
+    def _prefetch_fixed_step_cpu_rows(self, requests: dict[str, torch.Tensor]) -> dict[str, dict]:
+        required_ids = []
+        for ids_cpu in requests.values():
+            if ids_cpu.numel() > 0:
+                required_ids.append(ids_cpu.detach().to(device="cpu", dtype=torch.long))
+        if required_ids:
+            required_ids_cpu = torch.unique(torch.cat(required_ids), sorted=False)
+            self._flush_pending_cpu_writeback(required_ids_cpu)
+        payload = {}
+        non_lm_head_ids_cpu = requests.get("__non_lm_head__")
+        for name, spec in self.table_specs.items():
+            ids_cpu = requests.get(name)
+            if name != "lm_head":
+                ids_cpu = non_lm_head_ids_cpu
+            if ids_cpu is None or ids_cpu.numel() == 0:
+                continue
+            ids_cpu = ids_cpu.detach().to(device="cpu", dtype=torch.long)
+            param = spec["param"].detach()
+            state = self.state[spec["param"]]
+            exp_avg_src = state["exp_avg"].detach()
+            exp_avg_sq_src = state["exp_avg_sq"].detach()
+            rows = torch.empty((ids_cpu.numel(),) + tuple(param.shape[1:]), dtype=param.dtype, pin_memory=self.use_cuda)
+            exp_avg = torch.empty((ids_cpu.numel(),) + tuple(param.shape[1:]), dtype=param.dtype, pin_memory=self.use_cuda)
+            exp_avg_sq = torch.empty((ids_cpu.numel(),) + tuple(param.shape[1:]), dtype=param.dtype, pin_memory=self.use_cuda)
+            torch.index_select(param, 0, ids_cpu, out=rows)
+            torch.index_select(exp_avg_src, 0, ids_cpu, out=exp_avg)
+            torch.index_select(exp_avg_sq_src, 0, ids_cpu, out=exp_avg_sq)
+            global_to_local_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+            global_to_local_cpu[ids_cpu] = torch.arange(ids_cpu.numel(), dtype=torch.long)
+            payload[name] = {
+                "ids_cpu": ids_cpu,
+                "global_to_local_cpu": global_to_local_cpu,
+                "param": rows,
+                "exp_avg": exp_avg,
+                "exp_avg_sq": exp_avg_sq,
+            }
+        return payload
+
+    def prefetch_step(self, active_ids_cpu) -> None:
+        if not (self.use_cuda and self.fixed_u_mode and isinstance(active_ids_cpu, dict)):
+            return
+        requests = self._build_fixed_prefetch_requests(active_ids_cpu)
+        if not requests:
+            self._pending_stage_prefetch_future = None
+            self._pending_stage_prefetch_key = None
+            return
+        self._pending_stage_prefetch_key = id(active_ids_cpu)
+        self._pending_stage_prefetch_future = self._stage_prefetch_executor.submit(self._prefetch_fixed_step_cpu_rows, requests)
 
     @torch.no_grad()
     def _apply_fixed_lm_head_cold_row_decay_(
@@ -1356,6 +1569,9 @@ class DynamicVocabRuntime:
         cold_bias_scale: float = 0.0,
         cold_row_decay: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
+        prefetched_stage: Optional[dict[str, dict]] = None,
+        prefetched_wait_ms: float = 0.0,
+        prefetched_hit: int = 0,
     ) -> DynamicVocabStep:
         assert self.fixed_u_mode, "Fixed-U step requested without fixed_u_max runtime configuration"
         active_ids_cpu = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
@@ -1496,6 +1712,41 @@ class DynamicVocabRuntime:
 
         grad_accum_stage_ids_cpu = grad_accum_ids_cpu
         grad_accum_stage_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        prep_writeback_wait_ms = 0.0
+        prep_prefetch_wait_ms = float(prefetched_wait_ms)
+        prep_cpu_gather_ms = 0.0
+        prep_h2d_enqueue_ms = 0.0
+        prep_h2d_tensor_count = 0
+        prep_h2d_bytes = 0
+        deferred_writeback_ids_cpu = self._empty_long_cpu()
+        deferred_writeback_slot_ids_cpu = self._empty_long_cpu()
+        deferred_lm_head_writeback_ids_cpu = self._empty_long_cpu()
+        deferred_lm_head_writeback_slot_ids_cpu = self._empty_long_cpu()
+        if self.use_cuda and grad_accum_steps > 1 and self._fixed_live_state:
+            prev_active_slot_ids_cpu = torch.nonzero(self.fixed_slot_to_global_cpu >= 0, as_tuple=False).flatten()
+            if prev_active_slot_ids_cpu.numel() > 0:
+                prev_active_ids_cpu = self.fixed_slot_to_global_cpu.index_select(0, prev_active_slot_ids_cpu)
+                prev_active_global_to_row_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+                prev_active_global_to_row_cpu[prev_active_ids_cpu] = torch.arange(prev_active_ids_cpu.numel(), dtype=torch.long)
+                kept_prev_active_rows_cpu = prev_active_global_to_row_cpu.index_select(0, active_ids_cpu)
+                kept_prev_active_mask_cpu = torch.zeros(prev_active_slot_ids_cpu.numel(), dtype=torch.bool)
+                valid_prev_active_mask_cpu = kept_prev_active_rows_cpu >= 0
+                if valid_prev_active_mask_cpu.any():
+                    kept_prev_active_mask_cpu[kept_prev_active_rows_cpu[valid_prev_active_mask_cpu]] = True
+                deferred_writeback_ids_cpu = prev_active_ids_cpu[~kept_prev_active_mask_cpu]
+                deferred_writeback_slot_ids_cpu = prev_active_slot_ids_cpu[~kept_prev_active_mask_cpu]
+            prev_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
+            if prev_lm_head_slot_ids_cpu.numel() > 0:
+                prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
+                prev_lm_head_global_to_row_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+                prev_lm_head_global_to_row_cpu[prev_lm_head_ids_cpu] = torch.arange(prev_lm_head_ids_cpu.numel(), dtype=torch.long)
+                kept_prev_lm_head_rows_cpu = prev_lm_head_global_to_row_cpu.index_select(0, grad_accum_ids_cpu)
+                kept_prev_lm_head_mask_cpu = torch.zeros(prev_lm_head_slot_ids_cpu.numel(), dtype=torch.bool)
+                valid_prev_lm_head_mask_cpu = kept_prev_lm_head_rows_cpu >= 0
+                if valid_prev_lm_head_mask_cpu.any():
+                    kept_prev_lm_head_mask_cpu[kept_prev_lm_head_rows_cpu[valid_prev_lm_head_mask_cpu]] = True
+                deferred_lm_head_writeback_ids_cpu = prev_lm_head_ids_cpu[~kept_prev_lm_head_mask_cpu]
+                deferred_lm_head_writeback_slot_ids_cpu = prev_lm_head_slot_ids_cpu[~kept_prev_lm_head_mask_cpu]
         if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state:
             prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
             prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
@@ -1528,9 +1779,21 @@ class DynamicVocabRuntime:
             required_cpu_ids.append(cloud_stage_ids_cpu)
         if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_stage_ids_cpu.numel() > 0:
             required_cpu_ids.append(grad_accum_stage_ids_cpu)
+        if deferred_writeback_ids_cpu.numel() > 0:
+            self._queue_fixed_rows_writeback_(
+                deferred_writeback_ids_cpu,
+                deferred_writeback_slot_ids_cpu,
+            )
+        if deferred_lm_head_writeback_ids_cpu.numel() > 0:
+            self._queue_fixed_lm_head_writeback_(
+                deferred_lm_head_writeback_ids_cpu,
+                deferred_lm_head_writeback_slot_ids_cpu,
+            )
+        flush_t0 = time.perf_counter()
         self._flush_pending_cpu_writeback(
             torch.cat(required_cpu_ids) if required_cpu_ids else None
         )
+        prep_writeback_wait_ms += (time.perf_counter() - flush_t0) * 1000.0
         if cloud_writeback_ids_cpu.numel() > 0:
             self._queue_fixed_lm_head_writeback_(cloud_writeback_ids_cpu, cloud_writeback_slot_ids_cpu)
         if preserve_resident_grads:
@@ -1559,13 +1822,50 @@ class DynamicVocabRuntime:
             if stage_ids_for_name.numel() == 0:
                 continue
             stage_slot_ids_device = stage_slots_for_name.to(self.device)
-            rows = param.index_select(0, stage_ids_for_name)
-            exp_avg = state["exp_avg"].index_select(0, stage_ids_for_name)
-            exp_avg_sq = state["exp_avg_sq"].index_select(0, stage_ids_for_name)
             stage_suffix = f"fixed:{grad_accum_micro_step}:{name}"
-            rows_gpu = self._stage_cpu_tensor_to_device(f"{stage_suffix}:param", rows)
-            exp_avg_gpu = self._stage_cpu_tensor_to_device(f"{stage_suffix}:exp_avg", exp_avg)
-            exp_avg_sq_gpu = self._stage_cpu_tensor_to_device(f"{stage_suffix}:exp_avg_sq", exp_avg_sq)
+            prefetched_entry = None if prefetched_stage is None else prefetched_stage.get(name)
+            if prefetched_entry is not None:
+                if torch.equal(prefetched_entry["ids_cpu"], stage_ids_for_name):
+                    rows_gpu, rows_enqueue_ms, rows_bytes = self._stage_prefetched_cpu_tensor_to_device(f"{stage_suffix}:param", prefetched_entry["param"])
+                    exp_avg_gpu, exp_avg_enqueue_ms, exp_avg_bytes = self._stage_prefetched_cpu_tensor_to_device(f"{stage_suffix}:exp_avg", prefetched_entry["exp_avg"])
+                    exp_avg_sq_gpu, exp_avg_sq_enqueue_ms, exp_avg_sq_bytes = self._stage_prefetched_cpu_tensor_to_device(f"{stage_suffix}:exp_avg_sq", prefetched_entry["exp_avg_sq"])
+                    prep_h2d_enqueue_ms += rows_enqueue_ms + exp_avg_enqueue_ms + exp_avg_sq_enqueue_ms
+                    prep_h2d_tensor_count += 3
+                    prep_h2d_bytes += rows_bytes + exp_avg_bytes + exp_avg_sq_bytes
+                else:
+                    rows_gpu, rows_gather_ms, rows_enqueue_ms, rows_bytes = self._stage_mixed_prefetched_cpu_tensor_to_device(
+                        f"{stage_suffix}:param",
+                        param,
+                        stage_ids_for_name,
+                        prefetched_entry["param"],
+                        prefetched_entry["global_to_local_cpu"],
+                    )
+                    exp_avg_gpu, exp_avg_gather_ms, exp_avg_enqueue_ms, exp_avg_bytes = self._stage_mixed_prefetched_cpu_tensor_to_device(
+                        f"{stage_suffix}:exp_avg",
+                        state["exp_avg"],
+                        stage_ids_for_name,
+                        prefetched_entry["exp_avg"],
+                        prefetched_entry["global_to_local_cpu"],
+                    )
+                    exp_avg_sq_gpu, exp_avg_sq_gather_ms, exp_avg_sq_enqueue_ms, exp_avg_sq_bytes = self._stage_mixed_prefetched_cpu_tensor_to_device(
+                        f"{stage_suffix}:exp_avg_sq",
+                        state["exp_avg_sq"],
+                        stage_ids_for_name,
+                        prefetched_entry["exp_avg_sq"],
+                        prefetched_entry["global_to_local_cpu"],
+                    )
+                    prep_cpu_gather_ms += rows_gather_ms + exp_avg_gather_ms + exp_avg_sq_gather_ms
+                    prep_h2d_enqueue_ms += rows_enqueue_ms + exp_avg_enqueue_ms + exp_avg_sq_enqueue_ms
+                    prep_h2d_tensor_count += 3
+                    prep_h2d_bytes += rows_bytes + exp_avg_bytes + exp_avg_sq_bytes
+            else:
+                rows_gpu, rows_gather_ms, rows_enqueue_ms, rows_bytes = self._stage_index_select_to_device(f"{stage_suffix}:param", param, stage_ids_for_name)
+                exp_avg_gpu, exp_avg_gather_ms, exp_avg_enqueue_ms, exp_avg_bytes = self._stage_index_select_to_device(f"{stage_suffix}:exp_avg", state["exp_avg"], stage_ids_for_name)
+                exp_avg_sq_gpu, exp_avg_sq_gather_ms, exp_avg_sq_enqueue_ms, exp_avg_sq_bytes = self._stage_index_select_to_device(f"{stage_suffix}:exp_avg_sq", state["exp_avg_sq"], stage_ids_for_name)
+                prep_cpu_gather_ms += rows_gather_ms + exp_avg_gather_ms + exp_avg_sq_gather_ms
+                prep_h2d_enqueue_ms += rows_enqueue_ms + exp_avg_enqueue_ms + exp_avg_sq_enqueue_ms
+                prep_h2d_tensor_count += 3
+                prep_h2d_bytes += rows_bytes + exp_avg_bytes + exp_avg_sq_bytes
             self.fixed_params[name].data.index_copy_(0, stage_slot_ids_device, rows_gpu)
             self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
             self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
@@ -1675,6 +1975,13 @@ class DynamicVocabRuntime:
             cold_bias_clamped_count=cold_bias_clamped_count,
             cold_bias_abs_max=cold_bias_abs_max,
             hot_activation_counts_cpu=hot_activation_counts_cpu,
+            prep_writeback_wait_ms=prep_writeback_wait_ms,
+            prep_prefetch_wait_ms=prep_prefetch_wait_ms,
+            prep_cpu_gather_ms=prep_cpu_gather_ms,
+            prep_h2d_enqueue_ms=prep_h2d_enqueue_ms,
+            prep_h2d_tensor_count=prep_h2d_tensor_count,
+            prep_h2d_bytes=prep_h2d_bytes,
+            prep_prefetch_hit=prefetched_hit,
         )
 
     def prepare_step(
@@ -1685,11 +1992,24 @@ class DynamicVocabRuntime:
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
         if isinstance(active_ids_cpu, dict):
+            prefetched_stage = None
+            prefetch_wait_ms = 0.0
+            prefetch_hit = 0
+            if self.use_cuda and self._pending_stage_prefetch_future is not None and self._pending_stage_prefetch_key == id(active_ids_cpu):
+                prefetch_wait_t0 = time.perf_counter()
+                prefetched_stage = self._pending_stage_prefetch_future.result()
+                prefetch_wait_ms = (time.perf_counter() - prefetch_wait_t0) * 1000.0
+                prefetch_hit = 1
+                self._pending_stage_prefetch_future = None
+                self._pending_stage_prefetch_key = None
             return self._prepare_fixed_step(
                 active_ids_cpu,
                 cold_bias_scale=cold_bias_scale,
                 cold_row_decay=cold_row_decay,
                 cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+                prefetched_stage=prefetched_stage,
+                prefetched_wait_ms=prefetch_wait_ms,
+                prefetched_hit=prefetch_hit,
             )
         return self._prepare_dynamic_step(
             active_ids_cpu,
@@ -2030,8 +2350,11 @@ class DynamicVocabRuntime:
         d2h_launch_ms = 0.0
         d2h_sync_ms = 0.0
         cpu_writeback_ms = 0.0
+        d2h_segment_count = 0
+        d2h_row_count = 0
+        d2h_bytes = 0
         live_writeback_ids_cpu = torch.empty(0, dtype=torch.long)
-        if live_global_ids_cpu.numel() > 0 or live_lm_head_global_ids_cpu.numel() > 0:
+        if not self.use_cuda and (live_global_ids_cpu.numel() > 0 or live_lm_head_global_ids_cpu.numel() > 0):
             live_writeback_ids_cpu = torch.cat(
                 tuple(
                     ids for ids in (live_global_ids_cpu, live_lm_head_global_ids_cpu)
@@ -2050,8 +2373,35 @@ class DynamicVocabRuntime:
         if writeback_ids_cpu.numel() > 0:
             self._flush_pending_cpu_writeback(writeback_ids_cpu)
             t_d2h_launch_start = time.perf_counter()
+            writeback_sources = {}
+
+            def queue_writeback_source(
+                name: str,
+                param: torch.Tensor,
+                state: dict,
+                segment_ids_cpu: torch.Tensor,
+                row_source: torch.Tensor,
+                exp_avg_source: torch.Tensor,
+                exp_avg_sq_source: torch.Tensor,
+            ) -> None:
+                batch = writeback_sources.get(name)
+                if batch is None:
+                    batch = {
+                        "param": param,
+                        "state": state,
+                        "ids": [],
+                        "rows": [],
+                        "exp_avg": [],
+                        "exp_avg_sq": [],
+                    }
+                    writeback_sources[name] = batch
+                batch["ids"].append(segment_ids_cpu)
+                batch["rows"].append(row_source)
+                batch["exp_avg"].append(exp_avg_source)
+                batch["exp_avg_sq"].append(exp_avg_sq_source)
+
             writeback_segments = []
-            if live_slot_ids_cpu.numel() > 0:
+            if not self.use_cuda and live_slot_ids_cpu.numel() > 0:
                 live_slot_ids_device = live_slot_ids_cpu.to(self.device)
                 for name in self.table_specs:
                     if name == "lm_head":
@@ -2061,27 +2411,15 @@ class DynamicVocabRuntime:
                     row_source = self.fixed_params[name].detach().index_select(0, live_slot_ids_device)
                     exp_avg_source = self.fixed_optimizer_state[name]["exp_avg"].detach().index_select(0, live_slot_ids_device)
                     exp_avg_sq_source = self.fixed_optimizer_state[name]["exp_avg_sq"].detach().index_select(0, live_slot_ids_device)
-                    row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}:live", tuple(row_source.shape), row_source.dtype)
-                    exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}:live", tuple(exp_avg_source.shape), exp_avg_source.dtype)
-                    exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}:live", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
-                    row_buffer.copy_(row_source, non_blocking=self.use_cuda)
-                    exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
-                    exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
-                    writeback_segments.append((name, param, state, live_global_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
-            if live_lm_head_slot_ids_cpu.numel() > 0:
+                    queue_writeback_source(name, param, state, live_global_ids_cpu, row_source, exp_avg_source, exp_avg_sq_source)
+            if not self.use_cuda and live_lm_head_slot_ids_cpu.numel() > 0:
                 live_lm_head_slot_ids_device = live_lm_head_slot_ids_cpu.to(self.device)
                 param = self.table_specs["lm_head"]["param"]
                 state = self.state[param]
                 row_source = self.fixed_params["lm_head"].detach().index_select(0, live_lm_head_slot_ids_device)
                 exp_avg_source = self.fixed_optimizer_state["lm_head"]["exp_avg"].detach().index_select(0, live_lm_head_slot_ids_device)
                 exp_avg_sq_source = self.fixed_optimizer_state["lm_head"]["exp_avg_sq"].detach().index_select(0, live_lm_head_slot_ids_device)
-                row_buffer = self._get_cpu_receive_buffer("rows:accum:lm_head:live", tuple(row_source.shape), row_source.dtype)
-                exp_avg_buffer = self._get_cpu_receive_buffer("exp_avg:accum:lm_head:live", tuple(exp_avg_source.shape), exp_avg_source.dtype)
-                exp_avg_sq_buffer = self._get_cpu_receive_buffer("exp_avg_sq:accum:lm_head:live", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
-                row_buffer.copy_(row_source, non_blocking=self.use_cuda)
-                exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
-                exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
-                writeback_segments.append(("lm_head", param, state, live_lm_head_global_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
+                queue_writeback_source("lm_head", param, state, live_lm_head_global_ids_cpu, row_source, exp_avg_source, exp_avg_sq_source)
             for name, spec in self.table_specs.items():
                 param = spec["param"]
                 state = self.state[param]
@@ -2091,48 +2429,53 @@ class DynamicVocabRuntime:
                     row_source = chunk["tables"][name]["param"].detach()
                     exp_avg_source = chunk["tables"][name]["exp_avg"].detach()
                     exp_avg_sq_source = chunk["tables"][name]["exp_avg_sq"].detach()
-                    row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}:chunk{chunk_idx}", tuple(row_source.shape), row_source.dtype)
-                    exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}:chunk{chunk_idx}", tuple(exp_avg_source.shape), exp_avg_source.dtype)
-                    exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}:chunk{chunk_idx}", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
-                    row_buffer.copy_(row_source, non_blocking=self.use_cuda)
-                    exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
-                    exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
-                    writeback_segments.append((name, param, state, chunk["global_ids_cpu"], row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
+                    queue_writeback_source(name, param, state, chunk["global_ids_cpu"], row_source, exp_avg_source, exp_avg_sq_source)
                 if name in non_live_params:
                     row_source = non_live_params[name].detach()
                     exp_avg_source = non_live_optimizer_state[name]["exp_avg"].detach()
                     exp_avg_sq_source = non_live_optimizer_state[name]["exp_avg_sq"].detach()
-                    row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}:fallback", tuple(row_source.shape), row_source.dtype)
-                    exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}:fallback", tuple(exp_avg_source.shape), exp_avg_source.dtype)
-                    exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}:fallback", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
-                    row_buffer.copy_(row_source, non_blocking=self.use_cuda)
-                    exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
-                    exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
-                    writeback_segments.append((name, param, state, staged_non_live_grad_accum_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
+                    queue_writeback_source(name, param, state, staged_non_live_grad_accum_ids_cpu, row_source, exp_avg_source, exp_avg_sq_source)
+            for name, batch in writeback_sources.items():
+                segment_ids_cpu = batch["ids"][0] if len(batch["ids"]) == 1 else torch.cat(batch["ids"])
+                row_source = batch["rows"][0] if len(batch["rows"]) == 1 else torch.cat(batch["rows"], dim=0)
+                exp_avg_source = batch["exp_avg"][0] if len(batch["exp_avg"]) == 1 else torch.cat(batch["exp_avg"], dim=0)
+                exp_avg_sq_source = batch["exp_avg_sq"][0] if len(batch["exp_avg_sq"]) == 1 else torch.cat(batch["exp_avg_sq"], dim=0)
+                row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}:merged", tuple(row_source.shape), row_source.dtype)
+                exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}:merged", tuple(exp_avg_source.shape), exp_avg_source.dtype)
+                exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}:merged", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
+                row_buffer.copy_(row_source, non_blocking=self.use_cuda)
+                exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
+                exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)
+                d2h_segment_count += 1
+                d2h_row_count += int(segment_ids_cpu.numel())
+                d2h_bytes += (
+                    row_buffer.numel() * row_buffer.element_size() +
+                    exp_avg_buffer.numel() * exp_avg_buffer.element_size() +
+                    exp_avg_sq_buffer.numel() * exp_avg_sq_buffer.element_size()
+                )
+                writeback_segments.append((name, batch["param"], batch["state"], segment_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer))
             d2h_launch_ms = (time.perf_counter() - t_d2h_launch_start) * 1000.0
             ready_event = None
             if self.use_cuda:
                 ready_event = torch.cuda.Event()
                 ready_event.record(torch.cuda.current_stream(self.device))
 
-            pending_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-            pending_mask_cpu[writeback_ids_cpu] = True
-
-            def _write_segments_when_ready(event, segments) -> None:
+            def _write_segment_when_ready(event, segment) -> None:
                 if event is not None:
                     event.synchronize()
+                _, param, state, segment_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer = segment
                 with torch.no_grad():
-                    for _, param, state, segment_ids_cpu, row_buffer, exp_avg_buffer, exp_avg_sq_buffer in segments:
-                        param.index_copy_(0, segment_ids_cpu, row_buffer)
-                        state["exp_avg"].index_copy_(0, segment_ids_cpu, exp_avg_buffer)
-                        state["exp_avg_sq"].index_copy_(0, segment_ids_cpu, exp_avg_sq_buffer)
+                    param.index_copy_(0, segment_ids_cpu, row_buffer)
+                    state["exp_avg"].index_copy_(0, segment_ids_cpu, exp_avg_buffer)
+                    state["exp_avg_sq"].index_copy_(0, segment_ids_cpu, exp_avg_sq_buffer)
 
-            self._pending_cpu_writeback_future = self._cpu_writeback_executor.submit(_write_segments_when_ready, ready_event, writeback_segments)
-            self._pending_cpu_writeback_mask_cpu = pending_mask_cpu
+            futures = [
+                self._cpu_writeback_executor.submit(_write_segment_when_ready, ready_event, segment)
+                for segment in writeback_segments
+            ]
+            self._append_pending_cpu_writeback_futures(futures, writeback_ids_cpu)
         writeback_ms = (time.perf_counter() - t_writeback_start) * 1000.0
-        total_writeback_count = int(live_lm_head_global_ids_cpu.numel())
-        if total_writeback_count == 0:
-            total_writeback_count = int(writeback_ids_cpu.numel())
+        total_writeback_count = int(writeback_ids_cpu.numel())
 
         metrics = DynamicVocabStep(
             active_ids_cpu=grad_accum_ids_cpu,
@@ -2153,6 +2496,9 @@ class DynamicVocabRuntime:
             d2h_launch_ms=d2h_launch_ms,
             d2h_sync_ms=d2h_sync_ms,
             cpu_writeback_ms=cpu_writeback_ms,
+            d2h_segment_count=d2h_segment_count,
+            d2h_row_count=d2h_row_count,
+            d2h_bytes=d2h_bytes,
             optimizer_ms=apply_ms,
             fixed_u_mode=self.fixed_u_mode,
             cold_bias_clamped_count=self._grad_accum_window_cold_bias_clamped_count,

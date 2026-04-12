@@ -74,13 +74,12 @@ RUNS = [
             '--depth=6 --aspect-ratio 64 '
             '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
             '--num-iterations=5000 '            
-            '--run \"d6 65kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 0.001coldrow 2coldbias3\" '
+            '--run \"d6 65kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2\" '
             '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
             '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
             '--embedding-lr 1.2 --unembedding-lr=0.025 --matrix-lr 0.03 --scalar-lr 0.7 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '
-            '--sparse-cold-row-decay 0.001 --sparse-cold-bias-scale 2 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 5000 '
+            '--adam-beta1 0.7 --adam-beta2 0.95 '           
+            '--log-every 10 --eval-every 250 --core-metric-every 5000 '
         ),
     },
     # Add more runs below:

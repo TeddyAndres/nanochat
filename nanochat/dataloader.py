@@ -134,6 +134,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     buffer_size=1000,
     return_active_vocab=False,
     return_sequence_recipe=False,
+    pin_memory_output=False,
     vocab_size=None,
     token_cache_dir=None,
     token_cache_shard_batches=256,
@@ -186,10 +187,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
-    use_cuda = torch.device(device).type == "cuda"
+    output_device = torch.device(device)
+    use_cuda = output_device.type == "cuda"
+    use_pinned_output = use_cuda or bool(pin_memory_output)
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_pinned_output) # staging area (CPU)
+    gpu_buffer = torch.empty(
+        2 * B * T,
+        dtype=torch.long,
+        device=device,
+        pin_memory=(output_device.type == "cpu" and use_pinned_output),
+    ) # on-device buffer or pinned CPU output buffer
     cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -277,7 +285,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
             }
 
         # Single HtoD copy into persistent GPU buffer and yield
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        if gpu_buffer.data_ptr() != cpu_buffer.data_ptr():
+            gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         if return_active_vocab and return_sequence_recipe:
             yield inputs, targets, active_ids, state_dict, sequence_recipe
         elif return_active_vocab:
@@ -306,6 +315,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
     buffer_size=1000,
+    pin_memory_output=False,
     vocab_size=None,
     include_local_batch=False,
     step_override_provider=None,
@@ -410,14 +420,22 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             device="cpu",
             resume_state_dict=base_resume_state,
             buffer_size=buffer_size,
+            pin_memory_output=pin_memory_output,
             token_cache_dir=token_cache_dir,
             token_cache_shard_batches=token_cache_shard_batches,
             token_cache_workers=token_cache_workers,
         )
 
-    use_cuda = torch.device(device).type == "cuda"
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    output_device = torch.device(device)
+    use_cuda = output_device.type == "cuda"
+    use_pinned_output = use_cuda or bool(pin_memory_output)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_pinned_output)
+    gpu_buffer = torch.empty(
+        2 * B * T,
+        dtype=torch.long,
+        device=device,
+        pin_memory=(output_device.type == "cpu" and use_pinned_output),
+    )
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -709,7 +727,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         state_dict = dict(base_state_dict)
         state_dict["manifest_step"] = manifest_step
 
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        if gpu_buffer.data_ptr() != cpu_buffer.data_ptr():
+            gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, step_meta, state_dict
 
         if manifest_step == num_manifest_steps - 1 and is_last_microstep:

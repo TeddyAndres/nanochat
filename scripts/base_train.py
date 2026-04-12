@@ -22,6 +22,8 @@ import json
 import time
 import math
 import argparse
+import queue
+import threading
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -51,6 +53,37 @@ from scripts.base_eval import evaluate_core
 print_banner()
 
 SPARSE_RUNTIME_CAPACITY_MULTIPLE = 32
+
+
+class AsyncLoaderPrefetcher:
+    def __init__(self, loader, max_prefetch=2):
+        self.loader = loader
+        self.queue = queue.Queue(maxsize=max_prefetch)
+        self._error = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        try:
+            while True:
+                self.queue.put(next(self.loader))
+        except StopIteration:
+            pass
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+        return item
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -555,8 +588,9 @@ if args.sparse_mode:
             args.max_seq_len,
             split="train",
             manifest_path=args.sparse_manifest,
-            device=device,
+            device="cpu",
             resume_state_dict=dataloader_resume_state_dict,
+            pin_memory_output=(device_type == "cuda"),
             vocab_size=vocab_size,
             include_local_batch=sparse_lm_head_clouds,
             step_override_provider=None if sparse_future_window_planner is None else sparse_future_window_planner.get_step_override,
@@ -564,19 +598,22 @@ if args.sparse_mode:
             token_cache_shard_batches=args.token_cache_shard_batches,
             token_cache_workers=token_cache_workers,
         )
+        train_loader = AsyncLoaderPrefetcher(train_loader, max_prefetch=2)
     else:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
             tokenizer,
             args.device_batch_size,
             args.max_seq_len,
             split="train",
-            device=device,
+            device="cpu",
             resume_state_dict=dataloader_resume_state_dict,
+            pin_memory_output=(device_type == "cuda"),
             vocab_size=vocab_size,
             token_cache_dir=args.token_cache_dir,
             token_cache_shard_batches=args.token_cache_shard_batches,
             token_cache_workers=token_cache_workers,
         )
+        train_loader = AsyncLoaderPrefetcher(train_loader, max_prefetch=2)
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer,
@@ -614,6 +651,12 @@ def plan_sparse_batch_meta(step_meta):
         hidden_query_strategy=args.sparse_cloud_hidden_query_strategy,
         hidden_query_max_prefix_len=args.sparse_cloud_hidden_query_max_prefix_len,
     )
+
+
+def stage_batch_to_device(batch_x, batch_y):
+    if torch.device(device).type == "cpu":
+        return batch_x, batch_y
+    return batch_x.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
 
 
 if args.sparse_mode:
@@ -833,6 +876,7 @@ if args.sparse_mode:
     startup_fetch_t0 = time.perf_counter()
     x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
     sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
+    x, y = stage_batch_to_device(x, y)
     if args.sparse_debug_timing:
         print0(f"Sparse startup first-batch fetch: {(time.perf_counter() - startup_fetch_t0) * 1000.0:.2f}ms")
 else:
@@ -997,7 +1041,22 @@ while True:
     sparse_window_metrics = None
     train_loss_accum = None
     sparse_prepare_ms = 0.0
+    sparse_prep_writeback_wait_ms = 0.0
+    sparse_prep_prefetch_wait_ms = 0.0
+    sparse_prep_cpu_gather_ms = 0.0
+    sparse_prep_h2d_enqueue_ms = 0.0
+    sparse_prep_h2d_tensor_count = 0
+    sparse_prep_h2d_bytes = 0
+    sparse_prep_prefetch_hits = 0
     sparse_fwdbwd_ms = 0.0
+    sparse_input_clone_ms = 0.0
+    sparse_forward_call_ms = 0.0
+    sparse_backward_call_ms = 0.0
+    sparse_next_fetch_ms = 0.0
+    sparse_loader_fetch_ms = 0.0
+    sparse_plan_meta_ms = 0.0
+    sparse_row_prefetch_launch_ms = 0.0
+    sparse_batch_h2d_ms = 0.0
     sparse_backward_sync_ms = 0.0
     sparse_accum_call_ms = 0.0
     sparse_apply_call_ms = 0.0
@@ -1007,8 +1066,16 @@ while True:
     step_correct_records_all = None
     step_incorrect_scores_all = None
     step_incorrect_records_all = None
+    next_x = None
+    next_y = None
+    next_sparse_batch_meta = None
+    next_dataloader_state_dict = None
     for micro_step in range(grad_accum_steps):
         micro_t0 = time.perf_counter()
+        clone_t0 = time.perf_counter()
+        current_x = x.clone()
+        current_y = y.clone()
+        sparse_input_clone_ms += (time.perf_counter() - clone_t0) * 1000.0
         if args.sparse_mode:
             prepare_t0 = time.perf_counter()
             sparse_step_ctx = dynamic_vocab.prepare_step(
@@ -1018,19 +1085,28 @@ while True:
                 cold_bias_tokens_per_step=total_batch_size,
             )
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
+            sparse_prep_writeback_wait_ms += sparse_step_ctx.prep_writeback_wait_ms
+            sparse_prep_prefetch_wait_ms += sparse_step_ctx.prep_prefetch_wait_ms
+            sparse_prep_cpu_gather_ms += sparse_step_ctx.prep_cpu_gather_ms
+            sparse_prep_h2d_enqueue_ms += sparse_step_ctx.prep_h2d_enqueue_ms
+            sparse_prep_h2d_tensor_count += sparse_step_ctx.prep_h2d_tensor_count
+            sparse_prep_h2d_bytes += sparse_step_ctx.prep_h2d_bytes
+            sparse_prep_prefetch_hits += sparse_step_ctx.prep_prefetch_hit
             sparse_metrics = sparse_step_ctx
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
             analysis_logsumexp = None
             analysis_top2_logits = None
             analysis_top2_local = None
             analysis_target_logits = None
+            forward_t0 = time.perf_counter()
             model_result = model(
-                x,
+                current_x,
                 y_for_loss,
                 active_vocab=sparse_step_ctx.active_vocab,
                 logit_scale=args.sparse_logit_scale,
                 return_sparse_analysis=args.sparse_loss_topk_enable,
             )
+            sparse_forward_call_ms += (time.perf_counter() - forward_t0) * 1000.0
             if args.sparse_loss_topk_enable:
                 loss, analysis_logsumexp, analysis_top2_logits, analysis_top2_local, analysis_target_logits = model_result
             else:
@@ -1071,14 +1147,38 @@ while True:
                     topk=None,
                 )
         else:
-            loss = model(x, y)
+            forward_t0 = time.perf_counter()
+            loss = model(current_x, current_y)
+            sparse_forward_call_ms += (time.perf_counter() - forward_t0) * 1000.0
         micro_loss = loss.detach()
         train_loss_accum = micro_loss if train_loss_accum is None else (train_loss_accum + micro_loss)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        backward_t0 = time.perf_counter()
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        sparse_backward_call_ms += (time.perf_counter() - backward_t0) * 1000.0
+        if not final_train_step:
+            fetch_t0 = time.perf_counter()
+            if args.sparse_mode:
+                loader_fetch_t0 = time.perf_counter()
+                next_x, next_y, next_sparse_batch_meta, next_dataloader_state_dict = next(train_loader)
+                sparse_loader_fetch_ms += (time.perf_counter() - loader_fetch_t0) * 1000.0
+                plan_t0 = time.perf_counter()
+                next_sparse_batch_meta = plan_sparse_batch_meta(next_sparse_batch_meta)
+                sparse_plan_meta_ms += (time.perf_counter() - plan_t0) * 1000.0
+                h2d_t0 = time.perf_counter()
+                next_x, next_y = stage_batch_to_device(next_x, next_y)
+                sparse_batch_h2d_ms += (time.perf_counter() - h2d_t0) * 1000.0
+                prefetch_launch_t0 = time.perf_counter()
+                dynamic_vocab.prefetch_step(next_sparse_batch_meta)
+                sparse_row_prefetch_launch_ms += (time.perf_counter() - prefetch_launch_t0) * 1000.0
+            else:
+                loader_fetch_t0 = time.perf_counter()
+                next_x, next_y, next_dataloader_state_dict = next(train_loader)
+                sparse_loader_fetch_ms += (time.perf_counter() - loader_fetch_t0) * 1000.0
+            sparse_next_fetch_ms += (time.perf_counter() - fetch_t0) * 1000.0
         if args.sparse_mode and args.sparse_debug_sync_after_backward and device_type == "cuda":
             backward_sync_t0 = time.perf_counter()
             synchronize()
@@ -1092,10 +1192,14 @@ while True:
             sparse_step_ctx = None
         if not final_train_step:
             if args.sparse_mode:
-                x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # prefetch the next sparse batch while GPU is busy with backward
-                sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
+                x = next_x
+                y = next_y
+                sparse_batch_meta = next_sparse_batch_meta
+                dataloader_state_dict = next_dataloader_state_dict
             else:
-                x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+                x = next_x
+                y = next_y
+                dataloader_state_dict = next_dataloader_state_dict
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -1270,6 +1374,10 @@ while True:
             sparse_str += (
                 f" | step_ms prep: {sparse_prepare_ms:.2f}"
                 f" fwdbwd: {sparse_fwdbwd_ms:.2f}"
+                f" (clone: {sparse_input_clone_ms:.2f}"
+                f" fwd: {sparse_forward_call_ms:.2f}"
+                f" bwd: {sparse_backward_call_ms:.2f}"
+                f" fetch: {sparse_next_fetch_ms:.2f})"
                 f" bw_sync: {sparse_backward_sync_ms:.2f}"
                 f" accum: {sparse_accum_call_ms:.2f}"
                 f" apply_call: {sparse_apply_call_ms:.2f}"
@@ -1284,6 +1392,29 @@ while True:
                 f" | union_rows buffered: {sparse_metrics.grad_accum_queue_count:,}"
                 f" resident: {sparse_metrics.grad_accum_resident_count:,}"
             )
+            if sparse_prep_cpu_gather_ms > 0.0 or sparse_prep_h2d_enqueue_ms > 0.0 or sparse_prep_writeback_wait_ms > 0.0 or sparse_prep_prefetch_wait_ms > 0.0 or sparse_prep_prefetch_hits > 0:
+                sparse_str += (
+                    f" | prep_xfer_ms wait: {sparse_prep_writeback_wait_ms:.2f}"
+                    f" prefetch_wait: {sparse_prep_prefetch_wait_ms:.2f}"
+                    f" gather: {sparse_prep_cpu_gather_ms:.2f}"
+                    f" h2d: {sparse_prep_h2d_enqueue_ms:.2f}"
+                    f" | prefetch_hit: {sparse_prep_prefetch_hits:,}"
+                    f" | h2d_tensors: {sparse_prep_h2d_tensor_count:,}"
+                    f" h2d_mb: {sparse_prep_h2d_bytes / (1024 * 1024):.2f}"
+                )
+            if sparse_next_fetch_ms > 0.0:
+                sparse_str += (
+                    f" | fetch_ms loader: {sparse_loader_fetch_ms:.2f}"
+                    f" plan: {sparse_plan_meta_ms:.2f}"
+                    f" h2d: {sparse_batch_h2d_ms:.2f}"
+                    f" prefetch_launch: {sparse_row_prefetch_launch_ms:.2f}"
+                )
+            if sparse_metrics.d2h_segment_count > 0 or sparse_metrics.d2h_bytes > 0:
+                sparse_str += (
+                    f" | d2h_segments: {sparse_metrics.d2h_segment_count:,}"
+                    f" rows: {sparse_metrics.d2h_row_count:,}"
+                    f" d2h_mb: {sparse_metrics.d2h_bytes / (1024 * 1024):.2f}"
+                )
             if sparse_window_metrics is not None:
                 sparse_str += (
                     f" | micro_ms flush: {sparse_window_metrics.grad_accum_flush_ms:.2f}"
