@@ -66,75 +66,22 @@ def parse_cmd_string(cmd_str):
 # ============================================================
 RUNS = [
     {
-        "name": "d12_65kvocab_10k",
+        "name": "d6_65kvocab_5k",
         "args": parse_cmd_string(
             '-m scripts.base_train '
             '--sparse-mode --window-pattern L --fp8 '
             '--token-cache-dir "" --token-cache-workers 8 '
             '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
+            '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
             '--num-iterations=5000 '            
-            '--run \"d6 65kvoc 2kseq 64batch 1accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 0.0001coldrow 2coldbias3\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
-            '--embedding-lr 1.2 --unembedding-lr=0.025 --matrix-lr 0.03 --scalar-lr 0.7 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '
-            '--sparse-cold-row-decay 0.0001 --sparse-cold-bias-scale 2 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 5000 '
-        ),
-    },
-    {
-        "name": "d12_65kvocab_10k",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=5000 '            
-            '--run \"d6 65kvoc 2kseq 64batch 1accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 2coldbias3\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
-            '--embedding-lr 1.2 --unembedding-lr=0.025 --matrix-lr 0.03 --scalar-lr 0.7 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '
-            '--sparse-cold-bias-scale 2 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 5000 '
-        ),
-    },
-    {
-        "name": "d12_65kvocab_10k",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=5000 '            
-            '--run \"d6 65kvoc 2kseq 64batch 1accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 0.001coldrow 2coldbias3\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
+            '--run \"d6 65kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 0.001coldrow 2coldbias3\" '
+            '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
             '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
             '--embedding-lr 1.2 --unembedding-lr=0.025 --matrix-lr 0.03 --scalar-lr 0.7 --weight-decay 0 '
             '--adam-beta1 0.7 --adam-beta2 0.95 '
             '--sparse-cold-row-decay 0.001 --sparse-cold-bias-scale 2 '            
             '--log-every 10 --eval-every 500 --core-metric-every 5000 '
-        ),
-    },
-    {
-        "name": "d12_65kvocab_10k",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=64 '
-            '--num-iterations=100000 '            
-            '--run \"d6 65kvoc 2kseq 64batch 1accum 64aspect 100kstep unembedlr0.025 0warmup 0.65warmdown 1.2embedlr 0.03matrix 0.7scalar 0wd 0.7adam1 0.95adam2 0.001coldrow 2coldbias3\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_64batch_100kstep.json '
-            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
-            '--embedding-lr 1.2 --unembedding-lr=0.025 --matrix-lr 0.03 --scalar-lr 0.7 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '
-            '--sparse-cold-row-decay 0.001 --sparse-cold-bias-scale 2 '            
-            '--log-every 10 --eval-every 500 --core-metric-every 5000 '
+            '--sparse-loss-topk-enable '
         ),
     },
     # Add more runs below:
