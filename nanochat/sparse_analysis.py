@@ -14,6 +14,14 @@ CORRECT_RECORD_COLS = 7
 INCORRECT_RECORD_COLS = 9
 
 
+def _record_key_columns(records: torch.Tensor) -> tuple[int, ...]:
+    if records.size(-1) == CORRECT_RECORD_COLS:
+        return (6,)
+    if records.size(-1) == INCORRECT_RECORD_COLS:
+        return (6, 8)
+    raise ValueError(f"Unsupported sparse record width {records.size(-1)}")
+
+
 def resolve_sparse_analysis_dir(output_dir: str | Path | None, token_cache_dir: str | Path | None) -> Path:
     if output_dir is None or str(output_dir).strip() == "":
         cache_dir = resolve_token_cache_dir(token_cache_dir)
@@ -31,10 +39,15 @@ def _topk_from_candidates(
     candidate_scores: torch.Tensor,
     candidate_records: torch.Tensor,
     *,
-    topk: int,
+    topk: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if candidate_scores.numel() == 0:
+        if topk is None:
+            return candidate_scores, candidate_records
         return _empty_records(topk, candidate_records.size(-1), device=candidate_records.device)
+    if topk is None:
+        top_scores, top_idx = torch.sort(candidate_scores, descending=True)
+        return top_scores, candidate_records.index_select(0, top_idx)
     keep = min(int(topk), int(candidate_scores.numel()))
     top_scores, top_idx = torch.topk(candidate_scores, k=keep, largest=True, sorted=True)
     top_records = candidate_records.index_select(0, top_idx)
@@ -44,20 +57,60 @@ def _topk_from_candidates(
     return torch.cat((top_scores, pad_scores), dim=0), torch.cat((top_records, pad_records), dim=0)
 
 
+def aggregate_sparse_loss_candidates(
+    candidate_scores: torch.Tensor,
+    candidate_records: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if candidate_scores.numel() == 0:
+        return candidate_scores, candidate_records
+    key_columns = _record_key_columns(candidate_records)
+    key_tensor = candidate_records[:, key_columns]
+    if key_tensor.ndim == 1:
+        key_tensor = key_tensor.unsqueeze(1)
+    unique_keys, inverse = torch.unique(key_tensor, dim=0, sorted=False, return_inverse=True)
+    aggregated_scores = torch.zeros(unique_keys.size(0), dtype=torch.float32, device=candidate_scores.device)
+    aggregated_scores.index_add_(0, inverse, candidate_scores.to(dtype=torch.float32))
+    positions = torch.arange(candidate_scores.numel(), device=candidate_scores.device, dtype=torch.long)
+    representative_positions = torch.full((unique_keys.size(0),), candidate_scores.numel(), dtype=torch.long, device=candidate_scores.device)
+    representative_positions.scatter_reduce_(0, inverse, positions, reduce="amin", include_self=True)
+    aggregated_records = candidate_records.index_select(0, representative_positions)
+    return aggregated_scores, aggregated_records
+
+
+def select_topk_records(
+    candidate_scores: torch.Tensor,
+    candidate_records: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_mask = torch.isfinite(candidate_scores)
+    if valid_mask.any():
+        candidate_scores = candidate_scores[valid_mask]
+        candidate_records = candidate_records[valid_mask]
+    else:
+        return _empty_records(topk, candidate_records.size(-1), device=candidate_records.device)
+    aggregated_scores, aggregated_records = aggregate_sparse_loss_candidates(candidate_scores, candidate_records)
+    return _topk_from_candidates(aggregated_scores, aggregated_records, topk=topk)
+
+
 def merge_topk_records(
     current_scores: Optional[torch.Tensor],
     current_records: Optional[torch.Tensor],
     new_scores: torch.Tensor,
     new_records: torch.Tensor,
     *,
-    topk: int,
+    topk: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if current_scores is None or current_records is None:
-        return _topk_from_candidates(new_scores, new_records, topk=topk)
+        aggregated_scores, aggregated_records = aggregate_sparse_loss_candidates(new_scores, new_records)
+        return _topk_from_candidates(aggregated_scores, aggregated_records, topk=topk)
     candidate_scores = torch.cat((current_scores, new_scores), dim=0)
     candidate_records = torch.cat((current_records, new_records), dim=0)
     valid_mask = torch.isfinite(candidate_scores)
-    return _topk_from_candidates(candidate_scores[valid_mask], candidate_records[valid_mask], topk=topk)
+    candidate_scores = candidate_scores[valid_mask]
+    candidate_records = candidate_records[valid_mask]
+    aggregated_scores, aggregated_records = aggregate_sparse_loss_candidates(candidate_scores, candidate_records)
+    return _topk_from_candidates(aggregated_scores, aggregated_records, topk=topk)
 
 
 def collect_sparse_loss_topk(
@@ -65,8 +118,8 @@ def collect_sparse_loss_topk(
     targets: torch.Tensor,
     active_global_ids_cpu: torch.Tensor,
     *,
-    topk_correct: int,
-    topk_incorrect: int,
+    topk_correct: int | None,
+    topk_incorrect: int | None,
     step: int,
     micro_step: int,
     sequence_id: int = -1,
@@ -122,6 +175,7 @@ def collect_sparse_loss_topk(
         ),
         dim=1,
     ) if underpred_mask.any() else torch.empty((0, CORRECT_RECORD_COLS), dtype=torch.long, device=device)
+    correct_candidate_scores, correct_candidate_records = aggregate_sparse_loss_candidates(correct_candidate_scores, correct_candidate_records)
     correct_scores, correct_records = _topk_from_candidates(correct_candidate_scores, correct_candidate_records, topk=topk_correct)
 
     top2_logits, top2_local = torch.topk(valid_logits, k=min(2, valid_logits.size(-1)), dim=-1)
@@ -149,6 +203,7 @@ def collect_sparse_loss_topk(
         ),
         dim=1,
     ) if valid_wrong_mask.any() else torch.empty((0, INCORRECT_RECORD_COLS), dtype=torch.long, device=device)
+    incorrect_candidate_scores, incorrect_candidate_records = aggregate_sparse_loss_candidates(incorrect_candidate_scores, incorrect_candidate_records)
     incorrect_scores, incorrect_records = _topk_from_candidates(incorrect_candidate_scores, incorrect_candidate_records, topk=topk_incorrect)
 
     return {

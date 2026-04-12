@@ -9,7 +9,10 @@ from nanochat.sparse_analysis import (
     SparseLossAnalysisWriter,
     collect_sparse_loss_topk,
     resolve_sparse_analysis_dir,
+    merge_topk_records,
+    select_topk_records,
 )
+from nanochat.sparse_window_accum import SparseRollingLossAccumulator
 
 
 def test_collect_sparse_loss_topk_shapes_and_global_ids():
@@ -55,6 +58,73 @@ def test_collect_sparse_loss_topk_shapes_and_global_ids():
     assert payload["incorrect_records"][0, 8].item() == 20
 
 
+def test_step_level_sparse_loss_aggregation_sums_duplicate_tokens_and_pairs():
+    logits0 = torch.tensor(
+        [[[0.2, 4.0, 0.1], [0.1, 3.0, 0.2]]],
+        dtype=torch.float32,
+    )
+    targets0 = torch.tensor([[0, 0]], dtype=torch.long)
+    logits1 = torch.tensor(
+        [[[0.3, 2.5, 0.1], [0.2, 0.1, 2.0]]],
+        dtype=torch.float32,
+    )
+    targets1 = torch.tensor([[0, 2]], dtype=torch.long)
+    active_global_ids_cpu = torch.tensor([10, 20, 30], dtype=torch.long)
+
+    payload0 = collect_sparse_loss_topk(
+        logits0,
+        targets0,
+        active_global_ids_cpu,
+        topk_correct=None,
+        topk_incorrect=None,
+        step=0,
+        micro_step=0,
+        sequence_id=1,
+    )
+    payload1 = collect_sparse_loss_topk(
+        logits1,
+        targets1,
+        active_global_ids_cpu,
+        topk_correct=None,
+        topk_incorrect=None,
+        step=0,
+        micro_step=1,
+        sequence_id=2,
+    )
+
+    merged_correct_scores, merged_correct_records = merge_topk_records(
+        payload0["correct_scores"],
+        payload0["correct_records"],
+        payload1["correct_scores"],
+        payload1["correct_records"],
+        topk=None,
+    )
+    merged_incorrect_scores, merged_incorrect_records = merge_topk_records(
+        payload0["incorrect_scores"],
+        payload0["incorrect_records"],
+        payload1["incorrect_scores"],
+        payload1["incorrect_records"],
+        topk=None,
+    )
+
+    bounded_correct_scores, bounded_correct_records = select_topk_records(
+        merged_correct_scores,
+        merged_correct_records,
+        topk=1,
+    )
+    bounded_incorrect_scores, bounded_incorrect_records = select_topk_records(
+        merged_incorrect_scores,
+        merged_incorrect_records,
+        topk=1,
+    )
+
+    assert bounded_correct_records[0, 6].item() == 10
+    assert bounded_correct_scores[0].item() > payload0["correct_scores"][0].item()
+    assert bounded_incorrect_records[0, 6].item() == 10
+    assert bounded_incorrect_records[0, 8].item() == 20
+    assert bounded_incorrect_scores[0].item() > payload0["incorrect_scores"][0].item()
+
+
 def test_sparse_loss_analysis_writer_persists_cpu_tensors(tmp_path, monkeypatch):
     output_dir = Path(tmp_path) / "analysis"
     monkeypatch.setattr(sparse_analysis_module, "resolve_token_cache_dir", lambda path: Path(path) if path is not None else output_dir)
@@ -79,3 +149,34 @@ def test_resolve_sparse_analysis_dir_defaults_beside_token_cache(tmp_path, monke
     monkeypatch.setattr(sparse_analysis_module, "resolve_token_cache_dir", lambda path: Path(tmp_path) / "token_cache")
     resolved = resolve_sparse_analysis_dir(None, tmp_path)
     assert resolved.name.endswith("_sparse_analysis")
+
+
+def test_sparse_rolling_loss_accumulator_evicts_exactly_after_window():
+    accumulator = SparseRollingLossAccumulator(window_steps=2)
+    correct_records = torch.tensor([[0, 0, 0, 0, 0, 0, 10]], dtype=torch.long)
+    incorrect_records = torch.tensor([[0, 0, 0, 0, 0, 0, 10, 0, 20]], dtype=torch.long)
+
+    accumulator.update_step(
+        0,
+        correct_scores=torch.tensor([1.0], dtype=torch.float32),
+        correct_records=correct_records,
+        incorrect_scores=torch.tensor([0.5], dtype=torch.float32),
+        incorrect_records=incorrect_records,
+    )
+    accumulator.update_step(
+        1,
+        correct_scores=torch.tensor([2.0], dtype=torch.float32),
+        correct_records=correct_records,
+        incorrect_scores=torch.tensor([1.5], dtype=torch.float32),
+        incorrect_records=incorrect_records,
+    )
+    accumulator.update_step(
+        2,
+        correct_scores=torch.tensor([4.0], dtype=torch.float32),
+        correct_records=correct_records,
+        incorrect_scores=torch.tensor([3.0], dtype=torch.float32),
+        incorrect_records=incorrect_records,
+    )
+
+    assert accumulator.correct_totals[10] == 6.0
+    assert accumulator.incorrect_pair_totals[(20, 10)] == 4.5

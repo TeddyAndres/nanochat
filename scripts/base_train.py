@@ -36,7 +36,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CLAMP_MIN, DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
-from nanochat.sparse_analysis import SparseLossAnalysisWriter, collect_sparse_loss_topk, merge_topk_records
+from nanochat.sparse_analysis import SparseLossAnalysisWriter, collect_sparse_loss_topk, merge_topk_records, select_topk_records
 from nanochat.sparse_replan import SparseFutureWindowPlanner
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -113,9 +113,12 @@ parser.add_argument("--sparse-loss-topk-enable", action="store_true", help="capt
 parser.add_argument("--sparse-loss-topk-correct", type=int, default=50, help="maximum number of under-predicted correct-token records to keep per optimizer step")
 parser.add_argument("--sparse-loss-topk-incorrect", type=int, default=50, help="maximum number of over-predicted incorrect-token records to keep per optimizer step")
 parser.add_argument("--sparse-loss-topk-output", type=str, default="", help="dataset-side directory for async sparse top-K analysis output (empty = default beside token cache)")
+parser.add_argument("--sparse-loss-window-steps", type=int, default=20, help="rolling optimizer-step window used to accumulate sparse loss totals for replanning")
 parser.add_argument("--sparse-future-replan-enable", action="store_true", help="use per-step sparse top-K tensors to build delayed future grouping overrides in memory")
 parser.add_argument("--sparse-future-replan-lookahead", type=int, default=2, help="number of optimizer steps to delay sparse future-window replanning")
 parser.add_argument("--sparse-future-replan-window-steps", type=int, default=8, help="number of future optimizer steps to replan per sparse analysis update")
+parser.add_argument("--sparse-auto-negative-per-microstep", type=int, default=4, help="maximum number of automatic corrective cold negatives to inject per replanned microstep")
+parser.add_argument("--sparse-replan-sampling-seed", type=int, default=0, help="deterministic seed offset used when sampling from rolling sparse loss lists")
 parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip global gradient norm (dense params only) to this value before optimizer step; 0 = disabled")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -534,7 +537,14 @@ if args.sparse_future_replan_enable:
         args.sparse_manifest,
         lookahead_steps=args.sparse_future_replan_lookahead,
         window_steps=args.sparse_future_replan_window_steps,
+        rolling_window_steps=args.sparse_loss_window_steps,
+        max_auto_negatives_per_microstep=args.sparse_auto_negative_per_microstep,
+        sampling_seed=args.sparse_replan_sampling_seed,
     )
+    if resuming and args.sparse_mode:
+        planner_state = optimizer_data.get("sparse_planner") if isinstance(optimizer_data, dict) else None
+        if isinstance(planner_state, dict):
+            sparse_future_window_planner.load_state_dict(planner_state)
 if args.sparse_mode:
     if hybrid_sparse:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
@@ -936,6 +946,8 @@ while True:
                 "base_optimizer": optimizer_payload,
                 "dynamic_vocab": dynamic_vocab.state_dict(),
             }
+            if sparse_future_window_planner is not None:
+                optimizer_payload["sparse_planner"] = sparse_future_window_planner.state_dict()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -983,10 +995,10 @@ while True:
     sparse_apply_call_ms = 0.0
     sparse_cold_bias = get_sparse_cold_bias_scale(step)
     sparse_cold_row_decay = get_sparse_cold_row_decay(step)
-    step_correct_scores = None
-    step_correct_records = None
-    step_incorrect_scores = None
-    step_incorrect_records = None
+    step_correct_scores_all = None
+    step_correct_records_all = None
+    step_incorrect_scores_all = None
+    step_incorrect_records_all = None
     for micro_step in range(grad_accum_steps):
         micro_t0 = time.perf_counter()
         if args.sparse_mode:
@@ -1014,25 +1026,25 @@ while True:
                         analysis_logits,
                         y_for_loss,
                         analysis_active_ids_cpu,
-                        topk_correct=args.sparse_loss_topk_correct,
-                        topk_incorrect=args.sparse_loss_topk_incorrect,
+                        topk_correct=None,
+                        topk_incorrect=None,
                         step=step,
                         micro_step=micro_step,
                         sequence_id=int(sparse_batch_meta.get("sequence_id", -1)),
                     )
-                step_correct_scores, step_correct_records = merge_topk_records(
-                    step_correct_scores,
-                    step_correct_records,
+                step_correct_scores_all, step_correct_records_all = merge_topk_records(
+                    step_correct_scores_all,
+                    step_correct_records_all,
                     analysis_payload["correct_scores"],
                     analysis_payload["correct_records"],
-                    topk=args.sparse_loss_topk_correct,
+                    topk=None,
                 )
-                step_incorrect_scores, step_incorrect_records = merge_topk_records(
-                    step_incorrect_scores,
-                    step_incorrect_records,
+                step_incorrect_scores_all, step_incorrect_records_all = merge_topk_records(
+                    step_incorrect_scores_all,
+                    step_incorrect_records_all,
                     analysis_payload["incorrect_scores"],
                     analysis_payload["incorrect_records"],
-                    topk=args.sparse_loss_topk_incorrect,
+                    topk=None,
                 )
         else:
             loss = model(x, y)
@@ -1120,21 +1132,37 @@ while True:
             sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
-    if args.sparse_loss_topk_enable and step_correct_scores is not None and step_correct_records is not None and step_incorrect_scores is not None and step_incorrect_records is not None:
+    if args.sparse_loss_topk_enable and step_correct_scores_all is not None and step_correct_records_all is not None and step_incorrect_scores_all is not None and step_incorrect_records_all is not None:
+        step_correct_scores_cpu = step_correct_scores_all.detach().to(device="cpu")
+        step_correct_records_cpu = step_correct_records_all.detach().to(device="cpu")
+        step_incorrect_scores_cpu = step_incorrect_scores_all.detach().to(device="cpu")
+        step_incorrect_records_cpu = step_incorrect_records_all.detach().to(device="cpu")
+        bounded_correct_scores, bounded_correct_records = select_topk_records(
+            step_correct_scores_cpu,
+            step_correct_records_cpu,
+            topk=args.sparse_loss_topk_correct,
+        )
+        bounded_incorrect_scores, bounded_incorrect_records = select_topk_records(
+            step_incorrect_scores_cpu,
+            step_incorrect_records_cpu,
+            topk=args.sparse_loss_topk_incorrect,
+        )
         analysis_cpu_payload = {
             "step": step,
-            "correct_scores": step_correct_scores.detach().to(device="cpu"),
-            "correct_records": step_correct_records.detach().to(device="cpu"),
-            "incorrect_scores": step_incorrect_scores.detach().to(device="cpu"),
-            "incorrect_records": step_incorrect_records.detach().to(device="cpu"),
+            "correct_scores": bounded_correct_scores,
+            "correct_records": bounded_correct_records,
+            "incorrect_scores": bounded_incorrect_scores,
+            "incorrect_records": bounded_incorrect_records,
         }
         if sparse_loss_analysis_writer is not None:
             sparse_loss_analysis_writer.submit(step, analysis_cpu_payload)
         if sparse_future_window_planner is not None:
-            sparse_future_window_planner.update_from_topk(
+            sparse_future_window_planner.update_from_step_payload(
                 step,
-                correct_records=analysis_cpu_payload["correct_records"],
-                incorrect_records=analysis_cpu_payload["incorrect_records"],
+                correct_scores=step_correct_scores_cpu,
+                correct_records=step_correct_records_cpu,
+                incorrect_scores=step_incorrect_scores_cpu,
+                incorrect_records=step_incorrect_records_cpu,
             )
             sparse_future_window_planner.prune_consumed(step)
     model.zero_grad(set_to_none=True)
