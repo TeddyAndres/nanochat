@@ -3,7 +3,7 @@ Build a sparse-manifest JSON for hybrid fixed-U sparse training.
 
 Example:
 python -m scripts.build_sparse_manifest --num-iterations 2000 --grad-accum-steps 1 --output manifests/d6_sparse.json
-python -m scripts.build_sparse_manifest --num-iterations 2000 --grad-accum-steps 4 --output manifests/65kvocab_2kseq_16batch_4accum_2kstep.json --token-cache-dir "" --token-cache-workers 8 --device-batch-size 16
+python -m scripts.build_sparse_manifest --num-iterations 10000 --grad-accum-steps 8 --output manifests/65kvocab_2kseq_16batch_8accum_10kstep.json --token-cache-dir "" --token-cache-workers 8 --device-batch-size 16 --dual-manifest
 """
 
 import argparse
@@ -154,6 +154,7 @@ def main() -> None:
         device="cpu",
         resume_state_dict=None,
         buffer_size=args.buffer_size,
+        return_sequence_recipe=args.dual_manifest,
         vocab_size=vocab_size,
         token_cache_dir=args.token_cache_dir,
         token_cache_shard_batches=args.token_cache_shard_batches,
@@ -169,6 +170,11 @@ def main() -> None:
         raise ValueError(f"--shard-steps must be positive, got {args.shard_steps}")
 
     output_path = Path(args.output)
+    base_output_path = None
+    base_shard_dir = None
+    base_sequence_units: list[dict] = []
+    base_shard_entries: list[dict] = []
+    next_sequence_id = 0
     if args.dual_manifest:
         if args.base_output != "":
             base_output_path = Path(args.base_output)
@@ -177,12 +183,9 @@ def main() -> None:
         if base_output_path == output_path:
             raise ValueError("--base-output must differ from --output when --dual-manifest is enabled")
         base_shard_dir = base_output_path.parent / f"{base_output_path.stem}_shards"
-        base_sequence_units: list[dict] = []
-        base_shard_entries: list[dict] = []
         base_shard_index = 0
-        next_sequence_id = 0
     else:
-        base_output_path = None
+        base_shard_index = 0
     shard_dir = output_path.parent / f"{output_path.stem}_shards"
     shard_steps: list[dict] = []
     shard_entries: list[dict] = []
@@ -230,6 +233,7 @@ def main() -> None:
         if not args.dual_manifest or not base_sequence_units:
             return
         assert base_output_path is not None
+        assert base_shard_dir is not None
         start_sequence_id = int(base_sequence_units[0]["sequence_id"])
         shard_payload = build_sequence_manifest_shard_payload(
             shard_index=base_shard_index,
@@ -259,17 +263,27 @@ def main() -> None:
             inputs_cpu = cast(torch.Tensor, batch[0]).to(device="cpu")
             targets_cpu = cast(torch.Tensor, batch[1]).to(device="cpu")
             state_dict = dict(cast(dict, batch[2]))
+            sequence_recipe = None
+            if args.dual_manifest:
+                batch_with_recipe = cast(tuple[torch.Tensor, torch.Tensor, dict, dict], batch)
+                sequence_recipe = dict(batch_with_recipe[3])
             active_ids_cpu = torch.unique(torch.cat((inputs_cpu.reshape(-1), targets_cpu.reshape(-1))), sorted=True)
             active_ids_list.append(active_ids_cpu)
             sequence_id = None
             if args.dual_manifest:
+                assert sequence_recipe is not None
                 sequence_id = next_sequence_id
                 next_sequence_id += 1
                 base_sequence_units.append({
                     "sequence_id": int(sequence_id),
-                    "inputs": inputs_cpu.clone(),
-                    "targets": targets_cpu.clone(),
                     "state_dict": state_dict,
+                    "sequence_recipe": sequence_recipe,
+                    "num_unique_tokens": int(active_ids_cpu.numel()),
+                    "unique_token_ids": tensor_ids_to_list(active_ids_cpu),
+                    "sequence_geometry": {
+                        "device_batch_size": int(args.device_batch_size),
+                        "max_seq_len": int(args.max_seq_len),
+                    },
                 })
                 if len(base_sequence_units) >= args.shard_steps * grad_accum_steps:
                     flush_base_shard()

@@ -734,6 +734,48 @@ def load_cached_token_batches(cache_dir: str | Path, split: str) -> list[tuple[l
     return list(iter_cached_token_batches(cache_dir, split, ddp_rank=0, ddp_world_size=1, repeat=False))
 
 
+def load_cached_token_batch_by_state(
+    cache_dir: str | Path,
+    split: str,
+    *,
+    pq_idx: int,
+    rg_idx: int,
+    text_batch_index: int,
+) -> list[torch.Tensor]:
+    resolved_dir = resolve_token_cache_dir(cache_dir)
+    metadata = load_token_cache_metadata(resolved_dir, split)
+    if metadata is None:
+        raise FileNotFoundError(f"Token cache metadata not found for split='{split}' under {resolved_dir}")
+    file_entry = None
+    for entry in metadata.get("files", []):
+        if int(entry.get("pq_idx", -1)) == int(pq_idx):
+            file_entry = entry
+            break
+    if file_entry is None:
+        raise ValueError(f"Token cache is missing parquet index pq_idx={pq_idx} for split='{split}'")
+
+    split_dir = _cache_split_dir(resolved_dir, split)
+    parquet_payload = torch.load(split_dir / str(file_entry["path"]), map_location="cpu", weights_only=False)
+    row_group_entry = None
+    for entry in parquet_payload.get("row_groups", []):
+        if int(entry.get("rg_idx", -1)) == int(rg_idx):
+            row_group_entry = entry
+            break
+    if row_group_entry is None:
+        raise ValueError(
+            f"Token cache parquet pq_idx={pq_idx} is missing row_group rg_idx={rg_idx} for split='{split}'"
+        )
+
+    row_group_payload = torch.load(split_dir / str(row_group_entry["path"]), map_location="cpu", weights_only=False)
+    batches = row_group_payload.get("batches", [])
+    batch_idx = int(text_batch_index)
+    if batch_idx < 0 or batch_idx >= len(batches):
+        raise ValueError(
+            f"Token cache row_group pq_idx={pq_idx}, rg_idx={rg_idx} is missing batch text_batch_index={batch_idx}"
+        )
+    return _deserialize_token_lists(batches[batch_idx])
+
+
 def iter_cached_token_batches(
     cache_dir: str | Path,
     split: str,

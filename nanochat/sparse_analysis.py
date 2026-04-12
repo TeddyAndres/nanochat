@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+
+from nanochat.token_cache import resolve_token_cache_dir
+
+
+CORRECT_RECORD_COLS = 7
+INCORRECT_RECORD_COLS = 9
+
+
+def resolve_sparse_analysis_dir(output_dir: str | Path | None, token_cache_dir: str | Path | None) -> Path:
+    if output_dir is None or str(output_dir).strip() == "":
+        cache_dir = resolve_token_cache_dir(token_cache_dir)
+        return cache_dir.parent / f"{cache_dir.name}_sparse_analysis"
+    return resolve_token_cache_dir(output_dir)
+
+
+def _empty_records(topk: int, cols: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.full((topk,), -float("inf"), dtype=torch.float32, device=device)
+    records = torch.full((topk, cols), -1, dtype=torch.long, device=device)
+    return scores, records
+
+
+def _topk_from_candidates(
+    candidate_scores: torch.Tensor,
+    candidate_records: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if candidate_scores.numel() == 0:
+        return _empty_records(topk, candidate_records.size(-1), device=candidate_records.device)
+    keep = min(int(topk), int(candidate_scores.numel()))
+    top_scores, top_idx = torch.topk(candidate_scores, k=keep, largest=True, sorted=True)
+    top_records = candidate_records.index_select(0, top_idx)
+    if keep == topk:
+        return top_scores, top_records
+    pad_scores, pad_records = _empty_records(topk - keep, candidate_records.size(-1), device=candidate_records.device)
+    return torch.cat((top_scores, pad_scores), dim=0), torch.cat((top_records, pad_records), dim=0)
+
+
+def merge_topk_records(
+    current_scores: Optional[torch.Tensor],
+    current_records: Optional[torch.Tensor],
+    new_scores: torch.Tensor,
+    new_records: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if current_scores is None or current_records is None:
+        return _topk_from_candidates(new_scores, new_records, topk=topk)
+    candidate_scores = torch.cat((current_scores, new_scores), dim=0)
+    candidate_records = torch.cat((current_records, new_records), dim=0)
+    valid_mask = torch.isfinite(candidate_scores)
+    return _topk_from_candidates(candidate_scores[valid_mask], candidate_records[valid_mask], topk=topk)
+
+
+def collect_sparse_loss_topk(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    active_global_ids_cpu: torch.Tensor,
+    *,
+    topk_correct: int,
+    topk_incorrect: int,
+    step: int,
+    micro_step: int,
+    sequence_id: int = -1,
+) -> dict[str, torch.Tensor]:
+    if logits.ndim != 3 or targets.ndim != 2:
+        raise ValueError("Expected logits shape (B, T, U) and targets shape (B, T)")
+    if logits.shape[:2] != targets.shape:
+        raise ValueError("Logits and targets batch dimensions must match")
+    device = logits.device
+    active_global_ids = active_global_ids_cpu.to(device=device, dtype=torch.long)
+    losses = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        targets.view(-1),
+        ignore_index=-1,
+        reduction="none",
+    ).view_as(targets)
+    valid_mask = targets != -1
+    if not valid_mask.any():
+        correct_scores, correct_records = _empty_records(topk_correct, CORRECT_RECORD_COLS, device=device)
+        incorrect_scores, incorrect_records = _empty_records(topk_incorrect, INCORRECT_RECORD_COLS, device=device)
+        return {
+            "correct_scores": correct_scores,
+            "correct_records": correct_records,
+            "incorrect_scores": incorrect_scores,
+            "incorrect_records": incorrect_records,
+        }
+
+    flat_targets = targets.view(-1)
+    flat_losses = losses.view(-1)
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_valid = valid_mask.view(-1)
+    flat_indices = torch.nonzero(flat_valid, as_tuple=False).flatten()
+    valid_targets = flat_targets[flat_valid]
+    valid_losses = flat_losses[flat_valid]
+    valid_logits = flat_logits[flat_valid]
+
+    pred_local = valid_logits.argmax(dim=-1)
+    underpred_mask = pred_local != valid_targets
+    row_idx = flat_indices // targets.size(1)
+    pos_idx = flat_indices % targets.size(1)
+    target_global = active_global_ids.index_select(0, valid_targets.to(dtype=torch.long))
+
+    correct_candidate_scores = valid_losses[underpred_mask]
+    correct_candidate_records = torch.stack(
+        (
+            torch.full_like(row_idx[underpred_mask], int(step)),
+            torch.full_like(row_idx[underpred_mask], int(micro_step)),
+            torch.full_like(row_idx[underpred_mask], int(sequence_id)),
+            row_idx[underpred_mask].to(dtype=torch.long),
+            pos_idx[underpred_mask].to(dtype=torch.long),
+            valid_targets[underpred_mask].to(dtype=torch.long),
+            target_global[underpred_mask].to(dtype=torch.long),
+        ),
+        dim=1,
+    ) if underpred_mask.any() else torch.empty((0, CORRECT_RECORD_COLS), dtype=torch.long, device=device)
+    correct_scores, correct_records = _topk_from_candidates(correct_candidate_scores, correct_candidate_records, topk=topk_correct)
+
+    top2_logits, top2_local = torch.topk(valid_logits, k=min(2, valid_logits.size(-1)), dim=-1)
+    wrong_local = top2_local[:, 0]
+    wrong_logit = top2_logits[:, 0]
+    target_logit = valid_logits.gather(1, valid_targets.unsqueeze(1)).squeeze(1)
+    if top2_local.size(1) > 1:
+        choose_second = wrong_local == valid_targets
+        wrong_local = torch.where(choose_second, top2_local[:, 1], wrong_local)
+        wrong_logit = torch.where(choose_second, top2_logits[:, 1], wrong_logit)
+    valid_wrong_mask = wrong_local != valid_targets
+    wrong_global = active_global_ids.index_select(0, wrong_local.to(dtype=torch.long))
+    incorrect_candidate_scores = (wrong_logit - target_logit)[valid_wrong_mask]
+    incorrect_candidate_records = torch.stack(
+        (
+            torch.full_like(row_idx[valid_wrong_mask], int(step)),
+            torch.full_like(row_idx[valid_wrong_mask], int(micro_step)),
+            torch.full_like(row_idx[valid_wrong_mask], int(sequence_id)),
+            row_idx[valid_wrong_mask].to(dtype=torch.long),
+            pos_idx[valid_wrong_mask].to(dtype=torch.long),
+            valid_targets[valid_wrong_mask].to(dtype=torch.long),
+            target_global[valid_wrong_mask].to(dtype=torch.long),
+            wrong_local[valid_wrong_mask].to(dtype=torch.long),
+            wrong_global[valid_wrong_mask].to(dtype=torch.long),
+        ),
+        dim=1,
+    ) if valid_wrong_mask.any() else torch.empty((0, INCORRECT_RECORD_COLS), dtype=torch.long, device=device)
+    incorrect_scores, incorrect_records = _topk_from_candidates(incorrect_candidate_scores, incorrect_candidate_records, topk=topk_incorrect)
+
+    return {
+        "correct_scores": correct_scores,
+        "correct_records": correct_records,
+        "incorrect_scores": incorrect_scores,
+        "incorrect_records": incorrect_records,
+    }
+
+
+class SparseLossAnalysisWriter:
+    def __init__(self, output_dir: str | Path | None, token_cache_dir: str | Path | None):
+        self.output_dir = resolve_sparse_analysis_dir(output_dir, token_cache_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._pending = []
+
+    def submit(self, step: int, payload: dict[str, torch.Tensor | int]) -> None:
+        output_path = self.output_dir / f"step_{int(step):06d}.pt"
+        cpu_payload = {}
+        for key, value in payload.items():
+            if isinstance(value, torch.Tensor):
+                cpu_payload[key] = value.detach().to(device="cpu")
+            else:
+                cpu_payload[key] = value
+        self._pending.append(self._executor.submit(torch.save, cpu_payload, output_path))
+        if len(self._pending) > 8:
+            future = self._pending.pop(0)
+            future.result()
+
+    def flush(self) -> None:
+        while self._pending:
+            self._pending.pop(0).result()
+
+    def close(self) -> None:
+        self.flush()
+        self._executor.shutdown(wait=True)

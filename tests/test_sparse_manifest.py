@@ -329,15 +329,51 @@ def test_sequence_manifest_header_validation(tmp_path):
     sequence_units = [
         {
             "sequence_id": 0,
-            "inputs": torch.tensor([[1, 2]], dtype=torch.long),
-            "targets": torch.tensor([[2, 3]], dtype=torch.long),
             "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 1},
+            "sequence_recipe": {
+                "device_batch_size": 1,
+                "max_seq_len": 2,
+                "row_capacity": 3,
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "segments": [
+                            {
+                                "source_state": {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0},
+                                "doc_index_in_batch": 0,
+                                "start_offset": 0,
+                                "end_offset": 3,
+                            }
+                        ],
+                    }
+                ],
+            },
+            "num_unique_tokens": 3,
+            "unique_token_ids": [1, 2, 3],
         },
         {
             "sequence_id": 1,
-            "inputs": torch.tensor([[2, 3]], dtype=torch.long),
-            "targets": torch.tensor([[3, 4]], dtype=torch.long),
             "state_dict": {"pq_idx": 1, "rg_idx": 0, "epoch": 1},
+            "sequence_recipe": {
+                "device_batch_size": 1,
+                "max_seq_len": 2,
+                "row_capacity": 3,
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "segments": [
+                            {
+                                "source_state": {"pq_idx": 1, "rg_idx": 0, "epoch": 1, "text_batch_index": 0},
+                                "doc_index_in_batch": 0,
+                                "start_offset": 0,
+                                "end_offset": 3,
+                            }
+                        ],
+                    }
+                ],
+            },
+            "num_unique_tokens": 3,
+            "unique_token_ids": [2, 3, 4],
         },
     ]
     shard_payload = build_sequence_manifest_shard_payload(
@@ -392,15 +428,51 @@ def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
     sequence_units = [
         {
             "sequence_id": 0,
-            "inputs": torch.tensor([[1, 2]], dtype=torch.long),
-            "targets": torch.tensor([[2, 3]], dtype=torch.long),
             "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 1},
+            "sequence_recipe": {
+                "device_batch_size": 1,
+                "max_seq_len": 2,
+                "row_capacity": 3,
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "segments": [
+                            {
+                                "source_state": {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0},
+                                "doc_index_in_batch": 0,
+                                "start_offset": 0,
+                                "end_offset": 3,
+                            }
+                        ],
+                    }
+                ],
+            },
+            "num_unique_tokens": 3,
+            "unique_token_ids": [1, 2, 3],
         },
         {
             "sequence_id": 1,
-            "inputs": torch.tensor([[2, 3]], dtype=torch.long),
-            "targets": torch.tensor([[3, 4]], dtype=torch.long),
             "state_dict": {"pq_idx": 1, "rg_idx": 0, "epoch": 1},
+            "sequence_recipe": {
+                "device_batch_size": 1,
+                "max_seq_len": 2,
+                "row_capacity": 3,
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "segments": [
+                            {
+                                "source_state": {"pq_idx": 1, "rg_idx": 0, "epoch": 1, "text_batch_index": 0},
+                                "doc_index_in_batch": 0,
+                                "start_offset": 0,
+                                "end_offset": 3,
+                            }
+                        ],
+                    }
+                ],
+            },
+            "num_unique_tokens": 3,
+            "unique_token_ids": [2, 3, 4],
         },
     ]
     sequence_shard_payload = build_sequence_manifest_shard_payload(
@@ -510,6 +582,13 @@ def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
         "tokenizing_distributed_data_loader_with_state_bos_bestfit",
         fail_if_live_loader_called,
     )
+    monkeypatch.setattr(
+        dataloader_module,
+        "load_cached_token_batch_by_state",
+        lambda cache_dir, split, *, pq_idx, rg_idx, text_batch_index: [
+            torch.tensor([1, 2, 3], dtype=torch.long)
+        ] if pq_idx == 0 else [torch.tensor([2, 3, 4], dtype=torch.long)],
+    )
 
     loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         tokenizer=None,
@@ -544,6 +623,42 @@ def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
     assert torch.equal(step_meta1["targets_union_cpu_local"], torch.tensor([[2, 3]], dtype=torch.long))
     assert state1["manifest_step"] == 0
     assert state1["pq_idx"] == 1
+
+
+def test_bestfit_loader_emits_sequence_recipe(tmp_path, monkeypatch):
+    fake_batches = [
+        ([torch.tensor([99, 1, 2], dtype=torch.long)], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
+    ]
+
+    def fake_iter_tokenized_document_batches(*args, **kwargs):
+        while True:
+            for batch in fake_batches:
+                yield batch
+
+    monkeypatch.setattr(
+        dataloader_module,
+        "_iter_tokenized_document_batches",
+        fake_iter_tokenized_document_batches,
+    )
+
+    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer=None,
+        B=1,
+        T=2,
+        split="train",
+        device="cpu",
+        buffer_size=1,
+        return_sequence_recipe=True,
+    )
+
+    inputs, targets, state_dict, sequence_recipe = next(loader)
+
+    assert torch.equal(inputs, torch.tensor([[99, 1]], dtype=torch.long))
+    assert torch.equal(targets, torch.tensor([[1, 2]], dtype=torch.long))
+    assert state_dict == {"pq_idx": 0, "rg_idx": 0, "epoch": 1}
+    assert sequence_recipe["row_capacity"] == 3
+    assert len(sequence_recipe["rows"]) == 1
+    assert sequence_recipe["rows"][0]["segments"][0]["source_state"]["text_batch_index"] == 0
 
 
 def test_manifest_loader_emits_union_targets_without_local_batch_payload(tmp_path, monkeypatch):
