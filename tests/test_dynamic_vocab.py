@@ -2056,5 +2056,40 @@ def test_fixed_u_grad_accum_prepare_emits_union_inputs_for_input_tables():
 
     assert step_ctx.union_inputs is not None
     assert torch.equal(step_ctx.union_inputs.cpu(), torch.tensor([[2, 0, 1, 2]], dtype=torch.long))
+
+
+def test_fixed_u_grad_accum_prepare_exposes_exact_union_width_active_vocab():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=16)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+        grad_accum_u_max=12,
+    )
+
+    step_ctx = runtime.prepare_step(
+        build_fixed_step_meta(
+            slot_to_global=[7, 9, 4, -1, -1, -1],
+            stage_slots=[0, 1, 2],
+            stage_ids=[7, 9, 4],
+            writeback_slots=[],
+            writeback_ids=[],
+            grad_accum_ids=[7, 9, 4],
+            grad_accum_steps=2,
+            grad_accum_micro_step=0,
+            is_grad_accum_boundary=False,
+            inputs_union_cpu_local=[[2, 0, 1, 2]],
+        )
+    )
+
+    assert step_ctx.active_vocab is not None
+    assert step_ctx.active_vocab["wte"].shape[0] == 3
+    assert step_ctx.active_vocab["lm_head"].shape[0] == 3
+    assert step_ctx.active_vocab["value_embeds"]["1"].shape[0] == 3
+    assert "logit_mask" not in step_ctx.active_vocab
     assert runtime.fixed_input_slot_to_global_cpu is not None
     assert torch.equal(runtime.fixed_input_slot_to_global_cpu[:3], torch.tensor([7, 9, 4], dtype=torch.long))

@@ -2072,10 +2072,39 @@ class DynamicVocabRuntime:
             "value_embeds": self.fixed_active_vocab["value_embeds"],
             "lm_head": self.fixed_active_vocab["lm_head"],
         }
-        if use_logit_mask:
-            step_active_vocab["logit_mask"] = self.fixed_logit_mask
-        if use_cold_logit_bias:
-            step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias
+        if grad_accum_steps > 1:
+            union_count = int(grad_accum_ids_cpu.numel())
+            wte_view = self.fixed_params["wte"][:union_count]
+            lm_head_view = self.fixed_params["lm_head"][:union_count]
+            if not self.use_cuda:
+                wte_view.retain_grad()
+                lm_head_view.retain_grad()
+                if self.fixed_params["wte"].grad is not None:
+                    wte_view.grad = self.fixed_params["wte"].grad[:union_count]
+                if self.fixed_params["lm_head"].grad is not None:
+                    lm_head_view.grad = self.fixed_params["lm_head"].grad[:union_count]
+            value_embed_views = {}
+            for layer_name in self.fixed_active_vocab["value_embeds"]:
+                value_view = self.fixed_params[f"value_embeds.{layer_name}"][:union_count]
+                if not self.use_cuda:
+                    value_view.retain_grad()
+                    base_grad = self.fixed_params[f"value_embeds.{layer_name}"].grad
+                    if base_grad is not None:
+                        value_view.grad = base_grad[:union_count]
+                value_embed_views[layer_name] = value_view
+            step_active_vocab["wte"] = wte_view
+            step_active_vocab["value_embeds"] = value_embed_views
+            step_active_vocab["lm_head"] = lm_head_view
+            step_active_vocab.pop("logit_mask", None)
+            if use_cold_logit_bias:
+                step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias[:union_count]
+            else:
+                step_active_vocab.pop("cold_logit_bias", None)
+        else:
+            if use_logit_mask:
+                step_active_vocab["logit_mask"] = self.fixed_logit_mask
+            if use_cold_logit_bias:
+                step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias
         step_optimizer_state = {
             **self.fixed_optimizer_state,
         }
@@ -2284,6 +2313,31 @@ class DynamicVocabRuntime:
             exp_avg.index_copy_(0, slot_ids, exp_avg_rows)
             exp_avg_sq.index_copy_(0, slot_ids, exp_avg_sq_rows)
 
+    def _materialize_manual_grad_accum_view_grads_(self, step_ctx: DynamicVocabStep) -> None:
+        if self.use_cuda:
+            return
+        if step_ctx.active_vocab is None or step_ctx.grad_accum_ids_cpu is None:
+            return
+        union_count = int(step_ctx.grad_accum_ids_cpu.numel())
+        if union_count <= 0:
+            return
+
+        def copy_view_grad(param_name: str, exposed_tensor: torch.Tensor) -> None:
+            grad = getattr(exposed_tensor, "grad", None)
+            if grad is None:
+                return
+            target_param = self.fixed_params[param_name]
+            if target_param.grad is not None:
+                return
+            target_grad = torch.zeros_like(target_param)
+            target_grad[:union_count].copy_(grad.to(dtype=target_grad.dtype))
+            target_param.grad = target_grad
+
+        copy_view_grad("wte", step_ctx.active_vocab["wte"])
+        copy_view_grad("lm_head", step_ctx.active_vocab["lm_head"])
+        for layer_name, exposed_tensor in step_ctx.active_vocab["value_embeds"].items():
+            copy_view_grad(f"value_embeds.{layer_name}", exposed_tensor)
+
     @torch.no_grad()
     def accumulate_gradients(self, step_ctx: DynamicVocabStep) -> DynamicVocabStep:
         t_start = time.perf_counter()
@@ -2292,6 +2346,7 @@ class DynamicVocabRuntime:
         assert step_ctx.active_ids_cpu is not None
         if step_ctx.grad_accum_ids_cpu is None:
             raise ValueError("Sparse grad accumulation requires grad_accum_ids_cpu metadata")
+        self._materialize_manual_grad_accum_view_grads_(step_ctx)
 
         start_ms = 0.0
         if (not self._grad_accum_live) or self._grad_accum_ids_cpu is None or not torch.equal(self._grad_accum_ids_cpu, step_ctx.grad_accum_ids_cpu):
