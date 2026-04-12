@@ -220,6 +220,7 @@ class DynamicVocabRuntime:
         self._grad_accum_stage_count = 0
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
+        self._grad_accum_hot_activation_counts_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
         self._grad_accum_pending_transfers = []
@@ -888,6 +889,14 @@ class DynamicVocabRuntime:
         elif ids_cpu.numel() > 0:
             self._pending_cpu_writeback_mask_cpu[ids_cpu] = True
 
+    def _has_active_pending_cpu_writeback(self) -> bool:
+        futures = self._pending_cpu_writeback_futures
+        if futures is None and self._pending_cpu_writeback_future is not None:
+            futures = [self._pending_cpu_writeback_future]
+        if not futures:
+            return False
+        return not all(future.done() for future in futures)
+
     def _zero_fixed_grad_slots_(self, slot_ids_cpu: Optional[torch.Tensor], table_names: Optional[tuple[str, ...]] = None) -> None:
         if not self.fixed_u_mode or slot_ids_cpu is None:
             return
@@ -927,6 +936,7 @@ class DynamicVocabRuntime:
         self._grad_accum_live = False
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
+        self._grad_accum_hot_activation_counts_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
 
@@ -1038,6 +1048,10 @@ class DynamicVocabRuntime:
         self._grad_accum_stage_count = 0
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = torch.zeros(grad_accum_count, dtype=torch.bool)
+        self._grad_accum_hot_activation_counts_cpu = (
+            self.hot_activation_count_cpu.index_select(0, grad_accum_ids_cpu)
+            if grad_accum_count > 0 else torch.empty(0, dtype=torch.long)
+        )
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
 
@@ -1140,9 +1154,24 @@ class DynamicVocabRuntime:
         rows = active_param.detach().index_select(0, slot_ids_device)
         exp_avg = active_state["exp_avg"].detach().index_select(0, slot_ids_device)
         exp_avg_sq = active_state["exp_avg_sq"].detach().index_select(0, slot_ids_device)
-        row_buffer = self._get_cpu_receive_buffer("rows:lm_head:cloud", tuple(rows.shape), rows.dtype)
-        exp_avg_buffer = self._get_cpu_receive_buffer("exp_avg:lm_head:cloud", tuple(exp_avg.shape), exp_avg.dtype)
-        exp_avg_sq_buffer = self._get_cpu_receive_buffer("exp_avg_sq:lm_head:cloud", tuple(exp_avg_sq.shape), exp_avg_sq.dtype)
+        row_buffer = self._get_cpu_receive_buffer(
+            "rows:lm_head:cloud",
+            tuple(rows.shape),
+            rows.dtype,
+            block_reuse_while_pending=True,
+        )
+        exp_avg_buffer = self._get_cpu_receive_buffer(
+            "exp_avg:lm_head:cloud",
+            tuple(exp_avg.shape),
+            exp_avg.dtype,
+            block_reuse_while_pending=True,
+        )
+        exp_avg_sq_buffer = self._get_cpu_receive_buffer(
+            "exp_avg_sq:lm_head:cloud",
+            tuple(exp_avg_sq.shape),
+            exp_avg_sq.dtype,
+            block_reuse_while_pending=True,
+        )
         row_buffer.copy_(rows, non_blocking=self.use_cuda)
         exp_avg_buffer.copy_(exp_avg, non_blocking=self.use_cuda)
         exp_avg_sq_buffer.copy_(exp_avg_sq, non_blocking=self.use_cuda)
@@ -1171,9 +1200,24 @@ class DynamicVocabRuntime:
             rows = active_param.detach().index_select(0, slot_ids_device)
             exp_avg = active_state["exp_avg"].detach().index_select(0, slot_ids_device)
             exp_avg_sq = active_state["exp_avg_sq"].detach().index_select(0, slot_ids_device)
-            row_buffer = self._get_cpu_receive_buffer(f"rows:{name}:fixed", tuple(rows.shape), rows.dtype)
-            exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:{name}:fixed", tuple(exp_avg.shape), exp_avg.dtype)
-            exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:{name}:fixed", tuple(exp_avg_sq.shape), exp_avg_sq.dtype)
+            row_buffer = self._get_cpu_receive_buffer(
+                f"rows:{name}:fixed",
+                tuple(rows.shape),
+                rows.dtype,
+                block_reuse_while_pending=True,
+            )
+            exp_avg_buffer = self._get_cpu_receive_buffer(
+                f"exp_avg:{name}:fixed",
+                tuple(exp_avg.shape),
+                exp_avg.dtype,
+                block_reuse_while_pending=True,
+            )
+            exp_avg_sq_buffer = self._get_cpu_receive_buffer(
+                f"exp_avg_sq:{name}:fixed",
+                tuple(exp_avg_sq.shape),
+                exp_avg_sq.dtype,
+                block_reuse_while_pending=True,
+            )
             row_buffer.copy_(rows, non_blocking=True)
             exp_avg_buffer.copy_(exp_avg, non_blocking=True)
             exp_avg_sq_buffer.copy_(exp_avg_sq, non_blocking=True)
@@ -1504,11 +1548,18 @@ class DynamicVocabRuntime:
         if restore_rows is not None:
             lm_head_param.index_copy_(0, exempt_global_ids_cpu, restore_rows)
 
-    def _get_cpu_receive_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype):
+    def _get_cpu_receive_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        block_reuse_while_pending: bool = False,
+    ):
         buffer = self._cpu_receive_buffers.get(name)
         is_inference_buffer = bool(buffer is not None and getattr(buffer, "is_inference", lambda: False)())
         needs_new = (
             buffer is None or
+            (block_reuse_while_pending and self._has_active_pending_cpu_writeback()) or
             is_inference_buffer or
             buffer.dtype != dtype or
             buffer.dim() != len(shape) or
@@ -2264,6 +2315,7 @@ class DynamicVocabRuntime:
 
         grad_accum_ids_cpu = self._grad_accum_ids_cpu
         grad_accum_count = self._grad_accum_count
+        grad_accum_hot_activation_counts_cpu = self._grad_accum_hot_activation_counts_cpu
         live_count = int(grad_accum_ids_cpu.numel())
         live_slot_ids_cpu = torch.empty(0, dtype=torch.long)
         live_global_ids_cpu = torch.empty(0, dtype=torch.long)
@@ -2359,12 +2411,16 @@ class DynamicVocabRuntime:
                 live_step_values_cpu = self._get_token_event_step_values_cpu(
                     live_lm_head_global_ids_cpu if name == "lm_head" else live_global_ids_cpu
                 )
+                live_hot_counts_cpu = None
+                if name == "lm_head" and grad_accum_hot_activation_counts_cpu is not None and live_lm_head_union_row_ids_cpu.numel() > 0:
+                    live_hot_counts_cpu = grad_accum_hot_activation_counts_cpu.index_select(0, live_lm_head_union_row_ids_cpu)
                 self._adamw_update_with_step_(
                     name,
                     self.fixed_params[name],
                     self.fixed_optimizer_state[name],
                     live_step_values_cpu,
                     slot_ids_cpu=live_slot_ids_for_name_cpu,
+                    hot_activation_counts_cpu=live_hot_counts_cpu,
                 )
             if has_cached_non_live_grad:
                 for chunk in self._grad_accum_non_live_chunks:
@@ -2373,6 +2429,9 @@ class DynamicVocabRuntime:
                     chunk_param = chunk["tables"][name]["param"]
                     chunk_param.grad = self._grad_accum_buffers[name].index_select(0, chunk["union_row_ids_device"])
                     chunk_step_values_cpu = self._get_token_event_step_values_cpu(chunk["global_ids_cpu"])
+                    chunk_hot_counts_cpu = None
+                    if name == "lm_head" and grad_accum_hot_activation_counts_cpu is not None:
+                        chunk_hot_counts_cpu = grad_accum_hot_activation_counts_cpu.index_select(0, chunk["union_row_ids_cpu"])
                     self._adamw_update_with_step_(
                         name,
                         chunk_param,
@@ -2381,15 +2440,20 @@ class DynamicVocabRuntime:
                             "exp_avg_sq": chunk["tables"][name]["exp_avg_sq"],
                         },
                         chunk_step_values_cpu,
+                        hot_activation_counts_cpu=chunk_hot_counts_cpu,
                     )
             if has_staged_non_live_grad:
                 non_live_params[name].grad = self._grad_accum_buffers[name].index_select(0, staged_non_live_union_row_ids_device)
                 staged_step_values_cpu = self._get_token_event_step_values_cpu(staged_non_live_grad_accum_ids_cpu)
+                staged_hot_counts_cpu = None
+                if name == "lm_head" and grad_accum_hot_activation_counts_cpu is not None:
+                    staged_hot_counts_cpu = grad_accum_hot_activation_counts_cpu.index_select(0, staged_non_live_union_row_ids_cpu)
                 self._adamw_update_with_step_(
                     name,
                     non_live_params[name],
                     non_live_optimizer_state[name],
                     staged_step_values_cpu,
+                    hot_activation_counts_cpu=staged_hot_counts_cpu,
                 )
         apply_ms = (time.perf_counter() - t_apply_start) * 1000.0
         self._increment_token_event_step_counts_(grad_accum_ids_cpu)
@@ -2490,9 +2554,24 @@ class DynamicVocabRuntime:
                 row_source = batch["rows"][0] if len(batch["rows"]) == 1 else torch.cat(batch["rows"], dim=0)
                 exp_avg_source = batch["exp_avg"][0] if len(batch["exp_avg"]) == 1 else torch.cat(batch["exp_avg"], dim=0)
                 exp_avg_sq_source = batch["exp_avg_sq"][0] if len(batch["exp_avg_sq"]) == 1 else torch.cat(batch["exp_avg_sq"], dim=0)
-                row_buffer = self._get_cpu_receive_buffer(f"rows:accum:{name}:merged", tuple(row_source.shape), row_source.dtype)
-                exp_avg_buffer = self._get_cpu_receive_buffer(f"exp_avg:accum:{name}:merged", tuple(exp_avg_source.shape), exp_avg_source.dtype)
-                exp_avg_sq_buffer = self._get_cpu_receive_buffer(f"exp_avg_sq:accum:{name}:merged", tuple(exp_avg_sq_source.shape), exp_avg_sq_source.dtype)
+                row_buffer = self._get_cpu_receive_buffer(
+                    f"rows:accum:{name}:merged",
+                    tuple(row_source.shape),
+                    row_source.dtype,
+                    block_reuse_while_pending=True,
+                )
+                exp_avg_buffer = self._get_cpu_receive_buffer(
+                    f"exp_avg:accum:{name}:merged",
+                    tuple(exp_avg_source.shape),
+                    exp_avg_source.dtype,
+                    block_reuse_while_pending=True,
+                )
+                exp_avg_sq_buffer = self._get_cpu_receive_buffer(
+                    f"exp_avg_sq:accum:{name}:merged",
+                    tuple(exp_avg_sq_source.shape),
+                    exp_avg_sq_source.dtype,
+                    block_reuse_while_pending=True,
+                )
                 row_buffer.copy_(row_source, non_blocking=self.use_cuda)
                 exp_avg_buffer.copy_(exp_avg_source, non_blocking=self.use_cuda)
                 exp_avg_sq_buffer.copy_(exp_avg_sq_source, non_blocking=self.use_cuda)

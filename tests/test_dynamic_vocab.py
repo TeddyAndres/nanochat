@@ -394,6 +394,39 @@ def test_flush_pending_cpu_writeback_waits_for_overlapping_ids():
     assert runtime._pending_cpu_writeback_mask_cpu is None
 
 
+def test_cpu_receive_buffer_allocates_fresh_storage_while_writeback_is_pending():
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+
+    first_buffer = runtime._get_cpu_receive_buffer("rows:wte:fixed", (2, model.config.n_embd), torch.float32)
+
+    class FakeFuture:
+        def done(self):
+            return False
+
+        def result(self):
+            return None
+
+    runtime._pending_cpu_writeback_future = FakeFuture()
+    runtime._pending_cpu_writeback_mask_cpu = torch.zeros(model.config.vocab_size, dtype=torch.bool)
+
+    second_buffer = runtime._get_cpu_receive_buffer(
+        "rows:wte:fixed",
+        (2, model.config.n_embd),
+        torch.float32,
+        block_reuse_while_pending=True,
+    )
+
+    assert second_buffer.data_ptr() != first_buffer.data_ptr()
+
+
 def test_fixed_u_masked_logits_hide_inactive_slots():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)
@@ -1742,6 +1775,97 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
     assert metrics.live_count == 4
     assert metrics.unique_count == 4
     assert metrics.u_capacity == 4
+
+
+def test_fixed_u_grad_accum_lm_head_first_hot_lr_matches_single_union_step():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=10)
+    reference_model = build_tiny_model(vocab_size=10)
+    reference_model.load_state_dict(model.state_dict())
+
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        first_hot_unembedding_lr=0.003,
+        fixed_u_max=2,
+        grad_accum_u_max=4,
+    )
+    reference_runtime = DynamicVocabRuntime(
+        reference_model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        first_hot_unembedding_lr=0.003,
+    )
+
+    union_ids = [1, 3, 7, 9]
+    union_slot_by_token = {token_id: slot_id for slot_id, token_id in enumerate(union_ids)}
+
+    step0_ctx = runtime.prepare_step(
+        build_fixed_step_meta(
+            slot_to_global=[1, 3],
+            stage_slots=[0, 1],
+            stage_ids=[1, 3],
+            writeback_slots=[0],
+            writeback_ids=[1],
+            is_last_step=False,
+            grad_accum_ids=union_ids,
+            grad_accum_steps=2,
+            grad_accum_micro_step=0,
+            is_grad_accum_boundary=False,
+        )
+    )
+    step0_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step0_ctx.active_vocab["lm_head"])
+    step0_ctx.active_vocab["lm_head"].grad[union_slot_by_token[1]] += 10
+    step0_ctx.active_vocab["lm_head"].grad[union_slot_by_token[3]] += 20
+    runtime.accumulate_gradients(step0_ctx)
+
+    step1_ctx = runtime.prepare_step(
+        build_fixed_step_meta(
+            slot_to_global=[7, 9],
+            stage_slots=[],
+            stage_ids=[],
+            writeback_slots=[],
+            writeback_ids=[],
+            is_last_step=True,
+            grad_accum_ids=union_ids,
+            grad_accum_steps=2,
+            grad_accum_micro_step=1,
+            is_grad_accum_boundary=True,
+        )
+    )
+    if step1_ctx.active_vocab["lm_head"].grad is None:
+        step1_ctx.active_vocab["lm_head"].grad = torch.zeros_like(step1_ctx.active_vocab["lm_head"])
+    step1_ctx.active_vocab["lm_head"].grad[union_slot_by_token[7]] += 30
+    step1_ctx.active_vocab["lm_head"].grad[union_slot_by_token[9]] += 40
+    runtime.accumulate_gradients(step1_ctx)
+    runtime.apply_accumulated_gradients()
+
+    reference_ctx = reference_runtime.prepare_step(torch.tensor(union_ids, dtype=torch.long))
+    reference_ctx.active_vocab["lm_head"].grad = torch.stack([
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][0]) * 10,
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][1]) * 20,
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][2]) * 30,
+        torch.ones_like(reference_ctx.active_vocab["lm_head"][3]) * 40,
+    ])
+    reference_runtime.step(reference_ctx)
+
+    union_ids_tensor = torch.tensor(union_ids, dtype=torch.long)
+    runtime_param = runtime.table_specs["lm_head"]["param"]
+    reference_param = reference_runtime.table_specs["lm_head"]["param"]
+    assert torch.allclose(runtime_param[union_ids_tensor], reference_param[union_ids_tensor])
+    assert torch.allclose(
+        runtime.state[runtime_param]["exp_avg"][union_ids_tensor],
+        reference_runtime.state[reference_param]["exp_avg"][union_ids_tensor],
+    )
+    assert torch.allclose(
+        runtime.state[runtime_param]["exp_avg_sq"][union_ids_tensor],
+        reference_runtime.state[reference_param]["exp_avg_sq"][union_ids_tensor],
+    )
 
 
 def test_fixed_u_sparse_grad_accumulation_preserves_reentrant_rows():
