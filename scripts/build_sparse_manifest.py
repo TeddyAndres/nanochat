@@ -240,7 +240,7 @@ def main() -> None:
             start_sequence_id=start_sequence_id,
             sequence_units=base_sequence_units,
         )
-        shard_filename = f"{base_output_path.stem}.shard{base_shard_index:05d}.pt"
+        shard_filename = f"{base_output_path.stem}.shard{base_shard_index:05d}.sqlite"
         shard_path = base_shard_dir / shard_filename
         save_sequence_manifest_shard(shard_path, shard_payload)
         base_shard_entries.append({

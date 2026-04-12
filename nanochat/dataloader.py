@@ -27,9 +27,9 @@ from nanochat.sparse_manifest import (
     DUAL_SPARSE_MANIFEST_VERSION,
     SPARSE_GROUPING_MANIFEST_KIND,
     SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
+    SequenceManifestShardAccessor,
     compute_next_transition,
     get_sparse_manifest_kind,
-    load_sequence_manifest_shard,
     load_sparse_manifest_header,
     resolve_grouping_base_manifest_path,
     stream_sparse_manifest_steps,
@@ -381,22 +381,20 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                 raise ValueError("Sequence manifest shard entries must define start_sequence_id and num_sequence_units")
             shard_ranges.append((start_sequence_id, start_sequence_id + shard_num_units, shard_entry))
         loaded_sequence_shard_path = None
-        loaded_sequence_units = None
+        loaded_sequence_shard_accessor = None
 
         def resolve_sequence_unit(sequence_id: int) -> dict:
-            nonlocal loaded_sequence_shard_path, loaded_sequence_units
+            nonlocal loaded_sequence_shard_path, loaded_sequence_shard_accessor
             for start_sequence_id, end_sequence_id, shard_entry in shard_ranges:
                 if start_sequence_id <= sequence_id < end_sequence_id:
                     shard_path = base_manifest_path.parent / str(shard_entry["path"])
                     if loaded_sequence_shard_path != shard_path:
-                        shard_payload = load_sequence_manifest_shard(shard_path)
-                        units = shard_payload.get("sequence_units")
-                        if not isinstance(units, list):
-                            raise ValueError("Sequence manifest shard must define a sequence_units list")
+                        if loaded_sequence_shard_accessor is not None:
+                            loaded_sequence_shard_accessor.close()
+                        loaded_sequence_shard_accessor = SequenceManifestShardAccessor(shard_path)
                         loaded_sequence_shard_path = shard_path
-                        loaded_sequence_units = {int(unit["sequence_id"]): unit for unit in units}
-                    assert loaded_sequence_units is not None
-                    sequence_unit = loaded_sequence_units.get(sequence_id)
+                    assert loaded_sequence_shard_accessor is not None
+                    sequence_unit = loaded_sequence_shard_accessor.get_sequence_unit(sequence_id)
                     if sequence_unit is None:
                         raise ValueError(f"Sequence manifest shard is missing sequence_id={sequence_id}")
                     return sequence_unit

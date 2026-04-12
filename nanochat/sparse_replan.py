@@ -10,6 +10,7 @@ import torch
 from nanochat.sparse_analysis import CORRECT_RECORD_COLS, INCORRECT_RECORD_COLS
 from nanochat.sparse_window_accum import SparseRollingLossAccumulator
 from nanochat.sparse_manifest import (
+    SequenceManifestShardAccessor,
     load_sequence_manifest_shard,
     load_sparse_manifest_header,
     resolve_grouping_base_manifest_path,
@@ -43,16 +44,19 @@ def load_sequence_unit_views(base_manifest_path: str | Path) -> dict[int, Sequen
     sequence_units: dict[int, SequenceUnitView] = {}
     for shard_entry in shards:
         shard_path = base_manifest_path.parent / str(shard_entry["path"])
-        shard_payload = load_sequence_manifest_shard(shard_path)
-        for unit in shard_payload.get("sequence_units", []):
-            sequence_id = int(unit["sequence_id"])
-            unique_token_ids = tuple(int(token_id) for token_id in unit.get("unique_token_ids", []))
-            if len(unique_token_ids) == 0:
-                raise ValueError(f"Sequence unit {sequence_id} must define non-empty unique_token_ids")
-            sequence_units[sequence_id] = SequenceUnitView(
-                sequence_id=sequence_id,
-                unique_token_ids=unique_token_ids,
-            )
+        accessor = SequenceManifestShardAccessor(shard_path)
+        try:
+            for unit in accessor.iter_sequence_units():
+                sequence_id = int(unit["sequence_id"])
+                unique_token_ids = tuple(int(token_id) for token_id in unit.get("unique_token_ids", []))
+                if len(unique_token_ids) == 0:
+                    raise ValueError(f"Sequence unit {sequence_id} must define non-empty unique_token_ids")
+                sequence_units[sequence_id] = SequenceUnitView(
+                    sequence_id=sequence_id,
+                    unique_token_ids=unique_token_ids,
+                )
+        finally:
+            accessor.close()
     return sequence_units
 
 

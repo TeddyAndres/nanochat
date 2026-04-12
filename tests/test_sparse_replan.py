@@ -15,7 +15,7 @@ from nanochat.sparse_manifest import (
 
 
 def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
-    base_shard_path = tmp_path / "sequence_base_shard_000.pt"
+    base_shard_path = tmp_path / "sequence_base_shard_000.sqlite"
     base_manifest_path = tmp_path / "sequence_base.json"
     grouping_shard_path = tmp_path / "grouping_shard_000.json"
     grouping_manifest_path = tmp_path / "grouping_manifest.json"
@@ -187,7 +187,7 @@ def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
 
 
 def test_sparse_future_window_planner_auto_injects_cold_negative_for_baseline_sequence(tmp_path):
-    base_shard_path = tmp_path / "sequence_base_shard_000.pt"
+    base_shard_path = tmp_path / "sequence_base_shard_000.sqlite"
     base_manifest_path = tmp_path / "sequence_base.json"
     grouping_shard_path = tmp_path / "grouping_shard_000.json"
     grouping_manifest_path = tmp_path / "grouping_manifest.json"

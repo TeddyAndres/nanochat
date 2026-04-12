@@ -381,7 +381,7 @@ def test_sequence_manifest_header_validation(tmp_path):
         start_sequence_id=0,
         sequence_units=sequence_units,
     )
-    shard_path = tmp_path / "sequence_shards" / "sequence.shard00000.pt"
+    shard_path = tmp_path / "sequence_shards" / "sequence.shard00000.sqlite"
     save_sequence_manifest_shard(shard_path, shard_payload)
 
     manifest_path = tmp_path / "sequence_manifest.json"
@@ -480,7 +480,7 @@ def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
         start_sequence_id=0,
         sequence_units=sequence_units,
     )
-    sequence_shard_path = tmp_path / "sequence_manifest_shards" / "sequence_manifest.shard00000.pt"
+    sequence_shard_path = tmp_path / "sequence_manifest_shards" / "sequence_manifest.shard00000.sqlite"
     save_sequence_manifest_shard(sequence_shard_path, sequence_shard_payload)
     base_manifest_path = tmp_path / "sequence_manifest.json"
     save_sparse_manifest(

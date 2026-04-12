@@ -241,6 +241,7 @@ resuming = args.resume_from_step != -1
 sparse_manifest = None
 sparse_base_manifest = None
 sparse_base_manifest_path = ""
+sparse_resolved_grad_accum_u_max = None
 hybrid_sparse = args.sparse_mode and args.sparse_manifest != ""
 sparse_lm_head_clouds = args.sparse_cloud_max_u > 0
 if hybrid_sparse:
@@ -459,7 +460,8 @@ if args.sparse_mode:
     if hybrid_sparse:
         assert sparse_manifest is not None
         sparse_fixed_u_max = int(sparse_manifest["u_max"])
-        sparse_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
+        sparse_resolved_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
+        sparse_grad_accum_u_max = sparse_resolved_grad_accum_u_max
         sparse_lm_head_u_max = sparse_fixed_u_max if not sparse_lm_head_clouds else int(args.sparse_cloud_max_u)
         sparse_runtime_capacity_multiple = SPARSE_RUNTIME_CAPACITY_MULTIPLE
         if sparse_lm_head_u_max < sparse_fixed_u_max:
@@ -615,10 +617,7 @@ def plan_sparse_batch_meta(step_meta):
 
 
 if args.sparse_mode:
-    x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
-    sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
-else:
-    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    pass
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -630,7 +629,7 @@ if args.num_iterations > 0:
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
 elif args.target_flops > 0:
-    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
+    # Calculate the number of iterations from the target FLOPs (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
     num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif args.target_param_data_ratio > 0:
@@ -791,7 +790,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 if hybrid_sparse:
     assert sparse_manifest is not None
-    resolved_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
+    resolved_grad_accum_u_max = int(sparse_resolved_grad_accum_u_max if sparse_resolved_grad_accum_u_max is not None else resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest))
     manifest_num_steps = int(sparse_manifest["num_steps"])
     if num_iterations > manifest_num_steps:
         raise ValueError(
@@ -829,6 +828,15 @@ if hybrid_sparse:
             f"Sparse base sequence manifest: {sparse_base_manifest_path} | "
             f"sequence_units={int(sparse_base_manifest['num_sequence_units']):,}"
         )
+
+if args.sparse_mode:
+    startup_fetch_t0 = time.perf_counter()
+    x, y, sparse_batch_meta, dataloader_state_dict = next(train_loader) # kick off the first sparse batch
+    sparse_batch_meta = plan_sparse_batch_meta(sparse_batch_meta)
+    if args.sparse_debug_timing:
+        print0(f"Sparse startup first-batch fetch: {(time.perf_counter() - startup_fetch_t0) * 1000.0:.2f}ms")
+else:
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # Go!
 while True:

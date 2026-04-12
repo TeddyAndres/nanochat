@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -12,6 +13,7 @@ DUAL_SPARSE_MANIFEST_VERSION = 4
 SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2, 3, 4}
 SPARSE_GROUPING_MANIFEST_KIND = "grouping"
 SPARSE_SEQUENCE_BASE_MANIFEST_KIND = "sequence-base"
+SEQUENCE_SHARD_SQLITE_FORMAT = "sqlite-v1"
 
 
 def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +174,7 @@ def build_sequence_manifest_shard_payload(
     return {
         "version": DUAL_SPARSE_MANIFEST_VERSION,
         "manifest_kind": SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
+        "store_format": SEQUENCE_SHARD_SQLITE_FORMAT,
         "shard_index": int(shard_index),
         "start_sequence_id": int(start_sequence_id),
         "num_sequence_units": len(sequence_units),
@@ -261,17 +264,160 @@ def save_sparse_manifest(path: str | Path, payload: dict[str, Any]) -> None:
 def save_sequence_manifest_shard(path: str | Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix == ".sqlite":
+        _save_sequence_manifest_shard_sqlite(path, payload)
+        return
     torch.save(payload, path)
 
 
+def _save_sequence_manifest_shard_sqlite(path: Path, payload: dict[str, Any]) -> None:
+    payload = dict(payload)
+    sequence_units = payload.pop("sequence_units", None)
+    if not isinstance(sequence_units, list):
+        raise ValueError("Sequence manifest shard payload must define a sequence_units list")
+    if path.exists():
+        path.unlink()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE sequence_units (
+                sequence_id INTEGER PRIMARY KEY,
+                state_dict_json TEXT NOT NULL,
+                sequence_recipe_json TEXT NOT NULL,
+                num_unique_tokens INTEGER NOT NULL,
+                unique_token_ids_json TEXT NOT NULL,
+                sequence_geometry_json TEXT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_sequence_units_sequence_id ON sequence_units(sequence_id)"
+        )
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES(?, ?)",
+            [(str(key), json.dumps(value, separators=(",", ":"))) for key, value in payload.items()],
+        )
+        connection.executemany(
+            """
+            INSERT INTO sequence_units(
+                sequence_id,
+                state_dict_json,
+                sequence_recipe_json,
+                num_unique_tokens,
+                unique_token_ids_json,
+                sequence_geometry_json
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(unit["sequence_id"]),
+                    json.dumps(unit.get("state_dict", {}), separators=(",", ":")),
+                    json.dumps(unit.get("sequence_recipe", {}), separators=(",", ":")),
+                    int(unit.get("num_unique_tokens", len(unit.get("unique_token_ids", [])))),
+                    json.dumps(unit.get("unique_token_ids", []), separators=(",", ":")),
+                    None if "sequence_geometry" not in unit else json.dumps(unit.get("sequence_geometry"), separators=(",", ":")),
+                )
+                for unit in sequence_units
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def load_sequence_manifest_shard(path: str | Path) -> dict[str, Any]:
-    payload = torch.load(Path(path), map_location="cpu")
+    path = Path(path)
+    if path.suffix == ".sqlite":
+        return _load_sequence_manifest_shard_sqlite(path)
+    payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError("Sequence manifest shard must deserialize to a dict payload")
     _validate_manifest_version(payload)
     if get_sparse_manifest_kind(payload) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
         raise ValueError("Sequence manifest shard payload must have kind 'sequence-base'")
     return payload
+
+
+def _load_sequence_manifest_shard_sqlite(path: Path) -> dict[str, Any]:
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        metadata_rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+        payload = {key: json.loads(value) for key, value in metadata_rows}
+        payload["sequence_units"] = [
+            _decode_sequence_unit_row(row)
+            for row in connection.execute(
+                "SELECT sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json FROM sequence_units ORDER BY sequence_id"
+            )
+        ]
+    finally:
+        connection.close()
+    if not isinstance(payload, dict):
+        raise ValueError("Sequence manifest shard must deserialize to a dict payload")
+    _validate_manifest_version(payload)
+    if get_sparse_manifest_kind(payload) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
+        raise ValueError("Sequence manifest shard payload must have kind 'sequence-base'")
+    return payload
+
+
+def _decode_sequence_unit_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json = row
+    unit = {
+        "sequence_id": int(sequence_id),
+        "state_dict": json.loads(state_dict_json),
+        "sequence_recipe": json.loads(sequence_recipe_json),
+        "num_unique_tokens": int(num_unique_tokens),
+        "unique_token_ids": json.loads(unique_token_ids_json),
+    }
+    if sequence_geometry_json is not None:
+        unit["sequence_geometry"] = json.loads(sequence_geometry_json)
+    return unit
+
+
+class SequenceManifestShardAccessor:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._payload = None
+        self._connection = None
+        if self.path.suffix == ".sqlite":
+            self._connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        else:
+            self._payload = load_sequence_manifest_shard(self.path)
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def get_sequence_unit(self, sequence_id: int) -> dict[str, Any] | None:
+        if self._connection is None:
+            assert self._payload is not None
+            for unit in self._payload.get("sequence_units", []):
+                if int(unit.get("sequence_id", -1)) == int(sequence_id):
+                    return unit
+            return None
+        row = self._connection.execute(
+            "SELECT sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json FROM sequence_units WHERE sequence_id = ?",
+            (int(sequence_id),),
+        ).fetchone()
+        return None if row is None else _decode_sequence_unit_row(row)
+
+    def iter_sequence_units(self) -> Iterator[dict[str, Any]]:
+        if self._connection is None:
+            assert self._payload is not None
+            yield from self._payload.get("sequence_units", [])
+            return
+        cursor = self._connection.execute(
+            "SELECT sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json FROM sequence_units ORDER BY sequence_id"
+        )
+        for row in cursor:
+            yield _decode_sequence_unit_row(row)
 
 
 def _resolve_shard_path(manifest_path: str | Path, shard_entry: dict[str, Any]) -> Path:
