@@ -123,6 +123,7 @@ def collect_sparse_loss_topk(
     step: int,
     micro_step: int,
     sequence_id: int = -1,
+    losses: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     if logits.ndim != 3 or targets.ndim != 2:
         raise ValueError("Expected logits shape (B, T, U) and targets shape (B, T)")
@@ -130,12 +131,17 @@ def collect_sparse_loss_topk(
         raise ValueError("Logits and targets batch dimensions must match")
     device = logits.device
     active_global_ids = active_global_ids_cpu.to(device=device, dtype=torch.long)
-    losses = F.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        targets.view(-1),
-        ignore_index=-1,
-        reduction="none",
-    ).view_as(targets)
+    if losses is None:
+        losses = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction="none",
+        ).view_as(targets)
+    else:
+        if tuple(losses.shape) != tuple(targets.shape):
+            raise ValueError("Precomputed sparse token losses must match target shape")
+        losses = losses.to(device=device, dtype=torch.float32)
     valid_mask = targets != -1
     if not valid_mask.any():
         correct_scores, correct_records = _empty_records(topk_correct, CORRECT_RECORD_COLS, device=device)

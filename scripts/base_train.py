@@ -1012,18 +1012,27 @@ while True:
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_metrics = sparse_step_ctx
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
-            loss = model(x, y_for_loss, active_vocab=sparse_step_ctx.active_vocab, logit_scale=args.sparse_logit_scale)
+            analysis_logits = None
+            analysis_token_losses = None
+            model_result = model(
+                x,
+                y_for_loss,
+                active_vocab=sparse_step_ctx.active_vocab,
+                logit_scale=args.sparse_logit_scale,
+                return_logits=args.sparse_loss_topk_enable,
+                return_token_losses=args.sparse_loss_topk_enable,
+            )
+            if args.sparse_loss_topk_enable:
+                loss, analysis_logits, analysis_token_losses = model_result
+            else:
+                loss = model_result
             if args.sparse_loss_topk_enable:
                 analysis_active_ids_cpu = sparse_step_ctx.lm_head_active_ids_cpu if sparse_step_ctx.lm_head_active_ids_cpu is not None else sparse_step_ctx.active_ids_cpu
+                assert analysis_logits is not None
+                assert analysis_token_losses is not None
                 with torch.no_grad():
-                    analysis_features = orig_model.forward_features(x, active_vocab=sparse_step_ctx.active_vocab)
-                    analysis_logits = orig_model.compute_logits(
-                        analysis_features,
-                        active_vocab=sparse_step_ctx.active_vocab,
-                        logit_scale=args.sparse_logit_scale,
-                    )
                     analysis_payload = collect_sparse_loss_topk(
-                        analysis_logits,
+                        analysis_logits.detach(),
                         y_for_loss,
                         analysis_active_ids_cpu,
                         topk_correct=None,
@@ -1031,6 +1040,7 @@ while True:
                         step=step,
                         micro_step=micro_step,
                         sequence_id=int(sparse_batch_meta.get("sequence_id", -1)),
+                        losses=analysis_token_losses.detach(),
                     )
                 step_correct_scores_all, step_correct_records_all = merge_topk_records(
                     step_correct_scores_all,

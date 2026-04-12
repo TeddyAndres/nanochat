@@ -467,9 +467,7 @@ class GPT(nn.Module):
             logit_mask = active_vocab["logit_mask"]
             if logit_mask.device != logits.device or logit_mask.dtype != torch.bool:
                 logit_mask = logit_mask.to(device=logits.device, dtype=torch.bool)
-            active_width = active_vocab["lm_head"].size(0)
-            active_logits = logits[..., :active_width].masked_fill(~logit_mask.view(1, 1, -1), -1e9)
-            logits = active_logits
+            logits = logits.masked_fill(~logit_mask.view(1, 1, -1), -1e9)
         if logit_scale != 1.0:
             logits = logits * logit_scale
         return logits
@@ -533,20 +531,53 @@ class GPT(nn.Module):
                 logits = logits * logit_scale
             yield start, end, logits
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_vocab=None, logit_scale=1.0, logit_bias=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction='mean',
+        active_vocab=None,
+        logit_scale=1.0,
+        logit_bias=None,
+        return_logits=False,
+        return_token_losses=False,
+    ):
         x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
         logits = self.compute_logits(
             x,
             active_vocab=active_vocab,
             logit_scale=logit_scale,
             logit_bias=logit_bias,
-            force_float=(targets is None),
+            force_float=(targets is None or return_logits or return_token_losses),
         )
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            token_losses = None
+            if return_token_losses:
+                token_losses = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                    reduction='none',
+                ).view_as(targets)
+                if loss_reduction == 'none':
+                    loss = token_losses
+                elif loss_reduction == 'sum':
+                    loss = token_losses.sum()
+                else:
+                    valid_mask = targets != -1
+                    loss = token_losses[valid_mask].mean() if valid_mask.any() else token_losses.sum()
+            else:
+                # TODO experiment with chunked cross-entropy?
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_logits and return_token_losses:
+                return loss.float(), logits, token_losses
+            if return_logits:
+                return loss.float(), logits
+            if return_token_losses:
+                return loss.float(), token_losses
             return loss.float()
         else:
             # inference: just return the logits directly
