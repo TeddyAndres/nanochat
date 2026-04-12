@@ -1620,9 +1620,18 @@ class DynamicVocabRuntime:
             cpu_exp_avg[name] = exp_avg
             cpu_exp_avg_sq[name] = exp_avg_sq
 
-        gpu_rows = self._stage_rows_to_gpu(cpu_rows)
-        gpu_exp_avg = self._stage_rows_to_gpu(cpu_exp_avg)
-        gpu_exp_avg_sq = self._stage_rows_to_gpu(cpu_exp_avg_sq)
+        gpu_rows = {
+            name: self._stage_cpu_tensor_to_device(f"dynamic:param:{name}", rows)
+            for name, rows in cpu_rows.items()
+        }
+        gpu_exp_avg = {
+            name: self._stage_cpu_tensor_to_device(f"dynamic:exp_avg:{name}", exp_avg)
+            for name, exp_avg in cpu_exp_avg.items()
+        }
+        gpu_exp_avg_sq = {
+            name: self._stage_cpu_tensor_to_device(f"dynamic:exp_avg_sq:{name}", exp_avg_sq)
+            for name, exp_avg_sq in cpu_exp_avg_sq.items()
+        }
 
         active_vocab = {
             "wte": nn.Parameter(gpu_rows["wte"], requires_grad=True),

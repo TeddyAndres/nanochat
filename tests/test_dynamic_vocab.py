@@ -162,6 +162,50 @@ def test_dynamic_vocab_runtime_state_dict_round_trip():
     assert torch.equal(runtime.token_event_step_count_cpu, restored.token_event_step_count_cpu)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_dynamic_prepare_step_stages_lm_head_optimizer_state_without_aliasing():
+    torch.manual_seed(0)
+    model = GPT(
+        GPTConfig(
+            sequence_len=8,
+            vocab_size=2048,
+            n_layer=2,
+            n_head=1,
+            n_kv_head=1,
+            n_embd=256,
+            window_pattern="L",
+        )
+    )
+    model.init_weights()
+    model = model.to("cuda")
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cuda",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+    )
+    active_ids = torch.arange(1024, dtype=torch.long)
+    idx = torch.randint(0, 1024, (4, 8), device="cuda")
+    targets = torch.randint(0, 1024, (4, 8), device="cuda")
+
+    step0 = runtime.prepare_step(active_ids)
+    loss0 = model(idx, targets, active_vocab=step0.active_vocab)
+    loss0.backward()
+    runtime.step(step0)
+
+    step1 = runtime.prepare_step(active_ids)
+    lm_head = runtime.table_specs["lm_head"]["param"]
+    expected_exp_avg = runtime.state[lm_head]["exp_avg"].index_select(0, active_ids)
+
+    assert torch.allclose(
+        step1.optimizer_state["lm_head"]["exp_avg"].detach().cpu(),
+        expected_exp_avg,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
 def test_sparse_step_uses_token_local_event_count_instead_of_table_age():
     torch.manual_seed(0)
     model_a = build_tiny_model(vocab_size=10)
