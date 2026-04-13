@@ -144,7 +144,7 @@ class DynamicVocabRuntime:
         self.hot_unembedding_ramp_activations = max(0, int(hot_unembedding_ramp_activations))
         self.hot_unembedding_ramp_start_lr = None if hot_unembedding_ramp_start_lr is None or hot_unembedding_ramp_start_lr <= 0.0 else float(hot_unembedding_ramp_start_lr)
         self.capacity_round_multiple = max(1, int(capacity_round_multiple))
-        self.disable_fixed_overlap_reuse = os.getenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "1") == "1"
+        self.disable_fixed_overlap_reuse = os.getenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "0") == "1"
         fixed_u_max_value = 0 if fixed_u_max is None else round_capacity_up(int(fixed_u_max), self.capacity_round_multiple)
         assert fixed_u_max_value is not None
         self.fixed_u_max = int(fixed_u_max_value)
@@ -223,6 +223,8 @@ class DynamicVocabRuntime:
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
         self._grad_accum_hot_activation_counts_cpu = None
+        self._grad_accum_window_cold_steps_cpu = None
+        self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
         self._grad_accum_pending_transfers = []
@@ -939,6 +941,8 @@ class DynamicVocabRuntime:
         self._grad_accum_non_live_chunks = []
         self._grad_accum_cached_union_mask_cpu = None
         self._grad_accum_hot_activation_counts_cpu = None
+        self._grad_accum_window_cold_steps_cpu = None
+        self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
 
@@ -1054,6 +1058,8 @@ class DynamicVocabRuntime:
             self.hot_activation_count_cpu.index_select(0, grad_accum_ids_cpu)
             if grad_accum_count > 0 else torch.empty(0, dtype=torch.long)
         )
+        self._grad_accum_window_cold_steps_cpu = None
+        self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
 
@@ -1697,24 +1703,49 @@ class DynamicVocabRuntime:
             self._fixed_live_state = False
         if grad_accum_steps > 1 and not preserve_resident_grads:
             self._start_grad_accum_window(grad_accum_ids_cpu)
-        cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
         active_union_row_ids_cpu = self._empty_long_cpu()
-        current_cold_logit_bias_cpu = self._empty_long_cpu().to(dtype=torch.float32)
-        cold_bias_clamped_count = 0
-        cold_bias_abs_max = 0.0
+        union_cold_steps_cpu = self._empty_long_cpu().to(dtype=torch.long)
+        cold_steps_cpu = self._empty_long_cpu().to(dtype=torch.long)
+        hot_activation_counts_cpu = self._empty_long_cpu().to(dtype=torch.long)
         if grad_accum_steps > 1:
             assert self._grad_accum_global_to_local_cpu is not None
             if active_ids_cpu.numel() > 0:
                 active_union_row_ids_cpu = self._grad_accum_global_to_local_cpu[active_ids_cpu]
                 if (active_union_row_ids_cpu < 0).any():
                     raise ValueError("Sparse grad accumulation map is missing active vocab rows")
-            current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
-                cold_steps_cpu,
-                cold_bias_scale=cold_bias_scale,
-                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-            )
-            self._grad_accum_window_cold_bias_clamped_count += cold_bias_clamped_count
-            self._grad_accum_window_cold_bias_abs_max = max(self._grad_accum_window_cold_bias_abs_max, cold_bias_abs_max)
+            if not preserve_resident_grads:
+                union_cold_steps_cpu, _ = self._capture_cold_steps_cpu(grad_accum_ids_cpu)
+                self._grad_accum_window_cold_steps_cpu = union_cold_steps_cpu.clone()
+            else:
+                if self._grad_accum_window_cold_steps_cpu is None:
+                    raise RuntimeError("Sparse grad accumulation cold-step cache is missing for resident window")
+                union_cold_steps_cpu = self._grad_accum_window_cold_steps_cpu
+            if self._grad_accum_hot_activation_counts_cpu is None:
+                raise RuntimeError("Sparse grad accumulation hot-count cache is missing")
+            if active_union_row_ids_cpu.numel() > 0:
+                hot_activation_counts_cpu = self._grad_accum_hot_activation_counts_cpu.index_select(0, active_union_row_ids_cpu)
+                cold_steps_cpu = union_cold_steps_cpu.index_select(0, active_union_row_ids_cpu)
+        else:
+            cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
+        current_cold_logit_bias_cpu = self._empty_long_cpu().to(dtype=torch.float32)
+        cold_bias_clamped_count = 0
+        cold_bias_abs_max = 0.0
+        if grad_accum_steps > 1:
+            if not preserve_resident_grads:
+                current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
+                    union_cold_steps_cpu,
+                    cold_bias_scale=cold_bias_scale,
+                    cold_bias_tokens_per_step=cold_bias_tokens_per_step,
+                )
+                self._grad_accum_window_cold_logit_bias_cpu = current_cold_logit_bias_cpu.clone()
+                self._grad_accum_window_cold_bias_clamped_count = cold_bias_clamped_count
+                self._grad_accum_window_cold_bias_abs_max = cold_bias_abs_max
+            else:
+                if self._grad_accum_window_cold_logit_bias_cpu is None:
+                    raise RuntimeError("Sparse grad accumulation cold-bias cache is missing for resident window")
+                current_cold_logit_bias_cpu = self._grad_accum_window_cold_logit_bias_cpu
+                cold_bias_clamped_count = self._grad_accum_window_cold_bias_clamped_count
+                cold_bias_abs_max = self._grad_accum_window_cold_bias_abs_max
         else:
             current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
                 cold_steps_cpu,
@@ -2059,9 +2090,10 @@ class DynamicVocabRuntime:
         if use_cold_logit_bias:
             if grad_accum_steps > 1:
                 self.fixed_cold_logit_bias.zero_()
-                if active_union_row_ids_cpu.numel() > 0:
-                    bias_slot_ids_device = active_union_row_ids_cpu.to(self.device)
-                    self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
+                if current_cold_logit_bias_cpu.numel() > 0:
+                    self.fixed_cold_logit_bias[:current_cold_logit_bias_cpu.numel()].copy_(
+                        current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda)
+                    )
             else:
                 self.fixed_cold_logit_bias.zero_()
                 if active_slot_ids_cpu.numel() > 0:

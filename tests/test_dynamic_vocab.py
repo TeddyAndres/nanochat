@@ -132,6 +132,18 @@ def test_dynamic_vocab_runtime_updates_only_active_rows():
     assert torch.allclose(wte.weight[inactive_id], original_wte_inactive)
 
 
+def test_fixed_overlap_reuse_is_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", raising=False)
+    runtime = DynamicVocabRuntime(build_tiny_model(), device="cpu", embedding_lr=0.01, value_embedding_lr=0.01, unembedding_lr=0.01)
+    assert runtime.disable_fixed_overlap_reuse is False
+
+
+def test_fixed_overlap_reuse_can_be_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "1")
+    runtime = DynamicVocabRuntime(build_tiny_model(), device="cpu", embedding_lr=0.01, value_embedding_lr=0.01, unembedding_lr=0.01)
+    assert runtime.disable_fixed_overlap_reuse is True
+
+
 def test_dynamic_vocab_runtime_state_dict_round_trip():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=10)
@@ -177,6 +189,8 @@ def test_dynamic_prepare_step_stages_lm_head_optimizer_state_without_aliasing():
         )
     )
     model.init_weights()
+
+
     model = model.to("cuda")
     runtime = DynamicVocabRuntime(
         model,
@@ -1180,7 +1194,7 @@ def test_fixed_u_cold_logit_bias_aligns_with_active_slots():
     assert torch.allclose(cold_bias[[0, 2, 4, 5]], torch.zeros(4), atol=1e-6)
 
 
-def test_fixed_u_grad_accum_cold_bias_only_applies_on_first_microstep_appearance():
+def test_fixed_u_grad_accum_cold_bias_is_window_stable_across_microsteps():
     runtime = DynamicVocabRuntime(
         build_tiny_model(vocab_size=8),
         device="cpu",
@@ -1230,7 +1244,7 @@ def test_fixed_u_grad_accum_cold_bias_only_applies_on_first_microstep_appearance
     )
     window_ctx0 = runtime.prepare_step(window_micro0, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
     expected = torch.log1p(torch.tensor(1.0))
-    assert torch.allclose(window_ctx0.active_vocab["cold_logit_bias"][:2], torch.tensor([expected.item(), 0.0]), atol=1e-6)
+    assert torch.allclose(window_ctx0.active_vocab["cold_logit_bias"][:2], torch.tensor([expected.item(), expected.item()]), atol=1e-6)
     set_zero_sparse_grads(window_ctx0)
     runtime.accumulate_gradients(window_ctx0)
 
@@ -1247,9 +1261,9 @@ def test_fixed_u_grad_accum_cold_bias_only_applies_on_first_microstep_appearance
         is_last_step=True,
     )
     window_ctx1 = runtime.prepare_step(window_micro1, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:2], torch.tensor([0.0, expected.item()]), atol=1e-6)
+    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:2], torch.tensor([expected.item(), expected.item()]), atol=1e-6)
 
-def test_fixed_u_grad_accum_repeated_appearance_gets_zero_cold_bias_later_in_window():
+def test_fixed_u_grad_accum_repeated_appearance_keeps_window_cold_bias_later_in_window():
     runtime = DynamicVocabRuntime(
         build_tiny_model(vocab_size=8),
         device="cpu",
@@ -1316,7 +1330,7 @@ def test_fixed_u_grad_accum_repeated_appearance_gets_zero_cold_bias_later_in_win
         is_last_step=True,
     )
     window_ctx1 = runtime.prepare_step(window_micro1, cold_bias_scale=1.0, cold_bias_tokens_per_step=8)
-    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:1], torch.tensor([0.0]), atol=1e-6)
+    assert torch.allclose(window_ctx1.active_vocab["cold_logit_bias"][:1], torch.tensor([expected.item()]), atol=1e-6)
 
 
 def test_fixed_u_grad_accum_apply_metrics_preserve_cold_bias_window_stats():

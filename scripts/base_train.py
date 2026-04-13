@@ -253,7 +253,9 @@ if hybrid_sparse:
 if args.sparse_mode:
     assert not ddp, "Sparse mode is single-GPU only for now"
     if hybrid_sparse:
-        print0("Sparse hybrid mode: fixed-U manifest path enabled; dense eval/sample paths materialize from CPU masters and training uses manifest-driven sparse staging")
+        overlap_reuse_disabled = os.getenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "0") == "1"
+        sparse_training_mode = "manifest-driven sparse staging (fixed overlap reuse disabled)" if overlap_reuse_disabled else "manifest-driven overlap reuse"
+        print0(f"Sparse hybrid mode: fixed-U manifest path enabled; dense eval/sample paths materialize from CPU masters and training uses {sparse_training_mode}")
     else:
         print0("Sparse mode first pass: dense eval/sample paths use temporary full-vocab materialization; checkpoint save/resume is enabled and training metrics focus on the training loop and transfer timings")
 if resuming:
@@ -353,8 +355,9 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-if args.sparse_mode and not hybrid_sparse:
-    print0("Sparse mode enabled: skipping torch.compile in first-pass dynamic vocab path")
+if args.sparse_mode:
+    print0("Sparse mode enabled: compiling model with dynamic=True for varying active vocab shapes")
+    model = torch.compile(model, dynamic=True)
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
