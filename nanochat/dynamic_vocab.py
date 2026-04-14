@@ -1935,6 +1935,15 @@ class DynamicVocabRuntime:
                 prev_lm_head_global_to_slot_cpu[prev_lm_head_ids_cpu] = prev_lm_head_slot_ids_cpu
                 reused_old_slot_ids_cpu = prev_lm_head_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
                 reuse_mask_cpu = reused_old_slot_ids_cpu >= 0
+                # Writeback leaving lm_head tokens BEFORE the GPU→GPU reuse copy overwrites their slots.
+                # Mirrors the same pattern used in Block 2 for input tables.
+                if deferred_lm_head_writeback_ids_cpu.numel() > 0:
+                    self._queue_fixed_lm_head_writeback_(
+                        deferred_lm_head_writeback_ids_cpu,
+                        deferred_lm_head_writeback_slot_ids_cpu,
+                    )
+                    deferred_lm_head_writeback_ids_cpu = self._empty_long_cpu()
+                    deferred_lm_head_writeback_slot_ids_cpu = self._empty_long_cpu()
                 if reuse_mask_cpu.any():
                     reused_old_slot_ids_cpu = reused_old_slot_ids_cpu[reuse_mask_cpu]
                     reused_new_slot_ids_cpu = torch.nonzero(reuse_mask_cpu, as_tuple=False).flatten()
