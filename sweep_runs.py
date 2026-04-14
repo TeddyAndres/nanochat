@@ -74,30 +74,11 @@ RUNS = [
             '--depth=6 --aspect-ratio 64 '
             '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
             '--num-iterations=5000 '            
-            '--run \"d6 65kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.005 0warmup 0.2warmdown 0.2embedlr 0.01matrix 0.27scalar 0wd 0.7adam1 0.95adam2\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
-            '--warmup-ratio 0 --warmdown-ratio 0.2 --final-lr-frac 0.1 '
-            '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '
-            '--sparse-cold-bias-scale 2 '           
-            '--log-every 10 --eval-every 250 --core-metric-every 5000 '
-        ),
-    },
-    {
-        "name": "d6_65kvocab_5k",
-        "args": parse_cmd_string(
-            '-m scripts.base_train '
-            '--sparse-mode --window-pattern L --fp8 '
-            '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=6 --aspect-ratio 64 '
-            '--total-batch-size 262144 --max-seq-len 2048 --device-batch-size=16 '
-            '--num-iterations=5000 '            
             '--run \"d6 65kvoc 2kseq 16batch 8accum 64aspect 5kstep unembedlr0.005 0warmup 0.2warmdown 0.2embedlr 0.01matrix 0.27scalar 0wd 0.7adam1 0.95adam2 losstopk\" '
             '--sparse-manifest manifests/65kvocab_2kseq_16batch_8accum_10kstep.json '
             '--warmup-ratio 0 --warmdown-ratio 0.2 --final-lr-frac 0.1 '
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
-            '--adam-beta1 0.7 --adam-beta2 0.95 '
-            '--sparse-cold-bias-scale 2 '           
+            '--adam-beta1 0.7 --adam-beta2 0.95 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
             '--sparse-loss-topk-enable '
         ),
