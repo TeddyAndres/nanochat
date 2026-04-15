@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from nanochat.sparse_analysis import CORRECT_RECORD_COLS, INCORRECT_RECORD_COLS
+from nanochat.sparse_analysis import SPARSE_LOSS_TOPK_RANKING_SINGLE, SparseLossTopkRankingMode
 from nanochat.sparse_window_accum import SparseRollingLossAccumulator
 from nanochat.sparse_manifest import (
     SequenceManifestShardAccessor,
@@ -72,6 +73,7 @@ class SparseFutureWindowPlanner:
         corrective_fraction: float = 0.25,
         max_auto_negatives_per_microstep: int = 4,
         sampling_seed: int = 0,
+        ranking_mode: SparseLossTopkRankingMode = SPARSE_LOSS_TOPK_RANKING_SINGLE,
     ):
         self.manifest_path = Path(manifest_path)
         self.grouping_header = load_sparse_manifest_header(self.manifest_path)
@@ -87,7 +89,7 @@ class SparseFutureWindowPlanner:
         self.corrective_fraction = float(corrective_fraction)
         self.max_auto_negatives_per_microstep = max(0, int(max_auto_negatives_per_microstep))
         self.sampling_seed = int(sampling_seed)
-        self.accumulator = SparseRollingLossAccumulator(window_steps=rolling_window_steps)
+        self.accumulator = SparseRollingLossAccumulator(window_steps=rolling_window_steps, ranking_mode=ranking_mode)
         self._step_overrides: dict[int, dict[str, Any]] = {}
 
     def get_step_override(self, step: int) -> dict[str, Any] | None:

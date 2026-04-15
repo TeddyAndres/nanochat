@@ -5,12 +5,20 @@ from typing import Deque
 
 import torch
 
-from nanochat.sparse_analysis import CORRECT_RECORD_COLS, INCORRECT_RECORD_COLS
+from nanochat.sparse_analysis import (
+    CORRECT_RECORD_COLS,
+    INCORRECT_RECORD_COLS,
+    SPARSE_LOSS_TOPK_RANKING_ACCUMULATED,
+    SPARSE_LOSS_TOPK_RANKING_SINGLE,
+    SparseLossTopkRankingMode,
+    normalize_sparse_topk_ranking_mode,
+)
 
 
 class SparseRollingLossAccumulator:
-    def __init__(self, window_steps: int = 20):
+    def __init__(self, window_steps: int = 20, *, ranking_mode: SparseLossTopkRankingMode = SPARSE_LOSS_TOPK_RANKING_SINGLE):
         self.window_steps = max(1, int(window_steps))
+        self.ranking_mode = normalize_sparse_topk_ranking_mode(ranking_mode)
         self._step_queue: Deque[dict] = deque()
         self.correct_totals: dict[int, float] = {}
         self.incorrect_pair_totals: dict[tuple[int, int], float] = {}
@@ -31,11 +39,9 @@ class SparseRollingLossAccumulator:
             "incorrect": self._extract_incorrect_contributions(incorrect_scores, incorrect_records),
         }
         self._step_queue.append(step_payload)
-        self._apply_step_payload(step_payload, sign=1.0)
         while len(self._step_queue) > self.window_steps:
-            expired_payload = self._step_queue.popleft()
-            self._apply_step_payload(expired_payload, sign=-1.0)
-        self._rebuild_correct_pair_lookup()
+            self._step_queue.popleft()
+        self._rebuild_window_state()
         return step_payload
 
     def ranked_correct_tokens(self, limit: int | None = None) -> list[tuple[int, float]]:
@@ -72,6 +78,7 @@ class SparseRollingLossAccumulator:
     def state_dict(self) -> dict:
         return {
             "window_steps": self.window_steps,
+            "ranking_mode": self.ranking_mode,
             "step_queue": [
                 {
                     "step": int(payload["step"]),
@@ -84,6 +91,7 @@ class SparseRollingLossAccumulator:
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.window_steps = max(1, int(state_dict.get("window_steps", self.window_steps)))
+        self.ranking_mode = normalize_sparse_topk_ranking_mode(state_dict.get("ranking_mode", self.ranking_mode))
         self._step_queue.clear()
         self.correct_totals.clear()
         self.incorrect_pair_totals.clear()
@@ -97,8 +105,7 @@ class SparseRollingLossAccumulator:
                 },
             }
             self._step_queue.append(step_payload)
-            self._apply_step_payload(step_payload, sign=1.0)
-        self._rebuild_correct_pair_lookup()
+        self._rebuild_window_state()
 
     def _extract_correct_contributions(self, scores: torch.Tensor, records: torch.Tensor) -> dict[int, float]:
         scores = scores.detach().to(device="cpu", dtype=torch.float32)
@@ -112,7 +119,10 @@ class SparseRollingLossAccumulator:
             token_id = int(record[6])
             if token_id < 0:
                 continue
-            contributions[token_id] = contributions.get(token_id, 0.0) + float(score)
+            if self.ranking_mode == SPARSE_LOSS_TOPK_RANKING_ACCUMULATED:
+                contributions[token_id] = contributions.get(token_id, 0.0) + float(score)
+            else:
+                contributions[token_id] = max(contributions.get(token_id, float("-inf")), float(score))
         return contributions
 
     def _extract_incorrect_contributions(self, scores: torch.Tensor, records: torch.Tensor) -> dict[tuple[int, int], float]:
@@ -129,22 +139,31 @@ class SparseRollingLossAccumulator:
             if correct_id < 0 or wrong_id < 0:
                 continue
             key = (wrong_id, correct_id)
-            contributions[key] = contributions.get(key, 0.0) + float(score)
+            if self.ranking_mode == SPARSE_LOSS_TOPK_RANKING_ACCUMULATED:
+                contributions[key] = contributions.get(key, 0.0) + float(score)
+            else:
+                contributions[key] = max(contributions.get(key, float("-inf")), float(score))
         return contributions
 
-    def _apply_step_payload(self, step_payload: dict, *, sign: float) -> None:
-        for token_id, score in step_payload["correct"].items():
-            updated = self.correct_totals.get(token_id, 0.0) + sign * float(score)
-            if updated <= 0.0:
-                self.correct_totals.pop(token_id, None)
-            else:
-                self.correct_totals[token_id] = updated
-        for pair_key, score in step_payload["incorrect"].items():
-            updated = self.incorrect_pair_totals.get(pair_key, 0.0) + sign * float(score)
-            if updated <= 0.0:
-                self.incorrect_pair_totals.pop(pair_key, None)
-            else:
-                self.incorrect_pair_totals[pair_key] = updated
+    def _rebuild_window_state(self) -> None:
+        self.correct_totals.clear()
+        self.incorrect_pair_totals.clear()
+        for step_payload in self._step_queue:
+            for token_id, score in step_payload["correct"].items():
+                score = float(score)
+                if self.ranking_mode == SPARSE_LOSS_TOPK_RANKING_ACCUMULATED:
+                    self.correct_totals[token_id] = self.correct_totals.get(token_id, 0.0) + score
+                else:
+                    self.correct_totals[token_id] = max(self.correct_totals.get(token_id, float("-inf")), score)
+            for pair_key, score in step_payload["incorrect"].items():
+                score = float(score)
+                if self.ranking_mode == SPARSE_LOSS_TOPK_RANKING_ACCUMULATED:
+                    self.incorrect_pair_totals[pair_key] = self.incorrect_pair_totals.get(pair_key, 0.0) + score
+                else:
+                    self.incorrect_pair_totals[pair_key] = max(self.incorrect_pair_totals.get(pair_key, float("-inf")), score)
+        self.correct_totals = {token_id: score for token_id, score in self.correct_totals.items() if score > 0.0}
+        self.incorrect_pair_totals = {pair_key: score for pair_key, score in self.incorrect_pair_totals.items() if score > 0.0}
+        self._rebuild_correct_pair_lookup()
 
     def _rebuild_correct_pair_lookup(self) -> None:
         lookup: dict[int, list[tuple[int, float]]] = {}

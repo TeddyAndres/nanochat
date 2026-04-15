@@ -24,6 +24,13 @@ from typing import Optional
 
 import torch
 
+from nanochat.sparse_analysis import (
+    SPARSE_LOSS_TOPK_RANKING_ACCUMULATED,
+    SPARSE_LOSS_TOPK_RANKING_MODES,
+    SPARSE_LOSS_TOPK_RANKING_SINGLE,
+    normalize_sparse_topk_ranking_mode,
+)
+
 # ── Column indices ───────────────────────────────────────────────────────────────
 # Both correct (7 cols) and incorrect (9 cols) records share the same leading cols.
 _COL_STEP          = 0
@@ -55,31 +62,37 @@ def _parse_step_range(s: str) -> tuple[Optional[int], Optional[int]]:
 def iter_step_files(
     analysis_dir: Path,
     step_range: Optional[tuple[Optional[int], Optional[int]]] = None,
-) -> list[tuple[int, Path]]:
-    """Return sorted (step_int, path) pairs for all step_XXXXXX.pt files in analysis_dir."""
-    pattern = re.compile(r'^step_(\d{6})\.pt$')
+) -> list[tuple[int, int, Path]]:
+    """Return sorted (start_step, end_step, path) triples for legacy and batched sparse-analysis files."""
+    single_pattern = re.compile(r'^step_(\d{6})\.pt$')
+    batch_pattern = re.compile(r'^steps_(\d{6})_(\d{6})\.pt$')
     results = []
     for f in analysis_dir.iterdir():
-        m = pattern.match(f.name)
-        if m is None:
-            continue
-        step = int(m.group(1))
+        m = single_pattern.match(f.name)
+        if m is not None:
+            start_step = int(m.group(1))
+            end_step = start_step
+        else:
+            m = batch_pattern.match(f.name)
+            if m is None:
+                continue
+            start_step = int(m.group(1))
+            end_step = int(m.group(2))
         if step_range is not None:
             lo, hi = step_range
-            if lo is not None and step < lo:
+            if lo is not None and end_step < lo:
                 continue
-            if hi is not None and step > hi:
+            if hi is not None and start_step > hi:
                 continue
-        results.append((step, f))
-    results.sort(key=lambda x: x[0])
+        results.append((start_step, end_step, f))
+    results.sort(key=lambda x: (x[0], x[1], x[2].name))
     return results
 
 
 # ── Payload loading ──────────────────────────────────────────────────────────────
 
-def load_payload(path: Path) -> dict:
-    """Load a step .pt file; strip -inf padding rows from scores/records."""
-    raw = torch.load(path, weights_only=True)
+def _normalize_step_payload(raw: dict) -> dict:
+    """Normalize one step payload and strip -inf padding rows from scores/records."""
     out: dict = {"step": int(raw["step"])}
     for prefix in ("correct", "incorrect"):
         scores: torch.Tensor = raw[f"{prefix}_scores"]    # (N,)
@@ -88,6 +101,78 @@ def load_payload(path: Path) -> dict:
         out[f"{prefix}_scores"] = scores[valid]
         out[f"{prefix}_records"] = records[valid]
     return out
+
+
+def load_payloads(path: Path, step_range: Optional[tuple[Optional[int], Optional[int]]] = None) -> list[dict]:
+    """Load one analysis file and return normalized per-step payloads."""
+    raw = torch.load(path, weights_only=True)
+    if isinstance(raw, dict) and "step" in raw and "correct_scores" in raw and "incorrect_scores" in raw:
+        payloads = [_normalize_step_payload(raw)]
+    else:
+        payloads = []
+        if not isinstance(raw, dict):
+            raise ValueError(f"Unsupported sparse analysis payload in {path}")
+        for step_key, step_payload in raw.items():
+            if not isinstance(step_payload, dict):
+                raise ValueError(f"Unsupported sparse analysis step payload in {path} for key {step_key!r}")
+            normalized_payload = _normalize_step_payload(step_payload)
+            payloads.append(normalized_payload)
+    if step_range is None:
+        return sorted(payloads, key=lambda payload: int(payload["step"]))
+    lo, hi = step_range
+    filtered = []
+    for payload in payloads:
+        step = int(payload["step"])
+        if lo is not None and step < lo:
+            continue
+        if hi is not None and step > hi:
+            continue
+        filtered.append(payload)
+    return sorted(filtered, key=lambda payload: int(payload["step"]))
+
+
+def iter_step_payloads(
+    analysis_dir: Path,
+    step_range: Optional[tuple[Optional[int], Optional[int]]] = None,
+) -> list[tuple[int, dict]]:
+    payloads: list[tuple[int, dict]] = []
+    for _start_step, _end_step, path in iter_step_files(analysis_dir, step_range):
+        for payload in load_payloads(path, step_range=step_range):
+            payloads.append((int(payload["step"]), payload))
+    payloads.sort(key=lambda item: item[0])
+    return payloads
+
+
+def aggregate_ranked_records(
+    scores: torch.Tensor,
+    records: torch.Tensor,
+    *,
+    key_columns: tuple[int, ...],
+    ranking_mode: str,
+) -> dict[tuple[int, ...], dict[str, float | int]]:
+    ranking_mode = normalize_sparse_topk_ranking_mode(ranking_mode)
+    accum: dict[tuple[int, ...], dict[str, float | int]] = {}
+    for idx in range(records.size(0)):
+        key = tuple(int(records[idx, column].item()) for column in key_columns)
+        score = float(scores[idx].item())
+        stats = accum.setdefault(key, {"count": 0, "total_score": 0.0, "max_score": -float("inf")})
+        stats["count"] = int(stats["count"]) + 1
+        stats["total_score"] = float(stats["total_score"]) + score
+        stats["max_score"] = max(float(stats["max_score"]), score)
+    return accum
+
+
+def sort_ranked_items(
+    items: dict[tuple[int, ...], dict[str, float | int]],
+    *,
+    ranking_mode: str,
+) -> list[tuple[tuple[int, ...], dict[str, float | int]]]:
+    ranking_mode = normalize_sparse_topk_ranking_mode(ranking_mode)
+    score_field = "max_score" if ranking_mode == SPARSE_LOSS_TOPK_RANKING_SINGLE else "total_score"
+    return sorted(
+        items.items(),
+        key=lambda item: (-float(item[1][score_field]), item[0]),
+    )
 
 
 # ── Tokenizer ────────────────────────────────────────────────────────────────────
@@ -147,19 +232,18 @@ def _fmt_float(v: float, decimals: int = 4) -> str:
 # ── Subcommand: summary ──────────────────────────────────────────────────────────
 
 def cmd_summary(analysis_dir: Path, step_range, args) -> None:
-    files = iter_step_files(analysis_dir, step_range)
-    if not files:
+    payloads = iter_step_payloads(analysis_dir, step_range)
+    if not payloads:
         print("No matching step files found.")
         return
 
-    steps = [s for s, _ in files]
+    steps = [step for step, _payload in payloads]
     total_correct = 0
     total_incorrect = 0
     all_correct: list[torch.Tensor] = []
     all_incorrect: list[torch.Tensor] = []
 
-    for _step, path in files:
-        payload = load_payload(path)
+    for _step, payload in payloads:
         cs = payload["correct_scores"]
         is_ = payload["incorrect_scores"]
         total_correct += cs.numel()
@@ -172,7 +256,7 @@ def cmd_summary(analysis_dir: Path, step_range, args) -> None:
     print_table(
         ["metric", "value"],
         [
-            ["total step files",       str(len(files))],
+            ["total analyzed steps",   str(len(payloads))],
             ["step range",             f"{steps[0]} – {steps[-1]}"],
             ["total correct records",  str(total_correct)],
             ["total incorrect records", str(total_incorrect)],
@@ -215,16 +299,15 @@ def _rolling_mean(values: list[float], window: int) -> list[float]:
 
 
 def cmd_trends(analysis_dir: Path, step_range, args) -> None:
-    files = iter_step_files(analysis_dir, step_range)
-    if not files:
+    payloads = iter_step_payloads(analysis_dir, step_range)
+    if not payloads:
         print("No matching step files found.")
         return
 
     window: int = getattr(args, "window", 1)
     raw: list[tuple[int, int, float, int, float]] = []
 
-    for step, path in files:
-        payload = load_payload(path)
+    for step, payload in payloads:
         cs = payload["correct_scores"]
         is_ = payload["incorrect_scores"]
         mean_ce     = cs.mean().item()  if cs.numel()  else float("nan")
@@ -260,88 +343,101 @@ def cmd_trends(analysis_dir: Path, step_range, args) -> None:
 # ── Subcommand: tokens ───────────────────────────────────────────────────────────
 
 def cmd_tokens(analysis_dir: Path, step_range, args) -> None:
-    files = iter_step_files(analysis_dir, step_range)
-    if not files:
+    payloads = iter_step_payloads(analysis_dir, step_range)
+    if not payloads:
         print("No matching step files found.")
         return
 
     topk = args.topk
     tok = try_load_tokenizer()
+    ranking_mode = normalize_sparse_topk_ranking_mode(args.ranking_mode)
 
-    # {token_id: [count, sum_score]}
-    accum: dict[int, list] = {}
-    for _step, path in files:
-        payload = load_payload(path)
-        scores  = payload["correct_scores"]
-        records = payload["correct_records"]
-        for i in range(records.size(0)):
-            tok_id = int(records[i, _COL_TARGET_GLOBAL].item())
-            score  = float(scores[i].item())
-            if tok_id not in accum:
-                accum[tok_id] = [0, 0.0]
-            accum[tok_id][0] += 1
-            accum[tok_id][1] += score
+    accum: dict[tuple[int, ...], dict[str, float | int]] = {}
+    for _step, payload in payloads:
+        step_accum = aggregate_ranked_records(
+            payload["correct_scores"],
+            payload["correct_records"],
+            key_columns=(_COL_TARGET_GLOBAL,),
+            ranking_mode=ranking_mode,
+        )
+        for key, stats in step_accum.items():
+            global_stats = accum.setdefault(key, {"count": 0, "total_score": 0.0, "max_score": -float("inf")})
+            global_stats["count"] = int(global_stats["count"]) + int(stats["count"])
+            global_stats["total_score"] = float(global_stats["total_score"]) + float(stats["total_score"])
+            global_stats["max_score"] = max(float(global_stats["max_score"]), float(stats["max_score"]))
 
     if not accum:
         print("No correct records found.")
         return
 
-    sorted_items = sorted(accum.items(), key=lambda kv: kv[1][1], reverse=True)[:topk]
+    sorted_items = sort_ranked_items(accum, ranking_mode=ranking_mode)[:topk]
 
     rows = []
-    for rank, (tok_id, (count, total_score)) in enumerate(sorted_items, 1):
+    for rank, ((tok_id,), stats) in enumerate(sorted_items, 1):
+        count = int(stats["count"])
+        total_score = float(stats["total_score"])
+        max_score = float(stats["max_score"])
         mean_score = total_score / count if count > 0 else 0.0
         rows.append([
             str(rank),
             str(tok_id),
             decode_token(tok, tok_id),
             str(count),
+            _fmt_float(max_score),
             _fmt_float(mean_score),
             _fmt_float(total_score),
         ])
 
+    title = (
+        f"Top-{topk} Worst Predicted Tokens (by max single-occurrence CE loss)"
+        if ranking_mode == SPARSE_LOSS_TOPK_RANKING_SINGLE
+        else f"Top-{topk} Worst Predicted Tokens (by total accumulated CE loss)"
+    )
+
     print_table(
-        ["rank", "token_id", "decoded", "count", "mean_ce_loss", "total_ce_loss"],
+        ["rank", "token_id", "decoded", "count", "max_ce_loss", "mean_ce_loss", "total_ce_loss"],
         rows,
-        title=f"Top-{topk} Worst Predicted Tokens (by total CE loss)",
+        title=title,
     )
 
 
 # ── Subcommand: confusion ────────────────────────────────────────────────────────
 
 def cmd_confusion(analysis_dir: Path, step_range, args) -> None:
-    files = iter_step_files(analysis_dir, step_range)
-    if not files:
+    payloads = iter_step_payloads(analysis_dir, step_range)
+    if not payloads:
         print("No matching step files found.")
         return
 
     topk = args.topk
     tok = try_load_tokenizer()
+    ranking_mode = normalize_sparse_topk_ranking_mode(args.ranking_mode)
 
-    # {(target_global, wrong_global): [count, sum_margin]}
-    accum: dict[tuple[int, int], list] = {}
-    for _step, path in files:
-        payload = load_payload(path)
-        scores  = payload["incorrect_scores"]
-        records = payload["incorrect_records"]
-        for i in range(records.size(0)):
-            target_id = int(records[i, _COL_TARGET_GLOBAL].item())
-            wrong_id  = int(records[i, _COL_WRONG_GLOBAL].item())
-            score     = float(scores[i].item())
-            key       = (target_id, wrong_id)
-            if key not in accum:
-                accum[key] = [0, 0.0]
-            accum[key][0] += 1
-            accum[key][1] += score
+    accum: dict[tuple[int, ...], dict[str, float | int]] = {}
+    for _step, payload in payloads:
+        step_accum = aggregate_ranked_records(
+            payload["incorrect_scores"],
+            payload["incorrect_records"],
+            key_columns=(_COL_TARGET_GLOBAL, _COL_WRONG_GLOBAL),
+            ranking_mode=ranking_mode,
+        )
+        for key, stats in step_accum.items():
+            global_stats = accum.setdefault(key, {"count": 0, "total_score": 0.0, "max_score": -float("inf")})
+            global_stats["count"] = int(global_stats["count"]) + int(stats["count"])
+            global_stats["total_score"] = float(global_stats["total_score"]) + float(stats["total_score"])
+            global_stats["max_score"] = max(float(global_stats["max_score"]), float(stats["max_score"]))
 
     if not accum:
         print("No incorrect records found.")
         return
 
-    sorted_items = sorted(accum.items(), key=lambda kv: kv[1][0], reverse=True)[:topk]
+    sorted_items = sort_ranked_items(accum, ranking_mode=ranking_mode)[:topk]
 
     rows = []
-    for rank, ((target_id, wrong_id), (count, total_margin)) in enumerate(sorted_items, 1):
+    for rank, ((target_id, wrong_id), stats) in enumerate(sorted_items, 1):
+        count = int(stats["count"])
+        total_margin = float(stats["total_score"])
+        max_margin = float(stats["max_score"])
         mean_margin = total_margin / count if count > 0 else 0.0
         rows.append([
             str(rank),
@@ -350,14 +446,21 @@ def cmd_confusion(analysis_dir: Path, step_range, args) -> None:
             str(wrong_id),
             decode_token(tok, wrong_id),
             str(count),
+            _fmt_float(max_margin),
             _fmt_float(mean_margin),
             _fmt_float(total_margin),
         ])
 
+    title = (
+        f"Top-{topk} Confusion Pairs (by max single-occurrence margin)"
+        if ranking_mode == SPARSE_LOSS_TOPK_RANKING_SINGLE
+        else f"Top-{topk} Confusion Pairs (by total accumulated margin)"
+    )
+
     print_table(
-        ["rank", "target_id", "target", "wrong_id", "wrong", "count", "mean_margin", "total_margin"],
+        ["rank", "target_id", "target", "wrong_id", "wrong", "count", "max_margin", "mean_margin", "total_margin"],
         rows,
-        title=f"Top-{topk} Confusion Pairs (by count)",
+        title=title,
     )
 
 
@@ -366,18 +469,17 @@ def cmd_confusion(analysis_dir: Path, step_range, args) -> None:
 def cmd_inspect(analysis_dir: Path, step_range, args) -> None:
     specific_step: Optional[int] = getattr(args, "step", None)
     if specific_step is not None:
-        files = iter_step_files(analysis_dir, (specific_step, specific_step))
+        payloads = iter_step_payloads(analysis_dir, (specific_step, specific_step))
     else:
-        files = iter_step_files(analysis_dir, step_range)
+        payloads = iter_step_payloads(analysis_dir, step_range)
 
-    if not files:
+    if not payloads:
         print("No matching step files found.")
         return
 
     tok = try_load_tokenizer()
 
-    for step_num, path in files:
-        payload = load_payload(path)
+    for step_num, payload in payloads:
 
         # Correct records
         c_scores  = payload["correct_scores"]
@@ -449,6 +551,13 @@ def parse_args(argv=None):
         default=None,
         dest="step_range",
         help="Only consider steps in [START, END] (either bound optional, e.g. '100:500')",
+    )
+    parser.add_argument(
+        "--ranking-mode",
+        type=str,
+        default=SPARSE_LOSS_TOPK_RANKING_SINGLE,
+        choices=SPARSE_LOSS_TOPK_RANKING_MODES,
+        help="Ranking mode for aggregated tokens/confusion views: 'single' ranks by max single occurrence, 'accumulated' ranks by total score",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 

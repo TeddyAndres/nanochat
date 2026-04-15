@@ -39,7 +39,13 @@ from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CLAMP_MIN, DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.prefetch import AsyncLoaderPrefetcher
-from nanochat.sparse_analysis import SparseLossAnalysisWriter, collect_sparse_loss_topk_from_stats, merge_topk_records, select_topk_records
+from nanochat.sparse_analysis import (
+    SPARSE_LOSS_TOPK_RANKING_MODES,
+    SparseLossAnalysisWriter,
+    collect_sparse_loss_topk_from_stats,
+    merge_topk_records,
+    select_topk_records,
+)
 from nanochat.sparse_replan import SparseFutureWindowPlanner
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -113,6 +119,7 @@ parser.add_argument("--sparse-first-hot-unembedding-lr", type=float, default=0.0
 parser.add_argument("--sparse-hot-unembed-ramp-activations", type=int, default=0, help="for lm_head rows only, ramp per-token sparse unembedding LR over this many hot activations (0 = disabled)")
 parser.add_argument("--sparse-hot-unembed-ramp-start-lr", type=float, default=0.0, help="starting lm_head LR for the per-token hot-activation ramp; used with --sparse-hot-unembed-ramp-activations (0 = disabled)")
 parser.add_argument("--sparse-loss-topk-enable", action="store_true", help="capture bounded per-step sparse token-loss top-K tensors for analysis and future replanning")
+parser.add_argument("--sparse-loss-topk-ranking-mode", type=str, default="single", choices=SPARSE_LOSS_TOPK_RANKING_MODES, help="ranking mode for sparse top-K dedupe: 'single' keeps the worst single occurrence per token or pair, 'accumulated' sums repeated occurrences")
 parser.add_argument("--sparse-loss-topk-correct", type=int, default=50, help="maximum number of under-predicted correct-token records to keep per optimizer step")
 parser.add_argument("--sparse-loss-topk-incorrect", type=int, default=50, help="maximum number of over-predicted incorrect-token records to keep per optimizer step")
 parser.add_argument("--sparse-loss-topk-output", type=str, default="", help="dataset-side directory for async sparse top-K analysis output (empty = default beside token cache)")
@@ -555,6 +562,7 @@ if args.sparse_future_replan_enable:
         rolling_window_steps=args.sparse_loss_window_steps,
         max_auto_negatives_per_microstep=args.sparse_auto_negative_per_microstep,
         sampling_seed=args.sparse_replan_sampling_seed,
+        ranking_mode=args.sparse_loss_topk_ranking_mode,
     )
     if resuming and args.sparse_mode:
         planner_state = optimizer_data.get("sparse_planner") if isinstance(optimizer_data, dict) else None
@@ -781,6 +789,7 @@ def _run_topk_analysis(
     step,
     topk_correct,
     topk_incorrect,
+    ranking_mode,
     writer,
     planner_executor,
     planner,
@@ -817,6 +826,7 @@ def _run_topk_analysis(
             top2_logits=entry["top2_logits"],
             top2_local=entry["top2_local"],
             target_logits=entry["target_logits"],
+            ranking_mode=ranking_mode,
         )
         step_correct_scores_all, step_correct_records_all = merge_topk_records(
             step_correct_scores_all,
@@ -824,6 +834,7 @@ def _run_topk_analysis(
             payload["correct_scores"],
             payload["correct_records"],
             topk=topk_correct,
+            ranking_mode=ranking_mode,
         )
         step_incorrect_scores_all, step_incorrect_records_all = merge_topk_records(
             step_incorrect_scores_all,
@@ -831,6 +842,7 @@ def _run_topk_analysis(
             payload["incorrect_scores"],
             payload["incorrect_records"],
             topk=topk_incorrect,
+            ranking_mode=ranking_mode,
         )
 
     if step_correct_scores_all is None or step_correct_records_all is None:
@@ -842,11 +854,13 @@ def _run_topk_analysis(
         step_correct_scores_all,
         step_correct_records_all,
         topk=topk_correct,
+        ranking_mode=ranking_mode,
     )
     bounded_incorrect_scores, bounded_incorrect_records = select_topk_records(
         step_incorrect_scores_all,
         step_incorrect_records_all,
         topk=topk_incorrect,
+        ranking_mode=ranking_mode,
     )
     analysis_cpu_payload = {
         "step": step,
@@ -1380,6 +1394,7 @@ while True:
             step,
             args.sparse_loss_topk_correct,
             args.sparse_loss_topk_incorrect,
+            args.sparse_loss_topk_ranking_mode,
             sparse_loss_analysis_writer,
             _topk_planner_executor,
             sparse_future_window_planner,
