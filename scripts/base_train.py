@@ -535,15 +535,19 @@ token_cache_workers = max(1, args.token_cache_workers) if args.token_cache_worke
 sparse_loss_analysis_writer = None
 sparse_future_window_planner = None
 _topk_analysis_executor = None
+_topk_planner_executor = None
 _topk_analysis_lock = threading.Lock()
 if args.sparse_loss_topk_enable:
     assert args.sparse_mode, "--sparse-loss-topk-enable requires --sparse-mode"
     sparse_loss_analysis_writer = SparseLossAnalysisWriter(args.sparse_loss_topk_output, args.token_cache_dir)
-    _topk_analysis_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="topk_analysis")
+    # 2 workers so consecutive steps can overlap on CPU while one waits for D2H sync
+    _topk_analysis_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="topk_analysis")
 if args.sparse_future_replan_enable:
     assert args.sparse_mode, "--sparse-future-replan-enable requires --sparse-mode"
     assert hybrid_sparse, "--sparse-future-replan-enable requires --sparse-manifest"
     assert args.sparse_loss_topk_enable, "--sparse-future-replan-enable requires --sparse-loss-topk-enable"
+    # Sequential planner executor — keeps planner updates ordered and off the analysis path
+    _topk_planner_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="topk_planner")
     sparse_future_window_planner = SparseFutureWindowPlanner(
         args.sparse_manifest,
         lookahead_steps=args.sparse_future_replan_lookahead,
@@ -778,6 +782,7 @@ def _run_topk_analysis(
     topk_correct,
     topk_incorrect,
     writer,
+    planner_executor,
     planner,
     lock,
 ):
@@ -787,6 +792,9 @@ def _run_topk_analysis(
     All tensors in `transferred_microsteps` are already on CPU (D2H was fired
     non-blocking from the main thread).  We wait for those transfers here, inside
     this thread, via event.synchronize() — the main thread never blocks.
+
+    The planner update (if any) is submitted to a separate sequential executor so
+    it never blocks the analysis→write critical path.
     """
     if event is not None:
         event.synchronize()
@@ -849,16 +857,47 @@ def _run_topk_analysis(
     }
     if writer is not None:
         writer.submit(step, analysis_cpu_payload)
+    # Planner update is submitted to a separate executor so it never serialises
+    # with the analysis→write path above.
     if planner is not None:
-        with lock:
-            planner.update_from_step_payload(
+        if planner_executor is not None:
+            planner_executor.submit(
+                _run_planner_update,
+                planner,
+                lock,
                 step,
-                correct_scores=step_correct_scores_all,
-                correct_records=step_correct_records_all,
-                incorrect_scores=step_incorrect_scores_all,
-                incorrect_records=step_incorrect_records_all,
+                step_correct_scores_all,
+                step_correct_records_all,
+                step_incorrect_scores_all,
+                step_incorrect_records_all,
             )
-            planner.prune_consumed(step)
+        else:
+            _run_planner_update(
+                planner, lock, step,
+                step_correct_scores_all, step_correct_records_all,
+                step_incorrect_scores_all, step_incorrect_records_all,
+            )
+
+
+def _run_planner_update(
+    planner,
+    lock,
+    step,
+    correct_scores,
+    correct_records,
+    incorrect_scores,
+    incorrect_records,
+):
+    """Update the future-window planner on its own dedicated sequential thread."""
+    with lock:
+        planner.update_from_step_payload(
+            step,
+            correct_scores=correct_scores,
+            correct_records=correct_records,
+            incorrect_scores=incorrect_scores,
+            incorrect_records=incorrect_records,
+        )
+        planner.prune_consumed(step)
 
 
 # -----------------------------------------------------------------------------
@@ -1342,6 +1381,7 @@ while True:
             args.sparse_loss_topk_correct,
             args.sparse_loss_topk_incorrect,
             sparse_loss_analysis_writer,
+            _topk_planner_executor,
             sparse_future_window_planner,
             _topk_analysis_lock,
         )
@@ -1576,6 +1616,10 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
+if _topk_analysis_executor is not None:
+    _topk_analysis_executor.shutdown(wait=True)
+if _topk_planner_executor is not None:
+    _topk_planner_executor.shutdown(wait=True)
 if sparse_loss_analysis_writer is not None:
     sparse_loss_analysis_writer.close()
 wandb_run.finish() # wandb run finish

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 import torch
@@ -296,6 +297,7 @@ class SparseLossAnalysisWriter:
         self._pending = []
         self._accumulate_steps = max(1, int(accumulate_steps))
         self._step_buffer: list[tuple[int, dict]] = []
+        self._lock = Lock()
 
     def submit(self, step: int, payload: dict[str, torch.Tensor | int]) -> None:
         cpu_payload = {}
@@ -304,11 +306,13 @@ class SparseLossAnalysisWriter:
                 cpu_payload[key] = value.detach().to(device="cpu")
             else:
                 cpu_payload[key] = value
-        self._step_buffer.append((int(step), cpu_payload))
-        if len(self._step_buffer) >= self._accumulate_steps:
-            self._commit_buffer()
+        with self._lock:
+            self._step_buffer.append((int(step), cpu_payload))
+            if len(self._step_buffer) >= self._accumulate_steps:
+                self._commit_buffer_locked()
 
-    def _commit_buffer(self) -> None:
+    def _commit_buffer_locked(self) -> None:
+        """Must be called with self._lock held."""
         if not self._step_buffer:
             return
         batch = self._step_buffer
@@ -323,7 +327,8 @@ class SparseLossAnalysisWriter:
             future.result()
 
     def flush(self) -> None:
-        self._commit_buffer()
+        with self._lock:
+            self._commit_buffer_locked()
         while self._pending:
             self._pending.pop(0).result()
 
