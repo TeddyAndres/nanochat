@@ -284,26 +284,46 @@ def collect_sparse_loss_topk_from_stats(
 
 
 class SparseLossAnalysisWriter:
-    def __init__(self, output_dir: str | Path | None, token_cache_dir: str | Path | None):
+    def __init__(
+        self,
+        output_dir: str | Path | None,
+        token_cache_dir: str | Path | None,
+        accumulate_steps: int = 10,
+    ):
         self.output_dir = resolve_sparse_analysis_dir(output_dir, token_cache_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._pending = []
+        self._accumulate_steps = max(1, int(accumulate_steps))
+        self._step_buffer: list[tuple[int, dict]] = []
 
     def submit(self, step: int, payload: dict[str, torch.Tensor | int]) -> None:
-        output_path = self.output_dir / f"step_{int(step):06d}.pt"
         cpu_payload = {}
         for key, value in payload.items():
             if isinstance(value, torch.Tensor):
                 cpu_payload[key] = value.detach().to(device="cpu")
             else:
                 cpu_payload[key] = value
-        self._pending.append(self._executor.submit(torch.save, cpu_payload, output_path))
+        self._step_buffer.append((int(step), cpu_payload))
+        if len(self._step_buffer) >= self._accumulate_steps:
+            self._commit_buffer()
+
+    def _commit_buffer(self) -> None:
+        if not self._step_buffer:
+            return
+        batch = self._step_buffer
+        self._step_buffer = []
+        first_step = batch[0][0]
+        last_step = batch[-1][0]
+        output_path = self.output_dir / f"steps_{first_step:06d}_{last_step:06d}.pt"
+        save_data = {step: p for step, p in batch}
+        self._pending.append(self._executor.submit(torch.save, save_data, output_path))
         if len(self._pending) > 8:
             future = self._pending.pop(0)
             future.result()
 
     def flush(self) -> None:
+        self._commit_buffer()
         while self._pending:
             self._pending.pop(0).result()
 
