@@ -40,8 +40,11 @@ from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CL
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.prefetch import AsyncLoaderPrefetcher
 from nanochat.sparse_analysis import (
+    SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
     SPARSE_LOSS_TOPK_RANKING_MODES,
     SparseLossAnalysisWriter,
+    collect_sparse_loss_candidate_pool_from_stats,
+    collect_sparse_loss_topk_from_candidate_pool,
     collect_sparse_loss_topk_from_stats,
     merge_topk_records,
     select_topk_records,
@@ -814,18 +817,14 @@ def _run_topk_analysis(
     step_incorrect_records_all = None
 
     for entry in transferred_microsteps:
-        payload = collect_sparse_loss_topk_from_stats(
-            entry["targets"],
+        payload = collect_sparse_loss_topk_from_candidate_pool(
             entry["active_ids_cpu"],
+            correct_candidate_scores=entry["correct_candidate_scores"],
+            correct_candidate_records=entry["correct_candidate_records"],
+            incorrect_candidate_scores=entry["incorrect_candidate_scores"],
+            incorrect_candidate_records=entry["incorrect_candidate_records"],
             topk_correct=None,
             topk_incorrect=None,
-            step=step,
-            micro_step=entry["micro_step"],
-            sequence_id=entry["sequence_id"],
-            losses=entry["token_losses"],
-            top2_logits=entry["top2_logits"],
-            top2_local=entry["top2_local"],
-            target_logits=entry["target_logits"],
             ranking_mode=ranking_mode,
         )
         step_correct_scores_all, step_correct_records_all = merge_topk_records(
@@ -1237,8 +1236,8 @@ while True:
             else:
                 loss = model_result
             if args.sparse_loss_topk_enable:
-                # Stash compact GPU tensors; all heavy analysis runs after the optimizer
-                # in a background thread — no CUDA sync barriers in the fwd-bwd window.
+                # Stash GPU sparse-analysis tensors. We prune them on device after the
+                # optimizer step so CPU only sees a bounded candidate pool per microstep.
                 analysis_active_ids_cpu = sparse_step_ctx.lm_head_active_ids_cpu if sparse_step_ctx.lm_head_active_ids_cpu is not None else sparse_step_ctx.active_ids_cpu
                 _micro_analysis.append({
                     "targets": y_for_loss,
@@ -1369,20 +1368,29 @@ while True:
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
     if args.sparse_loss_topk_enable and _micro_analysis and _topk_analysis_executor is not None:
-        # Fire non-blocking D2H for all compact GPU tensors accumulated across micro-steps.
-        # The background thread waits on the CUDA event; the main thread continues immediately.
+        # GPU-prune each microstep to a bounded candidate pool before D2H.
+        # The background thread receives only the reduced candidate tensors.
         _topk_event = torch.cuda.Event() if device_type == "cuda" else None
         _transferred = []
         for _entry in _micro_analysis:
+            candidate_payload = collect_sparse_loss_candidate_pool_from_stats(
+                _entry["targets"],
+                candidate_pool_correct=SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
+                candidate_pool_incorrect=SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
+                step=step,
+                micro_step=_entry["micro_step"],
+                sequence_id=_entry["sequence_id"],
+                losses=_entry["token_losses"],
+                top2_logits=_entry["top2_logits"],
+                top2_local=_entry["top2_local"],
+                target_logits=_entry["target_logits"],
+            )
             _transferred.append({
-                "targets": _entry["targets"].to(device="cpu", non_blocking=True),
-                "token_losses": _entry["token_losses"].to(device="cpu", non_blocking=True),
-                "top2_logits": _entry["top2_logits"].to(device="cpu", non_blocking=True),
-                "top2_local": _entry["top2_local"].to(device="cpu", non_blocking=True),
-                "target_logits": _entry["target_logits"].to(device="cpu", non_blocking=True),
+                "correct_candidate_scores": candidate_payload["correct_candidate_scores"].to(device="cpu", non_blocking=True),
+                "correct_candidate_records": candidate_payload["correct_candidate_records"].to(device="cpu", non_blocking=True),
+                "incorrect_candidate_scores": candidate_payload["incorrect_candidate_scores"].to(device="cpu", non_blocking=True),
+                "incorrect_candidate_records": candidate_payload["incorrect_candidate_records"].to(device="cpu", non_blocking=True),
                 "active_ids_cpu": _entry["active_ids_cpu"],
-                "micro_step": _entry["micro_step"],
-                "sequence_id": _entry["sequence_id"],
             })
         if _topk_event is not None:
             _topk_event.record()

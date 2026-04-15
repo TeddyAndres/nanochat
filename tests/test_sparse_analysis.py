@@ -4,12 +4,17 @@ import torch
 
 import nanochat.sparse_analysis as sparse_analysis_module
 from nanochat.sparse_analysis import (
+    CORRECT_CANDIDATE_RECORD_COLS,
     CORRECT_RECORD_COLS,
+    INCORRECT_CANDIDATE_RECORD_COLS,
     INCORRECT_RECORD_COLS,
+    SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
     SPARSE_LOSS_TOPK_RANKING_ACCUMULATED,
     SPARSE_LOSS_TOPK_RANKING_SINGLE,
     SparseLossAnalysisWriter,
+    collect_sparse_loss_candidate_pool_from_stats,
     collect_sparse_loss_topk,
+    collect_sparse_loss_topk_from_candidate_pool,
     collect_sparse_loss_topk_from_stats,
     resolve_sparse_analysis_dir,
     merge_topk_records,
@@ -255,6 +260,89 @@ def test_collect_sparse_loss_topk_accumulated_mode_sums_duplicate_scores():
 
     assert payload["correct_scores"].tolist() == [4.0]
     assert payload["incorrect_scores"].tolist() == [5.0]
+
+
+def test_collect_sparse_loss_candidate_pool_from_stats_prunes_raw_occurrences():
+    targets = torch.tensor([[0, 0, 0]], dtype=torch.long)
+    losses = torch.tensor([[1.0, 3.0, 2.0]], dtype=torch.float32)
+    top2_local = torch.tensor([[[1, 0], [1, 0], [1, 0]]], dtype=torch.long)
+    top2_logits = torch.tensor([[[2.5, 0.5], [4.5, 0.5], [3.5, 0.5]]], dtype=torch.float32)
+    target_logits = torch.tensor([[0.5, 0.5, 0.5]], dtype=torch.float32)
+
+    payload = collect_sparse_loss_candidate_pool_from_stats(
+        targets,
+        candidate_pool_correct=2,
+        candidate_pool_incorrect=1,
+        step=8,
+        micro_step=2,
+        sequence_id=31,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+    )
+
+    assert payload["correct_candidate_scores"].shape == (2,)
+    assert payload["correct_candidate_records"].shape == (2, CORRECT_CANDIDATE_RECORD_COLS)
+    assert payload["correct_candidate_scores"].tolist() == [3.0, 2.0]
+    assert payload["correct_candidate_records"][0, 4].item() == 1
+    assert payload["correct_candidate_records"][1, 4].item() == 2
+    assert payload["incorrect_candidate_scores"].shape == (1,)
+    assert payload["incorrect_candidate_records"].shape == (1, INCORRECT_CANDIDATE_RECORD_COLS)
+    assert payload["incorrect_candidate_scores"].tolist() == [4.0]
+    assert payload["incorrect_candidate_records"][0, 4].item() == 1
+
+
+def test_candidate_pool_finalization_matches_full_stats_path_when_pool_keeps_all_candidates():
+    targets = torch.tensor([[0, 0, 2, 1]], dtype=torch.long)
+    active_global_ids_cpu = torch.tensor([10, 20, 30], dtype=torch.long)
+    losses = torch.tensor([[1.0, 4.0, 0.5, 2.0]], dtype=torch.float32)
+    top2_local = torch.tensor([[[1, 0], [1, 0], [0, 2], [2, 1]]], dtype=torch.long)
+    top2_logits = torch.tensor([[[3.0, 0.5], [5.0, 1.0], [2.5, 2.0], [4.0, 1.5]]], dtype=torch.float32)
+    target_logits = torch.tensor([[0.5, 1.0, 2.0, 1.5]], dtype=torch.float32)
+
+    candidate_payload = collect_sparse_loss_candidate_pool_from_stats(
+        targets,
+        candidate_pool_correct=SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
+        candidate_pool_incorrect=SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
+        step=9,
+        micro_step=3,
+        sequence_id=17,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+    )
+
+    pool_payload = collect_sparse_loss_topk_from_candidate_pool(
+        active_global_ids_cpu,
+        correct_candidate_scores=candidate_payload["correct_candidate_scores"],
+        correct_candidate_records=candidate_payload["correct_candidate_records"],
+        incorrect_candidate_scores=candidate_payload["incorrect_candidate_scores"],
+        incorrect_candidate_records=candidate_payload["incorrect_candidate_records"],
+        topk_correct=None,
+        topk_incorrect=None,
+        ranking_mode=SPARSE_LOSS_TOPK_RANKING_SINGLE,
+    )
+    full_payload = collect_sparse_loss_topk_from_stats(
+        targets,
+        active_global_ids_cpu,
+        topk_correct=None,
+        topk_incorrect=None,
+        step=9,
+        micro_step=3,
+        sequence_id=17,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+        ranking_mode=SPARSE_LOSS_TOPK_RANKING_SINGLE,
+    )
+
+    assert torch.equal(pool_payload["correct_records"], full_payload["correct_records"])
+    assert torch.equal(pool_payload["incorrect_records"], full_payload["incorrect_records"])
+    assert torch.allclose(pool_payload["correct_scores"], full_payload["correct_scores"])
+    assert torch.allclose(pool_payload["incorrect_scores"], full_payload["incorrect_scores"])
 
 
 def test_collect_sparse_loss_topk_from_stats_matches_full_logits_path():

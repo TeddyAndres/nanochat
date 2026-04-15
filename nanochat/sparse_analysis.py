@@ -13,6 +13,9 @@ from nanochat.token_cache import resolve_token_cache_dir
 
 CORRECT_RECORD_COLS = 7
 INCORRECT_RECORD_COLS = 9
+CORRECT_CANDIDATE_RECORD_COLS = 6
+INCORRECT_CANDIDATE_RECORD_COLS = 7
+SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL = 500
 SPARSE_LOSS_TOPK_RANKING_SINGLE = "single"
 SPARSE_LOSS_TOPK_RANKING_ACCUMULATED = "accumulated"
 SPARSE_LOSS_TOPK_RANKING_MODES = (
@@ -64,6 +67,234 @@ def _empty_or_unbounded_records(topk: int | None, cols: int, *, device: torch.de
             torch.empty((0, cols), dtype=torch.long, device=device),
         )
     return _empty_records(topk, cols, device=device)
+
+
+def _prepare_sparse_analysis_stats(
+    targets: torch.Tensor,
+    *,
+    losses: torch.Tensor,
+    top2_logits: torch.Tensor,
+    top2_local: torch.Tensor,
+    target_logits: torch.Tensor,
+) -> tuple[torch.device, dict[str, torch.Tensor] | None]:
+    if targets.ndim != 2:
+        raise ValueError("Expected targets shape (B, T)")
+    if tuple(losses.shape) != tuple(targets.shape):
+        raise ValueError("Precomputed sparse token losses must match target shape")
+    if tuple(target_logits.shape) != tuple(targets.shape):
+        raise ValueError("Target logits must match target shape")
+    if top2_logits.shape[:2] != targets.shape or top2_local.shape[:2] != targets.shape:
+        raise ValueError("Top-k sparse analysis tensors must match target batch dimensions")
+    if top2_logits.size(-1) != top2_local.size(-1):
+        raise ValueError("Top-k sparse analysis logits and ids must have matching widths")
+
+    device = losses.device
+    valid_mask = targets != -1
+    if not valid_mask.any():
+        return device, None
+
+    flat_targets = targets.view(-1)
+    flat_losses = losses.to(device=device, dtype=torch.float32).view(-1)
+    flat_target_logits = target_logits.to(device=device, dtype=torch.float32).view(-1)
+    flat_top2_logits = top2_logits.to(device=device, dtype=torch.float32).view(-1, top2_logits.size(-1))
+    flat_top2_local = top2_local.to(device=device, dtype=torch.long).view(-1, top2_local.size(-1))
+    flat_valid = valid_mask.view(-1)
+    flat_indices = torch.nonzero(flat_valid, as_tuple=False).flatten()
+    return device, {
+        "row_idx": flat_indices // targets.size(1),
+        "pos_idx": flat_indices % targets.size(1),
+        "valid_targets": flat_targets[flat_valid],
+        "valid_losses": flat_losses[flat_valid],
+        "valid_target_logits": flat_target_logits[flat_valid],
+        "valid_top2_logits": flat_top2_logits[flat_valid],
+        "valid_top2_local": flat_top2_local[flat_valid],
+    }
+
+
+def collect_sparse_loss_candidate_pool_from_stats(
+    targets: torch.Tensor,
+    *,
+    candidate_pool_correct: int | None,
+    candidate_pool_incorrect: int | None,
+    step: int,
+    micro_step: int,
+    sequence_id: int = -1,
+    losses: torch.Tensor,
+    top2_logits: torch.Tensor,
+    top2_local: torch.Tensor,
+    target_logits: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    device, prepared = _prepare_sparse_analysis_stats(
+        targets,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+    )
+    if prepared is None:
+        correct_scores, correct_records = _empty_or_unbounded_records(candidate_pool_correct, CORRECT_CANDIDATE_RECORD_COLS, device=device)
+        incorrect_scores, incorrect_records = _empty_or_unbounded_records(candidate_pool_incorrect, INCORRECT_CANDIDATE_RECORD_COLS, device=device)
+        return {
+            "correct_candidate_scores": correct_scores,
+            "correct_candidate_records": correct_records,
+            "incorrect_candidate_scores": incorrect_scores,
+            "incorrect_candidate_records": incorrect_records,
+        }
+
+    row_idx = prepared["row_idx"]
+    pos_idx = prepared["pos_idx"]
+    valid_targets = prepared["valid_targets"]
+    valid_losses = prepared["valid_losses"]
+    valid_target_logits = prepared["valid_target_logits"]
+    valid_top2_logits = prepared["valid_top2_logits"]
+    valid_top2_local = prepared["valid_top2_local"]
+
+    pred_local = valid_top2_local[:, 0]
+    underpred_mask = pred_local != valid_targets
+    correct_candidate_scores = valid_losses[underpred_mask]
+    correct_candidate_records = torch.stack(
+        (
+            torch.full_like(row_idx[underpred_mask], int(step)),
+            torch.full_like(row_idx[underpred_mask], int(micro_step)),
+            torch.full_like(row_idx[underpred_mask], int(sequence_id)),
+            row_idx[underpred_mask].to(dtype=torch.long),
+            pos_idx[underpred_mask].to(dtype=torch.long),
+            valid_targets[underpred_mask].to(dtype=torch.long),
+        ),
+        dim=1,
+    ) if underpred_mask.any() else torch.empty((0, CORRECT_CANDIDATE_RECORD_COLS), dtype=torch.long, device=device)
+    correct_candidate_scores, correct_candidate_records = _topk_from_candidates(
+        correct_candidate_scores,
+        correct_candidate_records,
+        topk=candidate_pool_correct,
+    )
+
+    wrong_local = valid_top2_local[:, 0]
+    wrong_logit = valid_top2_logits[:, 0]
+    if valid_top2_local.size(1) > 1:
+        choose_second = wrong_local == valid_targets
+        wrong_local = torch.where(choose_second, valid_top2_local[:, 1], wrong_local)
+        wrong_logit = torch.where(choose_second, valid_top2_logits[:, 1], wrong_logit)
+    valid_wrong_mask = (wrong_local != valid_targets) & (wrong_local >= 0)
+    incorrect_candidate_scores = (wrong_logit - valid_target_logits)[valid_wrong_mask]
+    incorrect_candidate_records = torch.stack(
+        (
+            torch.full_like(row_idx[valid_wrong_mask], int(step)),
+            torch.full_like(row_idx[valid_wrong_mask], int(micro_step)),
+            torch.full_like(row_idx[valid_wrong_mask], int(sequence_id)),
+            row_idx[valid_wrong_mask].to(dtype=torch.long),
+            pos_idx[valid_wrong_mask].to(dtype=torch.long),
+            valid_targets[valid_wrong_mask].to(dtype=torch.long),
+            wrong_local[valid_wrong_mask].to(dtype=torch.long),
+        ),
+        dim=1,
+    ) if valid_wrong_mask.any() else torch.empty((0, INCORRECT_CANDIDATE_RECORD_COLS), dtype=torch.long, device=device)
+    incorrect_candidate_scores, incorrect_candidate_records = _topk_from_candidates(
+        incorrect_candidate_scores,
+        incorrect_candidate_records,
+        topk=candidate_pool_incorrect,
+    )
+
+    return {
+        "correct_candidate_scores": correct_candidate_scores,
+        "correct_candidate_records": correct_candidate_records,
+        "incorrect_candidate_scores": incorrect_candidate_scores,
+        "incorrect_candidate_records": incorrect_candidate_records,
+    }
+
+
+def _map_correct_candidate_records_to_global(
+    candidate_scores: torch.Tensor,
+    candidate_records: torch.Tensor,
+    *,
+    active_global_ids_cpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_mask = torch.isfinite(candidate_scores)
+    if not valid_mask.any():
+        return (
+            torch.empty((0,), dtype=torch.float32, device=candidate_scores.device),
+            torch.empty((0, CORRECT_RECORD_COLS), dtype=torch.long, device=candidate_records.device),
+        )
+    candidate_scores = candidate_scores[valid_mask].to(dtype=torch.float32)
+    candidate_records = candidate_records[valid_mask].to(dtype=torch.long)
+    active_global_ids = active_global_ids_cpu.to(device=candidate_records.device, dtype=torch.long)
+    target_local = candidate_records[:, 5].clamp_min(0)
+    target_global = active_global_ids.index_select(0, target_local)
+    final_records = torch.cat((candidate_records, target_global.unsqueeze(1)), dim=1)
+    return candidate_scores, final_records
+
+
+def _map_incorrect_candidate_records_to_global(
+    candidate_scores: torch.Tensor,
+    candidate_records: torch.Tensor,
+    *,
+    active_global_ids_cpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_mask = torch.isfinite(candidate_scores)
+    if not valid_mask.any():
+        return (
+            torch.empty((0,), dtype=torch.float32, device=candidate_scores.device),
+            torch.empty((0, INCORRECT_RECORD_COLS), dtype=torch.long, device=candidate_records.device),
+        )
+    candidate_scores = candidate_scores[valid_mask].to(dtype=torch.float32)
+    candidate_records = candidate_records[valid_mask].to(dtype=torch.long)
+    active_global_ids = active_global_ids_cpu.to(device=candidate_records.device, dtype=torch.long)
+    target_local = candidate_records[:, 5].clamp_min(0)
+    wrong_local = candidate_records[:, 6].clamp_min(0)
+    target_global = active_global_ids.index_select(0, target_local)
+    wrong_global = active_global_ids.index_select(0, wrong_local)
+    final_records = torch.cat(
+        (
+            candidate_records[:, :6],
+            target_global.unsqueeze(1),
+            candidate_records[:, 6:7],
+            wrong_global.unsqueeze(1),
+        ),
+        dim=1,
+    )
+    return candidate_scores, final_records
+
+
+def collect_sparse_loss_topk_from_candidate_pool(
+    active_global_ids_cpu: torch.Tensor,
+    *,
+    correct_candidate_scores: torch.Tensor,
+    correct_candidate_records: torch.Tensor,
+    incorrect_candidate_scores: torch.Tensor,
+    incorrect_candidate_records: torch.Tensor,
+    topk_correct: int | None,
+    topk_incorrect: int | None,
+    ranking_mode: SparseLossTopkRankingMode = SPARSE_LOSS_TOPK_RANKING_SINGLE,
+) -> dict[str, torch.Tensor]:
+    ranking_mode = normalize_sparse_topk_ranking_mode(ranking_mode)
+    correct_scores, correct_records = _map_correct_candidate_records_to_global(
+        correct_candidate_scores,
+        correct_candidate_records,
+        active_global_ids_cpu=active_global_ids_cpu,
+    )
+    incorrect_scores, incorrect_records = _map_incorrect_candidate_records_to_global(
+        incorrect_candidate_scores,
+        incorrect_candidate_records,
+        active_global_ids_cpu=active_global_ids_cpu,
+    )
+    correct_scores, correct_records = aggregate_sparse_loss_candidates(
+        correct_scores,
+        correct_records,
+        ranking_mode=ranking_mode,
+    )
+    incorrect_scores, incorrect_records = aggregate_sparse_loss_candidates(
+        incorrect_scores,
+        incorrect_records,
+        ranking_mode=ranking_mode,
+    )
+    correct_scores, correct_records = _topk_from_candidates(correct_scores, correct_records, topk=topk_correct)
+    incorrect_scores, incorrect_records = _topk_from_candidates(incorrect_scores, incorrect_records, topk=topk_incorrect)
+    return {
+        "correct_scores": correct_scores,
+        "correct_records": correct_records,
+        "incorrect_scores": incorrect_scores,
+        "incorrect_records": incorrect_records,
+    }
 
 
 def _topk_from_candidates(
@@ -253,22 +484,16 @@ def collect_sparse_loss_topk_from_stats(
     target_logits: torch.Tensor,
     ranking_mode: SparseLossTopkRankingMode = SPARSE_LOSS_TOPK_RANKING_SINGLE,
 ) -> dict[str, torch.Tensor]:
-    if targets.ndim != 2:
-        raise ValueError("Expected targets shape (B, T)")
-    if tuple(losses.shape) != tuple(targets.shape):
-        raise ValueError("Precomputed sparse token losses must match target shape")
-    if tuple(target_logits.shape) != tuple(targets.shape):
-        raise ValueError("Target logits must match target shape")
-    if top2_logits.shape[:2] != targets.shape or top2_local.shape[:2] != targets.shape:
-        raise ValueError("Top-k sparse analysis tensors must match target batch dimensions")
-    if top2_logits.size(-1) != top2_local.size(-1):
-        raise ValueError("Top-k sparse analysis logits and ids must have matching widths")
-
     ranking_mode = normalize_sparse_topk_ranking_mode(ranking_mode)
-    device = losses.device
+    device, prepared = _prepare_sparse_analysis_stats(
+        targets,
+        losses=losses,
+        top2_logits=top2_logits,
+        top2_local=top2_local,
+        target_logits=target_logits,
+    )
     active_global_ids = active_global_ids_cpu.to(device=device, dtype=torch.long)
-    valid_mask = targets != -1
-    if not valid_mask.any():
+    if prepared is None:
         correct_scores, correct_records = _empty_or_unbounded_records(topk_correct, CORRECT_RECORD_COLS, device=device)
         incorrect_scores, incorrect_records = _empty_or_unbounded_records(topk_incorrect, INCORRECT_RECORD_COLS, device=device)
         return {
@@ -278,23 +503,16 @@ def collect_sparse_loss_topk_from_stats(
             "incorrect_records": incorrect_records,
         }
 
-    flat_targets = targets.view(-1)
-    flat_losses = losses.to(device=device, dtype=torch.float32).view(-1)
-    flat_target_logits = target_logits.to(device=device, dtype=torch.float32).view(-1)
-    flat_top2_logits = top2_logits.to(device=device, dtype=torch.float32).view(-1, top2_logits.size(-1))
-    flat_top2_local = top2_local.to(device=device, dtype=torch.long).view(-1, top2_local.size(-1))
-    flat_valid = valid_mask.view(-1)
-    flat_indices = torch.nonzero(flat_valid, as_tuple=False).flatten()
-    valid_targets = flat_targets[flat_valid]
-    valid_losses = flat_losses[flat_valid]
-    valid_target_logits = flat_target_logits[flat_valid]
-    valid_top2_logits = flat_top2_logits[flat_valid]
-    valid_top2_local = flat_top2_local[flat_valid]
+    row_idx = prepared["row_idx"]
+    pos_idx = prepared["pos_idx"]
+    valid_targets = prepared["valid_targets"]
+    valid_losses = prepared["valid_losses"]
+    valid_target_logits = prepared["valid_target_logits"]
+    valid_top2_logits = prepared["valid_top2_logits"]
+    valid_top2_local = prepared["valid_top2_local"]
 
     pred_local = valid_top2_local[:, 0]
     underpred_mask = pred_local != valid_targets
-    row_idx = flat_indices // targets.size(1)
-    pos_idx = flat_indices % targets.size(1)
     target_global = active_global_ids.index_select(0, valid_targets.to(dtype=torch.long))
 
     correct_candidate_scores = valid_losses[underpred_mask]
