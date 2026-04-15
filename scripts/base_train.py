@@ -22,6 +22,8 @@ import json
 import time
 import math
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -532,9 +534,12 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 token_cache_workers = max(1, args.token_cache_workers) if args.token_cache_workers > 0 else max(1, min(8, os.cpu_count() or 1))
 sparse_loss_analysis_writer = None
 sparse_future_window_planner = None
+_topk_analysis_executor = None
+_topk_analysis_lock = threading.Lock()
 if args.sparse_loss_topk_enable:
     assert args.sparse_mode, "--sparse-loss-topk-enable requires --sparse-mode"
     sparse_loss_analysis_writer = SparseLossAnalysisWriter(args.sparse_loss_topk_output, args.token_cache_dir)
+    _topk_analysis_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="topk_analysis")
 if args.sparse_future_replan_enable:
     assert args.sparse_mode, "--sparse-future-replan-enable requires --sparse-mode"
     assert hybrid_sparse, "--sparse-future-replan-enable requires --sparse-manifest"
@@ -761,6 +766,100 @@ def compute_global_grad_norm(optimizer, extra_params=None):
             grad /= world_size
         total_sq += grad.float().pow(2).sum(dtype=torch.float64)
     return total_sq.sqrt().item()
+
+# -----------------------------------------------------------------------------
+# Off-hot-path sparse loss topk analysis
+# Runs in a background thread so it never stalls the fwd-bwd-opt critical path.
+
+def _run_topk_analysis(
+    event,
+    transferred_microsteps,
+    step,
+    topk_correct,
+    topk_incorrect,
+    writer,
+    planner,
+    lock,
+):
+    """
+    Process sparse loss topk analysis on CPU in a background thread.
+
+    All tensors in `transferred_microsteps` are already on CPU (D2H was fired
+    non-blocking from the main thread).  We wait for those transfers here, inside
+    this thread, via event.synchronize() — the main thread never blocks.
+    """
+    if event is not None:
+        event.synchronize()
+
+    step_correct_scores_all = None
+    step_correct_records_all = None
+    step_incorrect_scores_all = None
+    step_incorrect_records_all = None
+
+    for entry in transferred_microsteps:
+        payload = collect_sparse_loss_topk_from_stats(
+            entry["targets"],
+            entry["active_ids_cpu"],
+            topk_correct=None,
+            topk_incorrect=None,
+            step=step,
+            micro_step=entry["micro_step"],
+            sequence_id=entry["sequence_id"],
+            losses=entry["token_losses"],
+            top2_logits=entry["top2_logits"],
+            top2_local=entry["top2_local"],
+            target_logits=entry["target_logits"],
+        )
+        step_correct_scores_all, step_correct_records_all = merge_topk_records(
+            step_correct_scores_all,
+            step_correct_records_all,
+            payload["correct_scores"],
+            payload["correct_records"],
+            topk=topk_correct,
+        )
+        step_incorrect_scores_all, step_incorrect_records_all = merge_topk_records(
+            step_incorrect_scores_all,
+            step_incorrect_records_all,
+            payload["incorrect_scores"],
+            payload["incorrect_records"],
+            topk=topk_incorrect,
+        )
+
+    if step_correct_scores_all is None or step_correct_records_all is None:
+        return
+    if step_incorrect_scores_all is None or step_incorrect_records_all is None:
+        return
+
+    bounded_correct_scores, bounded_correct_records = select_topk_records(
+        step_correct_scores_all,
+        step_correct_records_all,
+        topk=topk_correct,
+    )
+    bounded_incorrect_scores, bounded_incorrect_records = select_topk_records(
+        step_incorrect_scores_all,
+        step_incorrect_records_all,
+        topk=topk_incorrect,
+    )
+    analysis_cpu_payload = {
+        "step": step,
+        "correct_scores": bounded_correct_scores,
+        "correct_records": bounded_correct_records,
+        "incorrect_scores": bounded_incorrect_scores,
+        "incorrect_records": bounded_incorrect_records,
+    }
+    if writer is not None:
+        writer.submit(step, analysis_cpu_payload)
+    if planner is not None:
+        with lock:
+            planner.update_from_step_payload(
+                step,
+                correct_scores=step_correct_scores_all,
+                correct_records=step_correct_records_all,
+                incorrect_scores=step_incorrect_scores_all,
+                incorrect_records=step_incorrect_records_all,
+            )
+            planner.prune_consumed(step)
+
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -1037,10 +1136,7 @@ while True:
     sparse_apply_call_ms = 0.0
     sparse_cold_bias = get_sparse_cold_bias_scale(step)
     sparse_cold_row_decay = get_sparse_cold_row_decay(step)
-    step_correct_scores_all = None
-    step_correct_records_all = None
-    step_incorrect_scores_all = None
-    step_incorrect_records_all = None
+    _micro_analysis = []  # accumulates compact GPU tensors per micro-step for async topk analysis
     next_x = None
     next_y = None
     next_sparse_batch_meta = None
@@ -1070,7 +1166,7 @@ while True:
             sparse_metrics = sparse_step_ctx
             x_for_model = sparse_step_ctx.union_inputs if sparse_step_ctx.union_inputs is not None else current_x
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
-            analysis_logsumexp = None
+            analysis_token_losses = None
             analysis_top2_logits = None
             analysis_top2_local = None
             analysis_target_logits = None
@@ -1084,44 +1180,23 @@ while True:
             )
             sparse_forward_call_ms += (time.perf_counter() - forward_t0) * 1000.0
             if args.sparse_loss_topk_enable:
-                loss, analysis_logsumexp, analysis_top2_logits, analysis_top2_local, analysis_target_logits = model_result
+                loss, analysis_token_losses, analysis_top2_logits, analysis_top2_local, analysis_target_logits = model_result
             else:
                 loss = model_result
             if args.sparse_loss_topk_enable:
+                # Stash compact GPU tensors; all heavy analysis runs after the optimizer
+                # in a background thread — no CUDA sync barriers in the fwd-bwd window.
                 analysis_active_ids_cpu = sparse_step_ctx.lm_head_active_ids_cpu if sparse_step_ctx.lm_head_active_ids_cpu is not None else sparse_step_ctx.active_ids_cpu
-                assert analysis_logsumexp is not None
-                assert analysis_top2_logits is not None
-                assert analysis_top2_local is not None
-                assert analysis_target_logits is not None
-                analysis_token_losses = analysis_logsumexp.detach() - analysis_target_logits.detach().to(dtype=torch.float32)
-                with torch.no_grad():
-                    analysis_payload = collect_sparse_loss_topk_from_stats(
-                        y_for_loss,
-                        analysis_active_ids_cpu,
-                        topk_correct=None,
-                        topk_incorrect=None,
-                        step=step,
-                        micro_step=micro_step,
-                        sequence_id=int(sparse_batch_meta.get("sequence_id", -1)),
-                        losses=analysis_token_losses.detach(),
-                        top2_logits=analysis_top2_logits.detach(),
-                        top2_local=analysis_top2_local.detach(),
-                        target_logits=analysis_target_logits.detach(),
-                    )
-                step_correct_scores_all, step_correct_records_all = merge_topk_records(
-                    step_correct_scores_all,
-                    step_correct_records_all,
-                    analysis_payload["correct_scores"],
-                    analysis_payload["correct_records"],
-                    topk=None,
-                )
-                step_incorrect_scores_all, step_incorrect_records_all = merge_topk_records(
-                    step_incorrect_scores_all,
-                    step_incorrect_records_all,
-                    analysis_payload["incorrect_scores"],
-                    analysis_payload["incorrect_records"],
-                    topk=None,
-                )
+                _micro_analysis.append({
+                    "targets": y_for_loss,
+                    "token_losses": analysis_token_losses.detach(),
+                    "top2_logits": analysis_top2_logits.detach(),
+                    "top2_local": analysis_top2_local.detach(),
+                    "target_logits": analysis_target_logits.detach(),
+                    "active_ids_cpu": analysis_active_ids_cpu,
+                    "micro_step": micro_step,
+                    "sequence_id": int(sparse_batch_meta.get("sequence_id", -1)),
+                })
         else:
             forward_t0 = time.perf_counter()
             loss = model(current_x, current_y)
@@ -1240,39 +1315,36 @@ while True:
             sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
-    if args.sparse_loss_topk_enable and step_correct_scores_all is not None and step_correct_records_all is not None and step_incorrect_scores_all is not None and step_incorrect_records_all is not None:
-        step_correct_scores_cpu = step_correct_scores_all.detach().to(device="cpu")
-        step_correct_records_cpu = step_correct_records_all.detach().to(device="cpu")
-        step_incorrect_scores_cpu = step_incorrect_scores_all.detach().to(device="cpu")
-        step_incorrect_records_cpu = step_incorrect_records_all.detach().to(device="cpu")
-        bounded_correct_scores, bounded_correct_records = select_topk_records(
-            step_correct_scores_cpu,
-            step_correct_records_cpu,
-            topk=args.sparse_loss_topk_correct,
+    if args.sparse_loss_topk_enable and _micro_analysis and _topk_analysis_executor is not None:
+        # Fire non-blocking D2H for all compact GPU tensors accumulated across micro-steps.
+        # The background thread waits on the CUDA event; the main thread continues immediately.
+        _topk_event = torch.cuda.Event() if device_type == "cuda" else None
+        _transferred = []
+        for _entry in _micro_analysis:
+            _transferred.append({
+                "targets": _entry["targets"].to(device="cpu", non_blocking=True),
+                "token_losses": _entry["token_losses"].to(device="cpu", non_blocking=True),
+                "top2_logits": _entry["top2_logits"].to(device="cpu", non_blocking=True),
+                "top2_local": _entry["top2_local"].to(device="cpu", non_blocking=True),
+                "target_logits": _entry["target_logits"].to(device="cpu", non_blocking=True),
+                "active_ids_cpu": _entry["active_ids_cpu"],
+                "micro_step": _entry["micro_step"],
+                "sequence_id": _entry["sequence_id"],
+            })
+        if _topk_event is not None:
+            _topk_event.record()
+        _micro_analysis.clear()
+        _topk_analysis_executor.submit(
+            _run_topk_analysis,
+            _topk_event,
+            _transferred,
+            step,
+            args.sparse_loss_topk_correct,
+            args.sparse_loss_topk_incorrect,
+            sparse_loss_analysis_writer,
+            sparse_future_window_planner,
+            _topk_analysis_lock,
         )
-        bounded_incorrect_scores, bounded_incorrect_records = select_topk_records(
-            step_incorrect_scores_cpu,
-            step_incorrect_records_cpu,
-            topk=args.sparse_loss_topk_incorrect,
-        )
-        analysis_cpu_payload = {
-            "step": step,
-            "correct_scores": bounded_correct_scores,
-            "correct_records": bounded_correct_records,
-            "incorrect_scores": bounded_incorrect_scores,
-            "incorrect_records": bounded_incorrect_records,
-        }
-        if sparse_loss_analysis_writer is not None:
-            sparse_loss_analysis_writer.submit(step, analysis_cpu_payload)
-        if sparse_future_window_planner is not None:
-            sparse_future_window_planner.update_from_step_payload(
-                step,
-                correct_scores=step_correct_scores_cpu,
-                correct_records=step_correct_records_cpu,
-                incorrect_scores=step_incorrect_scores_cpu,
-                incorrect_records=step_incorrect_records_cpu,
-            )
-            sparse_future_window_planner.prune_consumed(step)
     model.zero_grad(set_to_none=True)
     should_trim_sparse_cache = False
     if (

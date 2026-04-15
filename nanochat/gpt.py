@@ -577,7 +577,14 @@ class GPT(nn.Module):
                 analysis_logits = logits.detach()
                 safe_targets = targets.clamp_min(0)
                 target_logits = analysis_logits.gather(2, safe_targets.unsqueeze(-1)).squeeze(-1)
-                analysis_logsumexp = torch.logsumexp(analysis_logits.to(dtype=torch.float32), dim=-1)
+                # Per-token CE losses reuse the same fused kernel path as the main loss above —
+                # no extra logsumexp pass over B×T×V is needed.
+                analysis_token_losses = F.cross_entropy(
+                    analysis_logits.to(dtype=torch.float32).view(-1, analysis_logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                    reduction="none",
+                ).view_as(targets)
                 analysis_k = min(2, analysis_logits.size(-1))
                 topk_logits, topk_local = torch.topk(analysis_logits, k=analysis_k, dim=-1)
                 if analysis_k < 2:
@@ -596,7 +603,7 @@ class GPT(nn.Module):
                         ),
                         dim=-1,
                     )
-                return loss.float(), analysis_logsumexp, topk_logits, topk_local, target_logits
+                return loss.float(), analysis_token_losses, topk_logits, topk_local, target_logits
             if return_logits and return_token_losses:
                 return loss.float(), logits, token_losses
             if return_logits:
