@@ -15,7 +15,7 @@ from nanochat.sparse_manifest import (
 
 
 def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
-    base_shard_path = tmp_path / "sequence_base_shard_000.sqlite"
+    base_shard_path = tmp_path / "sequence_base_shard_000.pt"
     base_manifest_path = tmp_path / "sequence_base.json"
     grouping_shard_path = tmp_path / "grouping_shard_000.json"
     grouping_manifest_path = tmp_path / "grouping_manifest.json"
@@ -522,6 +522,189 @@ def test_manifest_loader_applies_runtime_step_override(monkeypatch, tmp_path):
     assert torch.equal(targets1, torch.tensor([[1, 2]], dtype=torch.long))
     assert torch.equal(step_meta1["active_ids_cpu"], torch.tensor([2, 3, 4, 9], dtype=torch.long))
     assert torch.equal(step_meta1["stage_ids_cpu"], torch.tensor([2, 3, 4, 9], dtype=torch.long))
+    assert state1["manifest_step"] == 1
+
+
+def test_manifest_loader_uses_sequence_base_manifest_for_runtime_overrides(monkeypatch, tmp_path):
+    base_shard_path = tmp_path / "sequence_base_shard_000.pt"
+    base_manifest_path = tmp_path / "sequence_base.json"
+    grouping_shard_path = tmp_path / "grouping_shard_000.json"
+    grouping_manifest_path = tmp_path / "grouping_manifest.json"
+
+    sequence_units = [
+        {
+            "sequence_id": 0,
+            "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 0},
+            "inputs": [[11, 12]],
+            "targets": [[12, 11]],
+            "num_unique_tokens": 2,
+            "unique_token_ids": [11, 12],
+            "sequence_geometry": {"rows": 1, "tokens": 2},
+        },
+        {
+            "sequence_id": 1,
+            "state_dict": {"pq_idx": 1, "rg_idx": 0, "epoch": 0},
+            "inputs": [[21, 22]],
+            "targets": [[22, 21]],
+            "num_unique_tokens": 2,
+            "unique_token_ids": [21, 22],
+            "sequence_geometry": {"rows": 1, "tokens": 2},
+        },
+    ]
+    save_sequence_manifest_shard(
+        base_shard_path,
+        build_sequence_manifest_shard_payload(shard_index=0, start_sequence_id=0, sequence_units=sequence_units),
+    )
+    save_sparse_manifest(
+        base_manifest_path,
+        build_sequence_manifest_payload(
+            split="train",
+            vocab_size=128,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=2,
+            grad_accum_steps=1,
+            ddp_world_size=1,
+            num_iterations=2,
+            buffer_size=2,
+            num_sequence_units=2,
+            shard_sequence_count=2,
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(base_shard_path.relative_to(tmp_path)),
+                    "start_sequence_id": 0,
+                    "num_sequence_units": 2,
+                }
+            ],
+        ),
+    )
+
+    steps = [
+        {
+            "grad_accum_u_size": 2,
+            "grad_accum_active_ids": [11, 12],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "sequence_id": 0,
+                    "u_size": 2,
+                    "active_ids": [11, 12],
+                    "next_active_ids": [11, 12],
+                    "next_u_size": 2,
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                }
+            ],
+        },
+        {
+            "grad_accum_u_size": 2,
+            "grad_accum_active_ids": [11, 12],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "sequence_id": 0,
+                    "u_size": 2,
+                    "active_ids": [11, 12],
+                    "next_active_ids": [11, 12],
+                    "next_u_size": 2,
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                }
+            ],
+        },
+    ]
+    with grouping_shard_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "version": 4,
+                "manifest_kind": "grouping",
+                "shard_index": 0,
+                "start_step": 0,
+                "num_steps": 2,
+                "u_max": 3,
+                "grad_accum_u_max": 3,
+                "steps": steps,
+            },
+            f,
+        )
+    save_sparse_manifest(
+        grouping_manifest_path,
+        build_grouping_manifest_payload(
+            split="train",
+            vocab_size=128,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=2,
+            grad_accum_steps=1,
+            ddp_world_size=1,
+            num_iterations=2,
+            buffer_size=2,
+            u_max=3,
+            grad_accum_u_max=3,
+            shard_step_count=2,
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(grouping_shard_path.relative_to(tmp_path)),
+                    "start_step": 0,
+                    "num_steps": 2,
+                    "u_max": 3,
+                    "grad_accum_u_max": 3,
+                }
+            ],
+            base_manifest_path=str(base_manifest_path.relative_to(tmp_path)),
+        ),
+    )
+
+    def fail_if_live_loader_called(*args, **kwargs):
+        raise AssertionError("runtime override path should load from the sequence-base manifest")
+
+    monkeypatch.setattr(
+        dataloader_module,
+        "tokenizing_distributed_data_loader_with_state_bos_bestfit",
+        fail_if_live_loader_called,
+    )
+    def override_provider(step_index):
+        if step_index != 1:
+            return None
+        return {
+            "grad_accum_u_size": 3,
+            "grad_accum_active_ids": [21, 22, 99],
+            "microsteps": [
+                {
+                    "microstep": 0,
+                    "sequence_id": 1,
+                    "u_size": 3,
+                    "active_ids": [21, 22, 99],
+                    "next_active_ids": [21, 22, 99],
+                    "next_u_size": 3,
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                    "injected_negative_ids": [99],
+                }
+            ],
+        }
+
+    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
+        tokenizer=None,
+        B=1,
+        T=2,
+        split="train",
+        manifest_path=grouping_manifest_path,
+        device="cpu",
+        vocab_size=128,
+        include_local_batch=False,
+        step_override_provider=override_provider,
+    )
+
+    next(loader)
+    inputs1, targets1, step_meta1, state1 = next(loader)
+
+    assert torch.equal(inputs1, torch.tensor([[0, 1]], dtype=torch.long))
+    assert torch.equal(targets1, torch.tensor([[1, 0]], dtype=torch.long))
+    assert torch.equal(step_meta1["active_ids_cpu"], torch.tensor([21, 22, 99], dtype=torch.long))
+    assert torch.equal(step_meta1["stage_ids_cpu"], torch.tensor([21, 22, 99], dtype=torch.long))
     assert state1["manifest_step"] == 1
 
 

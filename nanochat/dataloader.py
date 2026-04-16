@@ -363,9 +363,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         )
 
     use_dual_manifest = (
-        bool(use_sequence_base_manifest) and
         manifest_version >= DUAL_SPARSE_MANIFEST_VERSION and
-        "base_manifest_path" in manifest
+        "base_manifest_path" in manifest and
+        (bool(use_sequence_base_manifest) or step_override_provider is not None)
     )
     base_loader = None
     resolve_sequence_unit = None
