@@ -130,6 +130,7 @@ parser.add_argument("--sparse-loss-topk-output", type=str, default="", help="dat
 parser.add_argument("--sparse-loss-window-steps", type=int, default=20, help="rolling optimizer-step window used to accumulate sparse loss totals for replanning")
 parser.add_argument("--sparse-future-replan-enable", action="store_true", help="use per-step sparse top-K tensors to build delayed future grouping overrides in memory")
 parser.add_argument("--sparse-future-replan-interval", type=int, default=3, help="number of optimizer steps of lead time before a single future manifest step is replanned; with the current prefetch depth this must be at least 3")
+parser.add_argument("--sparse-future-replan-negative-only", action="store_true", help="keep baseline future microsteps but inject hard negatives from sparse top-K results instead of reordering future sequences")
 parser.add_argument("--sparse-auto-negative-per-microstep", type=int, default=4, help="maximum number of automatic corrective cold negatives to inject per replanned microstep")
 parser.add_argument("--sparse-replan-sampling-seed", type=int, default=0, help="deterministic seed offset used when sampling from rolling sparse loss lists")
 parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip global gradient norm (dense params only) to this value before optimizer step; 0 = disabled")
@@ -570,6 +571,7 @@ if args.sparse_future_replan_enable:
         max_auto_negatives_per_microstep=args.sparse_auto_negative_per_microstep,
         sampling_seed=args.sparse_replan_sampling_seed,
         ranking_mode=args.sparse_loss_topk_ranking_mode,
+        negative_only=args.sparse_future_replan_negative_only,
     )
     if resuming and args.sparse_mode:
         planner_state = optimizer_data.get("sparse_planner") if isinstance(optimizer_data, dict) else None
@@ -589,6 +591,7 @@ if args.sparse_mode:
             vocab_size=vocab_size,
             include_local_batch=sparse_lm_head_clouds,
             step_override_provider=None if sparse_future_window_planner is None else sparse_future_window_planner.get_step_override,
+            use_sequence_base_manifest=None if sparse_future_window_planner is None else sparse_future_window_planner.requires_sequence_base_manifest,
             token_cache_dir=args.token_cache_dir,
             token_cache_shard_batches=args.token_cache_shard_batches,
             token_cache_workers=token_cache_workers,

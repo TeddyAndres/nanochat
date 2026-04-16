@@ -16,7 +16,7 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import cast
 
@@ -44,6 +44,9 @@ from nanochat.token_cache import (
     prepare_token_cache_writer,
     resolve_token_cache_dir,
 )
+
+
+DUAL_MANIFEST_TOKEN_BATCH_CACHE_LIMIT = 64
 
 
 def _tokenize_document_batch(tokenizer, text_batch, state, bos_token, tokenizer_threads):
@@ -319,7 +322,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     vocab_size=None,
     include_local_batch=False,
     step_override_provider=None,
-    use_sequence_base_manifest=False,
+    use_sequence_base_manifest=None,
     token_cache_dir="",
     token_cache_shard_batches=256,
     token_cache_workers=1,
@@ -362,15 +365,20 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             f"Sparse manifest step {manifest_step} is out of range for {num_manifest_steps} stored steps"
         )
 
+    override_requires_sequence_base_manifest = (
+        step_override_provider is not None
+        if use_sequence_base_manifest is None else
+        bool(use_sequence_base_manifest)
+    )
     use_dual_manifest = (
         manifest_version >= DUAL_SPARSE_MANIFEST_VERSION and
         "base_manifest_path" in manifest and
-        (bool(use_sequence_base_manifest) or step_override_provider is not None)
+        override_requires_sequence_base_manifest
     )
     base_loader = None
     resolve_sequence_unit = None
     resolved_cache_dir = None
-    token_batch_cache = {}
+    token_batch_cache = OrderedDict()
     if use_dual_manifest:
         base_manifest_path = resolve_grouping_base_manifest_path(manifest_path, manifest)
         base_manifest = load_sparse_manifest_header(base_manifest_path)
@@ -572,19 +580,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         global_to_slot[desired_active_ids] = new_slots
         return desired_active_ids.clone(), new_slots, leaving_ids, leaving_slots
 
-    def resolve_step_entry(step_index: int, default_step_entry: dict):
-        if step_override_provider is None:
-            return default_step_entry, False
-        override_entry = step_override_provider(step_index)
-        if override_entry is None:
-            return default_step_entry, False
-        return override_entry, True
-
     manifest_iter = stream_sparse_manifest_steps(manifest_path)
-    try:
-        current_step_entry, current_step_is_override = resolve_step_entry(0, next(manifest_iter))
-    except StopIteration as exc:
-        raise ValueError("Sparse manifest contains no step entries") from exc
 
     def get_microsteps(step_entry):
         if manifest_version >= 2:
@@ -593,6 +589,32 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                 raise ValueError("Sparse manifest step is missing microsteps")
             return microsteps
         return [step_entry]
+
+    def resolve_step_entry(step_index: int, default_step_entry: dict):
+        if step_override_provider is None:
+            return default_step_entry, False
+        override_entry = step_override_provider(step_index)
+        if override_entry is None:
+            return default_step_entry, False
+        if not use_dual_manifest and manifest_version >= 2:
+            default_microsteps = get_microsteps(default_step_entry)
+            override_microsteps = get_microsteps(override_entry)
+            if len(default_microsteps) != len(override_microsteps):
+                raise ValueError(
+                    "Runtime sparse overrides without sequence-base manifest loading must preserve the baseline microstep count"
+                )
+            for micro_idx, (default_microstep, override_microstep) in enumerate(zip(default_microsteps, override_microsteps)):
+                if int(default_microstep.get("sequence_id", -1)) != int(override_microstep.get("sequence_id", -1)):
+                    raise ValueError(
+                        "Runtime sparse overrides that change sequence_id require sequence-base manifest loading "
+                        f"(step={step_index}, micro={micro_idx})"
+                    )
+        return override_entry, True
+
+    try:
+        current_step_entry, current_step_is_override = resolve_step_entry(0, next(manifest_iter))
+    except StopIteration as exc:
+        raise ValueError("Sparse manifest contains no step entries") from exc
 
     current_microsteps = get_microsteps(current_step_entry)
     current_micro_idx = 0
@@ -706,6 +728,10 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                                 text_batch_index=batch_key[2],
                             )
                             token_batch_cache[batch_key] = token_lists
+                            if len(token_batch_cache) > DUAL_MANIFEST_TOKEN_BATCH_CACHE_LIMIT:
+                                token_batch_cache.popitem(last=False)
+                        else:
+                            token_batch_cache.move_to_end(batch_key)
                         doc_index_in_batch = int(segment.get("doc_index_in_batch", -1))
                         if doc_index_in_batch < 0 or doc_index_in_batch >= len(token_lists):
                             raise ValueError(

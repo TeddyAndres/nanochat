@@ -73,18 +73,24 @@ class SparseFutureWindowPlanner:
         max_auto_negatives_per_microstep: int = 4,
         sampling_seed: int = 0,
         ranking_mode: SparseLossTopkRankingMode = SPARSE_LOSS_TOPK_RANKING_SINGLE,
+        negative_only: bool = False,
     ):
         self.manifest_path = Path(manifest_path)
         self.grouping_header = load_sparse_manifest_header(self.manifest_path)
-        self.base_manifest_path = resolve_grouping_base_manifest_path(self.manifest_path, header=self.grouping_header)
-        self.sequence_units = load_sequence_unit_views(self.base_manifest_path)
+        self.negative_only = bool(negative_only)
+        self.requires_sequence_base_manifest = not self.negative_only
+        self.base_manifest_path = None
+        self.sequence_units: dict[int, SequenceUnitView] = {}
+        if self.requires_sequence_base_manifest:
+            self.base_manifest_path = resolve_grouping_base_manifest_path(self.manifest_path, header=self.grouping_header)
+            self.sequence_units = load_sequence_unit_views(self.base_manifest_path)
         self.num_steps = int(self.grouping_header["num_steps"])
         self.grad_accum_steps = int(self.grouping_header["grad_accum_steps"])
         self.u_max = int(self.grouping_header["u_max"])
         self.grad_accum_u_max = int(self.grouping_header.get("grad_accum_u_max", self.u_max))
         self.interval_steps = max(1, int(interval_steps))
-        self.positive_fraction = float(positive_fraction)
-        self.corrective_fraction = float(corrective_fraction)
+        self.positive_fraction = 0.0 if self.negative_only else float(positive_fraction)
+        self.corrective_fraction = 0.0 if self.negative_only else float(corrective_fraction)
         self.max_auto_negatives_per_microstep = max(0, int(max_auto_negatives_per_microstep))
         self.sampling_seed = int(sampling_seed)
         self.accumulator = SparseRollingLossAccumulator(window_steps=rolling_window_steps, ranking_mode=ranking_mode)
@@ -162,6 +168,31 @@ class SparseFutureWindowPlanner:
         future_sequence_slots = [int(microstep["sequence_id"]) for microstep in baseline_step_entry.get("microsteps", [])]
         if len(future_sequence_slots) == 0:
             return {}
+
+        if self.negative_only:
+            selected_microsteps = [
+                self._build_negative_only_microstep(microstep)
+                for microstep in baseline_step_entry.get("microsteps", [])
+            ]
+            grad_accum_active_ids = _dedupe_preserve_order(
+                [token_id for microstep in selected_microsteps for token_id in microstep["active_ids"]]
+            )
+            if len(grad_accum_active_ids) > self.grad_accum_u_max:
+                selected_microsteps = [
+                    self._build_baseline_microstep(microstep)
+                    for microstep in baseline_step_entry.get("microsteps", [])
+                ]
+                grad_accum_active_ids = _dedupe_preserve_order(
+                    [token_id for microstep in selected_microsteps for token_id in microstep["active_ids"]]
+                )
+            planned_override = {
+                "grad_accum_active_ids": grad_accum_active_ids,
+                "grad_accum_u_size": len(grad_accum_active_ids),
+                "microsteps": selected_microsteps,
+                "replanned_from_step": int(step),
+            }
+            self._step_overrides[target_step] = planned_override
+            return {target_step: planned_override}
 
         positive_records = self.accumulator.sample_correct_tokens(len(future_sequence_slots), seed=self.sampling_seed + int(step) * 17 + 1)
         corrective_records = self.accumulator.sample_incorrect_pairs(len(future_sequence_slots), seed=self.sampling_seed + int(step) * 17 + 2)
@@ -300,6 +331,30 @@ class SparseFutureWindowPlanner:
         if explicit_negative_ids:
             payload["explicit_injected_negative_ids"] = explicit_negative_ids
         if auto_negative_ids:
+            payload["auto_injected_negative_ids"] = auto_negative_ids
+        return payload
+
+    def _build_negative_only_microstep(self, microstep: dict[str, Any]) -> dict[str, Any]:
+        active_ids = [int(token_id) for token_id in microstep.get("active_ids", [])]
+        auto_negative_entries = self.accumulator.lookup_negatives_for_tokens(
+            active_ids,
+            limit=self.max_auto_negatives_per_microstep,
+        )
+        remaining_slots = max(0, self.u_max - len(active_ids))
+        auto_negative_ids = [int(token_id) for token_id, _ in auto_negative_entries[:remaining_slots]]
+        selected_active_ids = _dedupe_preserve_order(active_ids + auto_negative_ids)
+        payload = {
+            "sequence_id": int(microstep.get("sequence_id", -1)),
+            "active_ids": selected_active_ids,
+            "u_size": len(selected_active_ids),
+            "next_active_ids": selected_active_ids,
+            "next_u_size": len(selected_active_ids),
+            "next_leaving_ids": [],
+            "next_new_ids": [],
+            "planner_bucket": "baseline",
+        }
+        if auto_negative_ids:
+            payload["injected_negative_ids"] = auto_negative_ids
             payload["auto_injected_negative_ids"] = auto_negative_ids
         return payload
 
