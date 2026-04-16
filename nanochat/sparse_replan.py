@@ -150,6 +150,8 @@ class SparseFutureWindowPlanner:
         )
 
     def _plan_from_accumulator(self, step: int) -> dict[int, dict[str, Any]]:
+        if not self.accumulator.is_warmed_up:
+            return {}
         target_step = int(step) + self.interval_steps
         if target_step >= self.num_steps:
             return {}

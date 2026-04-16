@@ -143,6 +143,7 @@ def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
     planner = SparseFutureWindowPlanner(
         grouping_manifest_path,
         interval_steps=2,
+        rolling_window_steps=1,
     )
     correct_records = torch.tensor(
         [
@@ -309,7 +310,7 @@ def test_sparse_future_window_planner_targets_exactly_one_future_step_per_update
         ),
     )
 
-    planner = SparseFutureWindowPlanner(grouping_manifest_path, interval_steps=2)
+    planner = SparseFutureWindowPlanner(grouping_manifest_path, interval_steps=2, rolling_window_steps=1)
     planner.update_from_step_payload(
         0,
         correct_scores=torch.tensor([5.0], dtype=torch.float32),
@@ -419,7 +420,13 @@ def test_sparse_future_window_planner_auto_injects_cold_negative_for_baseline_se
         ),
     )
 
-    planner = SparseFutureWindowPlanner(grouping_manifest_path, interval_steps=1, positive_fraction=0.0, corrective_fraction=0.0)
+    planner = SparseFutureWindowPlanner(
+        grouping_manifest_path,
+        interval_steps=1,
+        rolling_window_steps=1,
+        positive_fraction=0.0,
+        corrective_fraction=0.0,
+    )
     planner.update_from_step_payload(
         0,
         correct_scores=torch.tensor([1.0], dtype=torch.float32),
@@ -661,3 +668,144 @@ def test_sparse_future_window_planner_tracks_single_occurrence_rolling_maxima(tm
     override = planner.get_step_override(3)
     assert override is not None
     assert override["microsteps"][0]["focus_token_id"] == 51
+
+
+def test_sparse_future_window_planner_waits_for_full_rolling_window_before_emitting_overrides(tmp_path):
+    base_shard_path = tmp_path / "sequence_base_shard_000.sqlite"
+    base_manifest_path = tmp_path / "sequence_base.json"
+    grouping_shard_path = tmp_path / "grouping_shard_000.json"
+    grouping_manifest_path = tmp_path / "grouping_manifest.json"
+
+    sequence_units = [
+        {
+            "sequence_id": 0,
+            "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 0},
+            "sequence_recipe": {"row_capacity": 3, "rows": []},
+            "num_unique_tokens": 2,
+            "unique_token_ids": [11, 12],
+            "sequence_geometry": {"rows": 1, "tokens": 2},
+        },
+        {
+            "sequence_id": 1,
+            "state_dict": {"pq_idx": 1, "rg_idx": 0, "epoch": 0},
+            "sequence_recipe": {"row_capacity": 3, "rows": []},
+            "num_unique_tokens": 2,
+            "unique_token_ids": [21, 22],
+            "sequence_geometry": {"rows": 1, "tokens": 2},
+        },
+        {
+            "sequence_id": 2,
+            "state_dict": {"pq_idx": 2, "rg_idx": 0, "epoch": 0},
+            "sequence_recipe": {"row_capacity": 3, "rows": []},
+            "num_unique_tokens": 2,
+            "unique_token_ids": [31, 32],
+            "sequence_geometry": {"rows": 1, "tokens": 2},
+        },
+    ]
+    save_sequence_manifest_shard(
+        base_shard_path,
+        build_sequence_manifest_shard_payload(shard_index=0, start_sequence_id=0, sequence_units=sequence_units),
+    )
+    save_sparse_manifest(
+        base_manifest_path,
+        build_sequence_manifest_payload(
+            split="train",
+            vocab_size=2048,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=2,
+            grad_accum_steps=2,
+            ddp_world_size=1,
+            num_iterations=4,
+            buffer_size=2,
+            num_sequence_units=3,
+            shard_sequence_count=3,
+            shards=[{"shard_index": 0, "path": str(base_shard_path.relative_to(tmp_path)), "start_sequence_id": 0, "num_sequence_units": 3}],
+        ),
+    )
+    steps = [
+        {
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [11, 12, 21, 22],
+            "microsteps": [
+                {"microstep": 0, "sequence_id": 0, "u_size": 2, "active_ids": [11, 12], "next_active_ids": [11, 12], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+                {"microstep": 1, "sequence_id": 1, "u_size": 2, "active_ids": [21, 22], "next_active_ids": [21, 22], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+            ],
+        },
+        {
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [11, 12, 21, 22],
+            "microsteps": [
+                {"microstep": 0, "sequence_id": 0, "u_size": 2, "active_ids": [11, 12], "next_active_ids": [11, 12], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+                {"microstep": 1, "sequence_id": 1, "u_size": 2, "active_ids": [21, 22], "next_active_ids": [21, 22], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+            ],
+        },
+        {
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [21, 22, 31, 32],
+            "microsteps": [
+                {"microstep": 0, "sequence_id": 1, "u_size": 2, "active_ids": [21, 22], "next_active_ids": [21, 22], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+                {"microstep": 1, "sequence_id": 2, "u_size": 2, "active_ids": [31, 32], "next_active_ids": [31, 32], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+            ],
+        },
+        {
+            "grad_accum_u_size": 4,
+            "grad_accum_active_ids": [21, 22, 31, 32],
+            "microsteps": [
+                {"microstep": 0, "sequence_id": 1, "u_size": 2, "active_ids": [21, 22], "next_active_ids": [21, 22], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+                {"microstep": 1, "sequence_id": 2, "u_size": 2, "active_ids": [31, 32], "next_active_ids": [31, 32], "next_u_size": 2, "next_leaving_ids": [], "next_new_ids": []},
+            ],
+        },
+    ]
+    with grouping_shard_path.open("w", encoding="utf-8") as f:
+        json.dump({"version": 4, "manifest_kind": "grouping", "shard_index": 0, "start_step": 0, "num_steps": 4, "u_max": 3, "grad_accum_u_max": 6, "steps": steps}, f)
+    save_sparse_manifest(
+        grouping_manifest_path,
+        build_grouping_manifest_payload(
+            split="train",
+            vocab_size=2048,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=2,
+            grad_accum_steps=2,
+            ddp_world_size=1,
+            num_iterations=4,
+            buffer_size=2,
+            u_max=3,
+            grad_accum_u_max=6,
+            shard_step_count=4,
+            shards=[{"shard_index": 0, "path": str(grouping_shard_path.relative_to(tmp_path)), "start_step": 0, "num_steps": 4, "u_max": 3, "grad_accum_u_max": 6}],
+            base_manifest_path=str(base_manifest_path.relative_to(tmp_path)),
+        ),
+    )
+
+    planner = SparseFutureWindowPlanner(grouping_manifest_path, interval_steps=1, rolling_window_steps=3)
+    empty_planned = planner.update_from_step_payload(
+        0,
+        correct_scores=torch.tensor([5.0], dtype=torch.float32),
+        correct_records=torch.tensor([[0, 0, 0, 0, 0, 0, 11]], dtype=torch.long),
+        incorrect_scores=torch.tensor([1.0], dtype=torch.float32),
+        incorrect_records=torch.tensor([[0, 0, 0, 0, 0, 0, 11, 0, 999]], dtype=torch.long),
+    )
+    assert empty_planned == {}
+    assert planner.get_step_override(1) is None
+
+    empty_planned = planner.update_from_step_payload(
+        1,
+        correct_scores=torch.tensor([4.0], dtype=torch.float32),
+        correct_records=torch.tensor([[1, 0, 0, 0, 0, 0, 21]], dtype=torch.long),
+        incorrect_scores=torch.tensor([2.0], dtype=torch.float32),
+        incorrect_records=torch.tensor([[1, 0, 0, 0, 0, 0, 21, 0, 888]], dtype=torch.long),
+    )
+    assert empty_planned == {}
+    assert planner.get_step_override(2) is None
+
+    planned = planner.update_from_step_payload(
+        2,
+        correct_scores=torch.tensor([3.0], dtype=torch.float32),
+        correct_records=torch.tensor([[2, 0, 0, 0, 0, 0, 31]], dtype=torch.long),
+        incorrect_scores=torch.tensor([3.0], dtype=torch.float32),
+        incorrect_records=torch.tensor([[2, 0, 0, 0, 0, 0, 31, 0, 777]], dtype=torch.long),
+    )
+    assert sorted(planned.keys()) == [3]
+    assert planner.get_step_override(3) is not None

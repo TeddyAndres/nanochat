@@ -48,6 +48,14 @@ class SparseRollingLossAccumulator:
         items = sorted(self.correct_totals.items(), key=lambda item: (-item[1], item[0]))
         return items if limit is None else items[:limit]
 
+    @property
+    def current_window_size(self) -> int:
+        return len(self._step_queue)
+
+    @property
+    def is_warmed_up(self) -> bool:
+        return len(self._step_queue) >= self.window_steps
+
     def ranked_incorrect_pairs(self, limit: int | None = None) -> list[tuple[tuple[int, int], float]]:
         items = sorted(self.incorrect_pair_totals.items(), key=lambda item: (-item[1], item[0][1], item[0][0]))
         return items if limit is None else items[:limit]
