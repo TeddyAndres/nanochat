@@ -519,9 +519,9 @@ def test_manifest_loader_applies_runtime_step_override(monkeypatch, tmp_path):
     next(loader)
     _, targets1, step_meta1, state1 = next(loader)
 
-    assert torch.equal(targets1, torch.tensor([[2, 0]], dtype=torch.long))
-    assert torch.equal(step_meta1["active_ids_cpu"], torch.tensor([4, 2, 3, 9], dtype=torch.long))
-    assert torch.equal(step_meta1["stage_ids_cpu"], torch.tensor([4, 9], dtype=torch.long))
+    assert torch.equal(targets1, torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(step_meta1["active_ids_cpu"], torch.tensor([2, 3, 4, 9], dtype=torch.long))
+    assert torch.equal(step_meta1["stage_ids_cpu"], torch.tensor([2, 3, 4, 9], dtype=torch.long))
     assert state1["manifest_step"] == 1
 
 

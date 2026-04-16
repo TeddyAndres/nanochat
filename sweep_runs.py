@@ -137,7 +137,7 @@ RUNS = [
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
             '--adam-beta1 0.7 --adam-beta2 0.95 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
-            '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan3step_5kstep '
+            '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan3step_10kstep '
             '--sparse-future-replan-enable --sparse-future-replan-interval 3 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
         ),
     },
@@ -156,7 +156,7 @@ RUNS = [
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
             '--adam-beta1 0.7 --adam-beta2 0.95 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
-            '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan5step_5kstep '
+            '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan5step_10kstep '
             '--sparse-future-replan-enable --sparse-future-replan-interval 5 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
         ),
     },
@@ -175,7 +175,7 @@ RUNS = [
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
             '--adam-beta1 0.7 --adam-beta2 0.95 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
-            '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan10step_5kstep '
+            '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan10step_10kstep '
             '--sparse-future-replan-enable --sparse-future-replan-interval 10 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
         ),
     },

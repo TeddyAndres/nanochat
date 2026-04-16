@@ -448,8 +448,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
 
     slot_to_global = torch.full((u_max,), -1, dtype=torch.long)
     global_to_slot = torch.full((vocab_size,), -1, dtype=torch.long)
-    use_manifest_transitions = step_override_provider is None
-
     def apply_manifest_transition(step_entry):
         next_leaving_ids = torch.tensor(step_entry["next_leaving_ids"], dtype=torch.long)
         next_new_ids = torch.tensor(step_entry["next_new_ids"], dtype=torch.long)
@@ -543,15 +541,48 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                 )
         return new_ids, new_slots, leaving_ids, leaving_slots
 
+    def rebuild_global_to_slot_from_slot_map() -> None:
+        global_to_slot.fill_(-1)
+        active_slot_ids = torch.nonzero(slot_to_global >= 0, as_tuple=False).flatten()
+        if active_slot_ids.numel() > 0:
+            global_to_slot[slot_to_global[active_slot_ids]] = active_slot_ids
+
+    def replace_active_ids(desired_active_ids: torch.Tensor):
+        if desired_active_ids.numel() > u_max:
+            raise ValueError(
+                f"Sparse manifest override exceeds U_max: {desired_active_ids.numel()} > {u_max}"
+            )
+        current_active_ids = slot_to_global[slot_to_global >= 0].clone()
+        leaving_ids = current_active_ids[~torch.isin(current_active_ids, desired_active_ids)]
+        if leaving_ids.numel() > 0:
+            leaving_slots = global_to_slot[leaving_ids].clone()
+        else:
+            leaving_slots = torch.empty(0, dtype=torch.long)
+        slot_to_global.fill_(-1)
+        global_to_slot.fill_(-1)
+        if desired_active_ids.numel() == 0:
+            return (
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+                leaving_ids,
+                leaving_slots,
+            )
+        new_slots = torch.arange(desired_active_ids.numel(), dtype=torch.long)
+        slot_to_global[new_slots] = desired_active_ids
+        global_to_slot[desired_active_ids] = new_slots
+        return desired_active_ids.clone(), new_slots, leaving_ids, leaving_slots
+
     def resolve_step_entry(step_index: int, default_step_entry: dict):
         if step_override_provider is None:
-            return default_step_entry
+            return default_step_entry, False
         override_entry = step_override_provider(step_index)
-        return default_step_entry if override_entry is None else override_entry
+        if override_entry is None:
+            return default_step_entry, False
+        return override_entry, True
 
     manifest_iter = stream_sparse_manifest_steps(manifest_path)
     try:
-        current_step_entry = resolve_step_entry(0, next(manifest_iter))
+        current_step_entry, current_step_is_override = resolve_step_entry(0, next(manifest_iter))
     except StopIteration as exc:
         raise ValueError("Sparse manifest contains no step entries") from exc
 
@@ -567,32 +598,38 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     current_micro_idx = 0
     current_micro_entry = current_microsteps[current_micro_idx]
     buffered_next_step_entry = None
+    buffered_next_step_is_override = False
+    state_matches_current_entry = False
 
     first_active_ids = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
     if first_active_ids.numel() > u_max:
         raise ValueError(
             f"Sparse manifest first step exceeds U_max: {first_active_ids.numel()} > {u_max}"
         )
-    if use_manifest_transitions:
+    if current_step_is_override:
+        current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = replace_active_ids(first_active_ids)
+        state_matches_current_entry = True
+    else:
         first_slots = torch.arange(first_active_ids.numel(), dtype=torch.long)
         slot_to_global[first_slots] = first_active_ids
         global_to_slot[first_active_ids] = first_slots
         current_new_ids = first_active_ids.clone()
         current_new_slots = first_slots.clone()
-    else:
-        current_new_ids = torch.empty(0, dtype=torch.long)
-        current_new_slots = torch.empty(0, dtype=torch.long)
-    current_leaving_ids = torch.empty(0, dtype=torch.long)
-    current_leaving_slots = torch.empty(0, dtype=torch.long)
+        state_matches_current_entry = True
+        current_leaving_ids = torch.empty(0, dtype=torch.long)
+        current_leaving_slots = torch.empty(0, dtype=torch.long)
     for replay_step in range(manifest_step):
         for replay_micro_entry in current_microsteps:
-            if use_manifest_transitions:
+            if not current_step_is_override:
                 current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = apply_manifest_transition(replay_micro_entry)
+                state_matches_current_entry = True
             else:
                 replay_active_ids = torch.tensor(replay_micro_entry["active_ids"], dtype=torch.long)
-                current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = reconcile_active_ids(replay_active_ids)
+                current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = replace_active_ids(replay_active_ids)
+                state_matches_current_entry = True
+        previous_step_is_override = current_step_is_override
         try:
-            current_step_entry = resolve_step_entry(replay_step + 1, next(manifest_iter))
+            current_step_entry, current_step_is_override = resolve_step_entry(replay_step + 1, next(manifest_iter))
         except StopIteration as exc:
             raise ValueError(
                 f"Sparse manifest ended before requested resume step {manifest_step}"
@@ -600,13 +637,19 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         current_microsteps = get_microsteps(current_step_entry)
         current_micro_idx = 0
         current_micro_entry = current_microsteps[current_micro_idx]
+        state_matches_current_entry = (not previous_step_is_override) and (not current_step_is_override)
 
     while True:
         if manifest_step >= num_manifest_steps:
             raise StopIteration
-        if not use_manifest_transitions:
+        if current_step_is_override or not state_matches_current_entry:
             desired_active_ids = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
-            current_new_ids, current_new_slots, _, _ = reconcile_active_ids(desired_active_ids)
+            if current_step_is_override:
+                current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = replace_active_ids(desired_active_ids)
+            else:
+                current_new_ids, current_new_slots, _, _ = reconcile_active_ids(desired_active_ids)
+            state_matches_current_entry = True
+        loaded_sequence_unique_ids = None
         if use_dual_manifest:
             assert resolve_sequence_unit is not None
             assert resolved_cache_dir is not None
@@ -692,6 +735,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             base_state_dict = sequence_unit.get("state_dict", {})
             if not isinstance(base_state_dict, dict):
                 raise ValueError("Sequence manifest state_dict payload must be a dict")
+            loaded_sequence_unique_ids = torch.tensor(sequence_unit.get("unique_token_ids", []), dtype=torch.long)
             cpu_inputs.copy_(base_inputs)
             cpu_targets.copy_(base_targets)
         else:
@@ -699,11 +743,35 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             base_inputs, base_targets, base_state_dict = next(base_loader)
             cpu_inputs.copy_(base_inputs)
             cpu_targets.copy_(base_targets)
+        rebuild_global_to_slot_from_slot_map()
         remapped_inputs = global_to_slot[cpu_inputs]
         remapped_targets = global_to_slot[cpu_targets]
         if (remapped_inputs < 0).any() or (remapped_targets < 0).any():
+            missing_input_ids = torch.unique(cpu_inputs[remapped_inputs < 0]).to(dtype=torch.long)
+            missing_target_ids = torch.unique(cpu_targets[remapped_targets < 0]).to(dtype=torch.long)
+            missing_ids = torch.unique(torch.cat((missing_input_ids, missing_target_ids)))
+            desired_active_ids_debug = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
+            desired_missing_ids = desired_active_ids_debug[global_to_slot[desired_active_ids_debug] < 0]
+            loaded_batch_unique_ids = torch.unique(torch.cat((cpu_inputs.reshape(-1), cpu_targets.reshape(-1))))
+            sequence_unique_missing_ids = torch.empty(0, dtype=torch.long)
+            sequence_unique_missing_from_active_ids = torch.empty(0, dtype=torch.long)
+            if loaded_sequence_unique_ids is not None and loaded_sequence_unique_ids.numel() > 0:
+                loaded_sequence_unique_ids = loaded_sequence_unique_ids.to(dtype=torch.long)
+                sequence_unique_missing_ids = loaded_batch_unique_ids[~torch.isin(loaded_batch_unique_ids, loaded_sequence_unique_ids)]
+                sequence_unique_missing_from_active_ids = loaded_sequence_unique_ids[
+                    ~torch.isin(loaded_sequence_unique_ids, desired_active_ids_debug)
+                ]
             raise ValueError(
-                f"Sparse manifest mismatch at step {manifest_step}: live batch contains tokens missing from manifest active_ids"
+                f"Sparse manifest mismatch at step {manifest_step} micro={current_micro_idx} sequence_id={int(current_micro_entry.get('sequence_id', -1))}: "
+                f"live batch contains {missing_ids.numel()} tokens missing from manifest active_ids; "
+                f"sample_missing_ids={missing_ids[:16].tolist()} | "
+                f"override_step={current_step_is_override} state_matches={state_matches_current_entry} "
+                f"resident_active={int((slot_to_global >= 0).sum().item())} desired_active={desired_active_ids_debug.numel()} "
+                f"desired_missing={desired_missing_ids.numel()} desired_missing_sample={desired_missing_ids[:16].tolist()} | "
+                f"batch_unique={loaded_batch_unique_ids.numel()} sequence_unique_missing={sequence_unique_missing_ids.numel()} "
+                f"sequence_unique_missing_sample={sequence_unique_missing_ids[:16].tolist()} | "
+                f"sequence_unique_missing_from_active={sequence_unique_missing_from_active_ids.numel()} "
+                f"sequence_unique_missing_from_active_sample={sequence_unique_missing_from_active_ids[:16].tolist()}"
             )
         cpu_inputs.copy_(remapped_inputs)
         cpu_targets.copy_(remapped_targets)
@@ -736,7 +804,30 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                 )
 
         is_last_microstep = current_micro_idx == len(current_microsteps) - 1
-        if use_manifest_transitions:
+        next_micro_entry = None
+        next_step_is_override = False
+        if not is_last_microstep:
+            next_micro_entry = current_microsteps[current_micro_idx + 1]
+            next_step_is_override = current_step_is_override
+        elif manifest_step < num_manifest_steps - 1:
+            if buffered_next_step_entry is None:
+                try:
+                    buffered_next_step_entry, buffered_next_step_is_override = resolve_step_entry(manifest_step + 1, next(manifest_iter))
+                except StopIteration as exc:
+                    raise ValueError(
+                        f"Sparse manifest ended early after step {manifest_step}; expected {num_manifest_steps} total steps"
+                    ) from exc
+            next_microsteps = get_microsteps(buffered_next_step_entry)
+            next_micro_entry = next_microsteps[0]
+            next_step_is_override = buffered_next_step_is_override
+
+        can_use_manifest_transition = (
+            not current_step_is_override
+            and next_micro_entry is not None
+            and not next_step_is_override
+        )
+
+        if can_use_manifest_transition:
             current_leaving_ids = torch.tensor(current_micro_entry["next_leaving_ids"], dtype=torch.long)
             if current_leaving_ids.numel() > 0:
                 current_leaving_slots = global_to_slot[current_leaving_ids]
@@ -745,20 +836,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             else:
                 current_leaving_slots = torch.empty(0, dtype=torch.long)
         else:
-            next_micro_entry = None
-            if not is_last_microstep:
-                next_micro_entry = current_microsteps[current_micro_idx + 1]
-            elif manifest_step < num_manifest_steps - 1:
-                if buffered_next_step_entry is None:
-                    try:
-                        buffered_next_step_entry = resolve_step_entry(manifest_step + 1, next(manifest_iter))
-                    except StopIteration as exc:
-                        raise ValueError(
-                            f"Sparse manifest ended early after step {manifest_step}; expected {num_manifest_steps} total steps"
-                        ) from exc
-                next_microsteps = get_microsteps(buffered_next_step_entry)
-                next_micro_entry = next_microsteps[0]
-
             if next_micro_entry is not None:
                 next_active_ids = torch.tensor(next_micro_entry["active_ids"], dtype=torch.long)
                 _, _, current_leaving_ids, current_leaving_slots = preview_next_transition(next_active_ids)
@@ -801,20 +878,23 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         if manifest_step == num_manifest_steps - 1 and is_last_microstep:
             manifest_step += 1
             continue
-        if use_manifest_transitions:
+        if can_use_manifest_transition:
             current_new_ids, current_new_slots, _, _ = apply_manifest_transition(current_micro_entry)
         if not is_last_microstep:
             current_micro_idx += 1
             current_micro_entry = current_microsteps[current_micro_idx]
+            state_matches_current_entry = can_use_manifest_transition
             continue
 
         manifest_step += 1
         if buffered_next_step_entry is not None:
             current_step_entry = buffered_next_step_entry
+            current_step_is_override = buffered_next_step_is_override
             buffered_next_step_entry = None
+            buffered_next_step_is_override = False
         else:
             try:
-                current_step_entry = resolve_step_entry(manifest_step, next(manifest_iter))
+                current_step_entry, current_step_is_override = resolve_step_entry(manifest_step, next(manifest_iter))
             except StopIteration as exc:
                 raise ValueError(
                     f"Sparse manifest ended early after step {manifest_step - 1}; expected {num_manifest_steps} total steps"
@@ -822,3 +902,4 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         current_microsteps = get_microsteps(current_step_entry)
         current_micro_idx = 0
         current_micro_entry = current_microsteps[current_micro_idx]
+        state_matches_current_entry = can_use_manifest_transition
