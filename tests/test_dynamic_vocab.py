@@ -1000,6 +1000,127 @@ def test_fixed_u_cloud_writeback_is_deferred_until_cloud_leaves():
     assert step1_ctx.cloud_stage_ids_cpu.tolist() == [5]
 
 
+def test_fixed_u_grad_accum_clouds_expand_lm_head_view_and_stay_window_stable():
+    torch.manual_seed(0)
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=10),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=3,
+        grad_accum_u_max=4,
+        lm_head_u_max=6,
+    )
+
+    micro0 = build_fixed_step_meta(
+        slot_to_global=[1, 3, 7],
+        stage_slots=[0, 1, 2],
+        stage_ids=[1, 3, 7],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[5],
+        cold_ids=[6],
+        grad_accum_ids=[1, 3, 7, 9],
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+        is_last_step=False,
+    )
+    micro0_ctx = runtime.prepare_step(micro0)
+
+    assert micro0_ctx.active_vocab is not None
+    assert micro0_ctx.active_vocab["wte"].shape[0] == 4
+    assert micro0_ctx.active_vocab["lm_head"].shape[0] == 6
+    assert micro0_ctx.lm_head_active_ids_cpu is not None
+    assert micro0_ctx.lm_head_active_ids_cpu.tolist() == [1, 3, 7, 9, 5, 6]
+    assert micro0_ctx.warm_slot_ids_cpu is not None
+    assert micro0_ctx.cold_slot_ids_cpu is not None
+    assert micro0_ctx.warm_slot_ids_cpu.tolist() == [4]
+    assert micro0_ctx.cold_slot_ids_cpu.tolist() == [5]
+
+    set_zero_sparse_grads(micro0_ctx)
+    runtime.accumulate_gradients(micro0_ctx)
+
+    micro1 = build_fixed_step_meta(
+        slot_to_global=[9, 3, 7],
+        stage_slots=[0],
+        stage_ids=[9],
+        writeback_slots=[1],
+        writeback_ids=[3],
+        warm_ids=[6],
+        cold_ids=[5],
+        grad_accum_ids=[1, 3, 7, 9],
+        grad_accum_steps=2,
+        grad_accum_micro_step=1,
+        is_grad_accum_boundary=True,
+        is_last_step=False,
+    )
+    micro1_ctx = runtime.prepare_step(micro1)
+
+    assert micro1_ctx.active_vocab is not None
+    assert micro1_ctx.active_vocab["lm_head"].shape[0] == 6
+    assert micro1_ctx.warm_ids_cpu is not None
+    assert micro1_ctx.cold_ids_cpu is not None
+    assert micro1_ctx.warm_ids_cpu.tolist() == [5]
+    assert micro1_ctx.cold_ids_cpu.tolist() == [6]
+    assert micro1_ctx.warm_slot_ids_cpu is not None
+    assert micro1_ctx.cold_slot_ids_cpu is not None
+    assert micro1_ctx.warm_slot_ids_cpu.tolist() == [4]
+    assert micro1_ctx.cold_slot_ids_cpu.tolist() == [5]
+
+
+def test_fixed_u_grad_accum_cloud_rows_use_separate_lm_head_learning_rates():
+    torch.manual_seed(0)
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=10),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=1.0,
+        unembedding_warm_lr=0.5,
+        unembedding_cold_lr=0.25,
+        fixed_u_max=3,
+        grad_accum_u_max=4,
+        lm_head_u_max=6,
+        adam_betas=(0.0, 0.0),
+    )
+
+    original_rows = runtime.table_specs["lm_head"]["param"][[0, 1, 2, 3, 4, 5]].clone()
+    micro0 = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2],
+        stage_slots=[0, 1, 2],
+        stage_ids=[0, 1, 2],
+        writeback_slots=[],
+        writeback_ids=[],
+        warm_ids=[4],
+        cold_ids=[5],
+        grad_accum_ids=[0, 1, 2, 3],
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+        is_last_step=False,
+    )
+    micro0_ctx = runtime.prepare_step(micro0)
+
+    assert micro0_ctx.active_vocab is not None
+    micro0_ctx.active_vocab["wte"].grad = torch.zeros_like(micro0_ctx.active_vocab["wte"])
+    micro0_ctx.active_vocab["lm_head"].grad = torch.zeros_like(micro0_ctx.active_vocab["lm_head"])
+    micro0_ctx.active_vocab["lm_head"].grad[:4] = 1.0
+    micro0_ctx.active_vocab["lm_head"].grad[4] = 1.0
+    micro0_ctx.active_vocab["lm_head"].grad[5] = 1.0
+    for value_embed in micro0_ctx.active_vocab["value_embeds"].values():
+        value_embed.grad = torch.zeros_like(value_embed)
+
+    runtime.accumulate_gradients(micro0_ctx)
+    runtime.apply_accumulated_gradients()
+
+    updated_rows = runtime.table_specs["lm_head"]["param"][[0, 1, 2, 3, 4, 5]]
+    expected_deltas = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.5, 0.25], dtype=updated_rows.dtype).unsqueeze(1)
+    observed_deltas = original_rows - updated_rows
+    assert torch.allclose(observed_deltas, expected_deltas.expand_as(observed_deltas), atol=1e-6)
+
+
 def test_plan_next_lm_head_cloud_retains_resident_cloud_ids_when_still_ranked():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=10)

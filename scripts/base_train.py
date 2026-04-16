@@ -1030,8 +1030,6 @@ if args.sparse_mode:
             f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
             f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
         )
-    if sparse_lm_head_clouds:
-        assert grad_accum_steps == 1, "lm_head cloud expansion currently requires grad_accum_steps == 1"
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
