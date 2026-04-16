@@ -762,6 +762,48 @@ def test_plan_next_lm_head_cloud_fills_warm_budget_beyond_shortlist_limit():
     assert planned["warm_candidate_ids_cpu"].numel() >= 8
 
 
+def test_plan_next_lm_head_cloud_reserves_hard_negative_budget_first():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=16)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=8,
+    )
+    runtime.global_token_count_cpu.copy_(torch.arange(16, dtype=torch.long))
+
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, 2, 3],
+        stage_slots=[0, 1, 2, 3],
+        stage_ids=[0, 1, 2, 3],
+        writeback_slots=[0, 1, 2, 3],
+        writeback_ids=[0, 1, 2, 3],
+        inputs_cpu_local=[[0, 1, 2, 3]],
+        is_last_step=True,
+    )
+    planned = runtime.plan_next_lm_head_cloud(
+        step_meta,
+        warm_proportion=0.5,
+        router_candidate_pool_size=0,
+        router_topk=0,
+        source_token_limit=0,
+        hard_negative_ids_cpu=torch.tensor([7, 6], dtype=torch.long),
+        hard_negative_budget=1,
+    )
+
+    assert planned["hard_negative_budget_target"] == 1
+    assert planned["hard_negative_candidate_count"] == 2
+    assert planned["hard_negative_ids_cpu"].tolist() == [7]
+    assert 7 not in planned["warm_ids_cpu"].tolist()
+    assert planned["cold_ids_cpu"][0].item() == 7
+    assert planned["warm_ids_cpu"].numel() == 2
+    assert planned["cold_ids_cpu"].numel() == 2
+
+
 def test_fixed_u_clouds_expand_only_lm_head_capacity():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)

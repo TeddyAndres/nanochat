@@ -3,6 +3,7 @@ import json
 import torch
 
 from nanochat import dataloader as dataloader_module
+import nanochat.sparse_replan as sparse_replan_module
 from nanochat.sparse_replan import SparseFutureWindowPlanner
 from nanochat.sparse_manifest import (
     build_grouping_manifest_payload,
@@ -342,6 +343,51 @@ def test_sparse_future_window_planner_uses_interval_as_planning_cadence(tmp_path
     )
 
     assert planner.get_step_override(4) is not None
+
+
+def test_sparse_future_window_planner_reuses_monotonic_manifest_stream(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "grouping_manifest.json"
+    save_sparse_manifest(
+        manifest_path,
+        build_manifest_payload(
+            split="train",
+            vocab_size=32,
+            device_batch_size=1,
+            max_seq_len=1,
+            total_batch_size=1,
+            grad_accum_steps=1,
+            ddp_world_size=1,
+            num_iterations=6,
+            buffer_size=1,
+            steps=[
+                {
+                    "u_size": 1,
+                    "active_ids": [step_idx],
+                    "next_u_size": 1,
+                    "next_active_ids": [step_idx],
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                }
+                for step_idx in range(6)
+            ],
+        ),
+    )
+
+    streamed_steps = [{"step": step_idx} for step_idx in range(6)]
+    stream_calls = []
+
+    def fake_stream_sparse_manifest_steps(path, start_step=0):
+        stream_calls.append(int(start_step))
+        for step_entry in streamed_steps[int(start_step):]:
+            yield step_entry
+
+    monkeypatch.setattr(sparse_replan_module, "stream_sparse_manifest_steps", fake_stream_sparse_manifest_steps)
+
+    planner = SparseFutureWindowPlanner(manifest_path, interval_steps=2, rolling_window_steps=1, negative_only=True)
+
+    assert planner._load_steps_window(2, 1) == [streamed_steps[2]]
+    assert planner._load_steps_window(4, 1) == [streamed_steps[4]]
+    assert stream_calls == [0]
 
 
 

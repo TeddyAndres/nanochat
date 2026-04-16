@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -96,6 +96,10 @@ class SparseFutureWindowPlanner:
         self.accumulator = SparseRollingLossAccumulator(window_steps=rolling_window_steps, ranking_mode=ranking_mode)
         self._step_overrides: dict[int, dict[str, Any]] = {}
         self._last_planned_step: int | None = None
+        self._manifest_step_stream: Iterator[dict[str, Any]]
+        self._manifest_step_cache: dict[int, dict[str, Any]]
+        self._next_manifest_step_index = 0
+        self._reset_manifest_step_stream()
 
     def get_step_override(self, step: int) -> dict[str, Any] | None:
         return self._step_overrides.get(int(step))
@@ -119,6 +123,12 @@ class SparseFutureWindowPlanner:
         accumulator_state = state_dict.get("accumulator")
         if isinstance(accumulator_state, dict):
             self.accumulator.load_state_dict(accumulator_state)
+        self._reset_manifest_step_stream()
+
+    def _reset_manifest_step_stream(self) -> None:
+        self._manifest_step_stream = stream_sparse_manifest_steps(self.manifest_path, start_step=0)
+        self._manifest_step_cache = {}
+        self._next_manifest_step_index = 0
 
     def update_from_step_payload(
         self,
@@ -274,11 +284,27 @@ class SparseFutureWindowPlanner:
         return {target_step: planned_override}
 
     def _load_steps_window(self, start_step: int, count: int) -> list[dict[str, Any]]:
-        steps: list[dict[str, Any]] = []
-        for step_entry in stream_sparse_manifest_steps(self.manifest_path, start_step=start_step):
-            steps.append(step_entry)
-            if len(steps) >= count:
+        start_step = int(start_step)
+        count = int(count)
+        if start_step < 0 or count <= 0:
+            return []
+        target_end = start_step + count
+        while self._next_manifest_step_index < target_end:
+            try:
+                step_entry = next(self._manifest_step_stream)
+            except StopIteration:
                 break
+            self._manifest_step_cache[self._next_manifest_step_index] = step_entry
+            self._next_manifest_step_index += 1
+        steps = []
+        for step_index in range(start_step, target_end):
+            step_entry = self._manifest_step_cache.get(step_index)
+            if step_entry is None:
+                break
+            steps.append(step_entry)
+        stale_steps = [step_index for step_index in self._manifest_step_cache if step_index < start_step]
+        for step_index in stale_steps:
+            del self._manifest_step_cache[step_index]
         return steps
 
     def _pop_sequence_for_token(self, remaining_slots: list[int], token_id: int) -> int | None:

@@ -50,6 +50,7 @@ from nanochat.sparse_analysis import (
     select_topk_records,
 )
 from nanochat.sparse_replan import SparseFutureWindowPlanner
+from nanochat.sparse_window_accum import SparseDecayedHardNegativePool
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from nanochat.sparse_manifest import (
@@ -132,6 +133,10 @@ parser.add_argument("--sparse-future-replan-enable", action="store_true", help="
 parser.add_argument("--sparse-future-replan-interval", type=int, default=3, help="number of optimizer steps of lead time before a single future manifest step is replanned; with the current prefetch depth this must be at least 3")
 parser.add_argument("--sparse-future-replan-negative-only", action="store_true", help="keep baseline future microsteps but inject hard negatives from sparse top-K results instead of reordering future sequences")
 parser.add_argument("--sparse-auto-negative-per-microstep", type=int, default=4, help="maximum number of automatic corrective cold negatives to inject per replanned microstep")
+parser.add_argument("--sparse-hard-negative-cloud-enable", action="store_true", help="use a per-step decayed hard-negative pool to reserve lm_head cloud rows when paired targets are present")
+parser.add_argument("--sparse-hard-negative-budget", type=int, default=0, help="maximum number of runtime hard-negative lm_head cloud rows to reserve per step")
+parser.add_argument("--sparse-hard-negative-pool-size", type=int, default=1000, help="maximum number of decayed (wrong, correct) pairs retained in the runtime hard-negative pool")
+parser.add_argument("--sparse-hard-negative-decay", type=float, default=0.98, help="per-optimizer-step exponential decay factor for runtime hard-negative pair scores")
 parser.add_argument("--sparse-replan-sampling-seed", type=int, default=0, help="deterministic seed offset used when sampling from rolling sparse loss lists")
 parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip global gradient norm (dense params only) to this value before optimizer step; 0 = disabled")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
@@ -545,6 +550,7 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 token_cache_workers = max(1, args.token_cache_workers) if args.token_cache_workers > 0 else max(1, min(8, os.cpu_count() or 1))
 sparse_loss_analysis_writer = None
 sparse_future_window_planner = None
+sparse_hard_negative_pool = None
 _topk_analysis_executor = None
 _topk_planner_executor = None
 _topk_analysis_lock = threading.Lock()
@@ -577,6 +583,20 @@ if args.sparse_future_replan_enable:
         planner_state = optimizer_data.get("sparse_planner") if isinstance(optimizer_data, dict) else None
         if isinstance(planner_state, dict):
             sparse_future_window_planner.load_state_dict(planner_state)
+if args.sparse_hard_negative_cloud_enable:
+    assert args.sparse_mode, "--sparse-hard-negative-cloud-enable requires --sparse-mode"
+    assert sparse_lm_head_clouds, "--sparse-hard-negative-cloud-enable requires --sparse-cloud-max-u"
+    assert args.sparse_loss_topk_enable, "--sparse-hard-negative-cloud-enable requires --sparse-loss-topk-enable"
+    assert args.sparse_hard_negative_budget > 0, "--sparse-hard-negative-budget must be positive when hard-negative clouds are enabled"
+    sparse_hard_negative_pool = SparseDecayedHardNegativePool(
+        pool_size=args.sparse_hard_negative_pool_size,
+        decay=args.sparse_hard_negative_decay,
+        ranking_mode=args.sparse_loss_topk_ranking_mode,
+    )
+    if resuming and args.sparse_mode:
+        hard_negative_state = optimizer_data.get("sparse_hard_negative_pool") if isinstance(optimizer_data, dict) else None
+        if isinstance(hard_negative_state, dict):
+            sparse_hard_negative_pool.load_state_dict(hard_negative_state)
 if args.sparse_mode:
     if hybrid_sparse:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
@@ -636,10 +656,53 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
 )
 
 
+def _resolve_step_target_global_ids_cpu(step_meta):
+    if "targets_union_cpu_local" in step_meta and "grad_accum_ids_cpu" in step_meta:
+        target_local = step_meta["targets_union_cpu_local"].detach().to(device="cpu", dtype=torch.long).reshape(-1)
+        target_source = step_meta["grad_accum_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+    elif "targets_cpu_local" in step_meta:
+        target_local = step_meta["targets_cpu_local"].detach().to(device="cpu", dtype=torch.long).reshape(-1)
+        target_source = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+    else:
+        return torch.empty(0, dtype=torch.long)
+    valid_mask = torch.logical_and(target_local >= 0, target_local < target_source.numel())
+    if not valid_mask.any():
+        return torch.empty(0, dtype=torch.long)
+    return torch.unique(target_source.index_select(0, target_local[valid_mask]), sorted=False)
+
+
 def plan_sparse_batch_meta(step_meta):
     if not sparse_lm_head_clouds:
         return step_meta
     assert dynamic_vocab is not None
+    hard_negative_ids_cpu = None
+    hard_negative_budget = 0
+    if sparse_hard_negative_pool is not None:
+        target_ids_cpu = _resolve_step_target_global_ids_cpu(step_meta)
+        if target_ids_cpu.numel() > 0:
+            exclude_ids = set(int(token_id) for token_id in step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long).tolist())
+            with _topk_analysis_lock:
+                hard_negative_selection = sparse_hard_negative_pool.select_for_targets(
+                    target_ids_cpu.tolist(),
+                    step=dynamic_vocab.runtime_step,
+                    limit=args.sparse_hard_negative_budget,
+                    exclude=exclude_ids,
+                )
+            selected_ids = hard_negative_selection["negative_ids"]
+            candidate_count = hard_negative_selection["candidate_count"]
+            matched_target_count = hard_negative_selection["matched_target_count"]
+            matched_pair_count = hard_negative_selection["matched_pair_count"]
+            assert isinstance(selected_ids, list)
+            assert isinstance(candidate_count, int)
+            assert isinstance(matched_target_count, int)
+            assert isinstance(matched_pair_count, int)
+            if selected_ids:
+                hard_negative_ids_cpu = torch.tensor(selected_ids, dtype=torch.long)
+            step_meta = dict(step_meta)
+            step_meta["hard_negative_candidate_count"] = candidate_count
+            step_meta["hard_negative_matched_target_count"] = matched_target_count
+            step_meta["hard_negative_matched_pair_count"] = matched_pair_count
+            hard_negative_budget = int(args.sparse_hard_negative_budget)
     return dynamic_vocab.plan_next_lm_head_cloud(
         step_meta,
         warm_proportion=args.sparse_cloud_warm_proportion,
@@ -648,6 +711,8 @@ def plan_sparse_batch_meta(step_meta):
         source_token_limit=args.sparse_cloud_hidden_query_samples,
         hidden_query_strategy=args.sparse_cloud_hidden_query_strategy,
         hidden_query_max_prefix_len=args.sparse_cloud_hidden_query_max_prefix_len,
+        hard_negative_ids_cpu=hard_negative_ids_cpu,
+        hard_negative_budget=hard_negative_budget,
     )
 
 
@@ -803,6 +868,7 @@ def _run_topk_analysis(
     writer,
     planner_executor,
     planner,
+    hard_negative_pool,
     lock,
 ):
     """
@@ -877,6 +943,13 @@ def _run_topk_analysis(
     }
     if writer is not None:
         writer.submit(step, analysis_cpu_payload)
+    if hard_negative_pool is not None:
+        with lock:
+            hard_negative_pool.update_step(
+                step,
+                incorrect_scores=step_incorrect_scores_all,
+                incorrect_records=step_incorrect_records_all,
+            )
     # Planner update is submitted to a separate executor so it never serialises
     # with the analysis→write path above.
     if planner is not None:
@@ -930,7 +1003,8 @@ if not resuming:
     val_ece = None
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
-    total_training_time = 0 # total wall-clock time of training
+    total_training_time = 0 # total accumulated train-step time
+    eta_training_time = 0 # warmup-filtered train-step time for ETA estimation
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -939,6 +1013,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    eta_training_time = loop_state.get("eta_training_time", total_training_time)
 
 peak_memory_usage = capture_peak_memory_bytes()
 peak_training_memory_usage = 0
@@ -1129,6 +1204,8 @@ while True:
             }
             if sparse_future_window_planner is not None:
                 optimizer_payload["sparse_planner"] = sparse_future_window_planner.state_dict()
+            if sparse_hard_negative_pool is not None:
+                optimizer_payload["sparse_hard_negative_pool"] = sparse_hard_negative_pool.state_dict()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -1151,6 +1228,7 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "eta_training_time": eta_training_time,
                 },
             },
             rank=ddp_rank,
@@ -1413,6 +1491,7 @@ while True:
             sparse_loss_analysis_writer,
             _topk_planner_executor,
             sparse_future_window_planner,
+            sparse_hard_negative_pool,
             _topk_analysis_lock,
         )
     model.zero_grad(set_to_none=True)
@@ -1444,12 +1523,13 @@ while True:
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    total_training_time += dt
     if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
+        eta_training_time += dt # only count the time after the first 10 steps
     # Calculate ETA based on average time per step (excluding first 10 steps)
     steps_done = step - 10
     if steps_done > 0:
-        avg_time_per_step = total_training_time / steps_done
+        avg_time_per_step = eta_training_time / steps_done
         remaining_steps = num_iterations - step
         eta_seconds = remaining_steps * avg_time_per_step
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
@@ -1467,10 +1547,13 @@ while True:
             sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
         else:
             sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
+        hard_negative_count = 0 if sparse_metrics.hard_negative_ids_cpu is None else int(sparse_metrics.hard_negative_ids_cpu.numel())
         warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
-        cold_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
-        if warm_count > 0 or cold_count > 0:
+        cold_total_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
+        cold_count = max(cold_total_count - hard_negative_count, 0)
+        if hard_negative_count > 0 or warm_count > 0 or cold_count > 0:
             sparse_str += (
+                f" | hard_neg: {hard_negative_count:,}/{sparse_metrics.hard_negative_budget_target:,}"
                 f" | warm: {warm_count:,}/{sparse_metrics.warm_budget_target:,}"
                 f" | cold: {cold_count:,}/{sparse_metrics.cold_budget_target:,}"
             )
@@ -1567,8 +1650,10 @@ while True:
             "train/step_peak_memory_mib": step_peak_memory / 1024 / 1024,
         }
         if sparse_metrics is not None:
+            hard_negative_count = 0 if sparse_metrics.hard_negative_ids_cpu is None else int(sparse_metrics.hard_negative_ids_cpu.numel())
             warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
-            cold_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
+            cold_total_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
+            cold_count = max(cold_total_count - hard_negative_count, 0)
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
                 "train/u_step": sparse_metrics.step_u_count if sparse_metrics.step_u_count > 0 else sparse_metrics.unique_count,
@@ -1576,9 +1661,12 @@ while True:
                 "train/u_capacity": sparse_metrics.u_capacity,
                 "train/u_stage": sparse_metrics.stage_count,
                 "train/u_writeback": sparse_metrics.writeback_count,
+                "train/u_hard_negative": hard_negative_count,
                 "train/u_warm": warm_count,
                 "train/u_cold": cold_count,
                 "train/u_residual": sparse_metrics.cloud_residual_capacity,
+                "train/u_hard_negative_target": sparse_metrics.hard_negative_budget_target,
+                "train/u_hard_negative_candidates": sparse_metrics.hard_negative_candidate_count,
                 "train/u_warm_target": sparse_metrics.warm_budget_target,
                 "train/u_cold_target": sparse_metrics.cold_budget_target,
                 "train/u_warm_candidates": sparse_metrics.warm_candidate_count,

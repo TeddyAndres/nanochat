@@ -68,6 +68,8 @@ class DynamicVocabStep:
     stage_count: int = 0
     writeback_count: int = 0
     cloud_residual_capacity: int = 0
+    hard_negative_budget_target: int = 0
+    hard_negative_candidate_count: int = 0
     warm_budget_target: int = 0
     cold_budget_target: int = 0
     warm_candidate_count: int = 0
@@ -87,6 +89,7 @@ class DynamicVocabStep:
     grad_accum_ids_cpu: Optional[torch.Tensor] = None
     lm_head_active_ids_cpu: Optional[torch.Tensor] = None
     lm_head_active_slot_ids_cpu: Optional[torch.Tensor] = None
+    hard_negative_ids_cpu: Optional[torch.Tensor] = None
     warm_ids_cpu: Optional[torch.Tensor] = None
     warm_slot_ids_cpu: Optional[torch.Tensor] = None
     cold_ids_cpu: Optional[torch.Tensor] = None
@@ -710,14 +713,19 @@ class DynamicVocabRuntime:
         source_token_limit: int,
         hidden_query_strategy: str = "uniform",
         hidden_query_max_prefix_len: int = 2048,
+        hard_negative_ids_cpu: Optional[torch.Tensor] = None,
+        hard_negative_budget: int = 0,
     ) -> dict:
         plan_t0 = time.perf_counter()
         planned_step_meta = dict(step_meta)
         planned_step_meta["warm_ids_cpu"] = self._empty_long_cpu()
         planned_step_meta["cold_ids_cpu"] = self._empty_long_cpu()
+        planned_step_meta["hard_negative_ids_cpu"] = self._empty_long_cpu()
         planned_step_meta["warm_candidate_ids_cpu"] = self._empty_long_cpu()
         planned_step_meta["lm_head_u_max"] = int(self.lm_head_u_max)
         planned_step_meta["cloud_residual_capacity"] = 0
+        planned_step_meta["hard_negative_budget_target"] = 0
+        planned_step_meta["hard_negative_candidate_count"] = int(step_meta.get("hard_negative_candidate_count", 0))
         planned_step_meta["warm_budget_target"] = 0
         planned_step_meta["cold_budget_target"] = 0
         planned_step_meta["warm_candidate_count"] = 0
@@ -738,13 +746,43 @@ class DynamicVocabRuntime:
             planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
             return planned_step_meta
 
-        warm_budget = min(residual_capacity, max(int(round(residual_capacity * float(warm_proportion))), 0))
-        cold_budget = residual_capacity - warm_budget
+        excluded_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
+        excluded_mask_cpu[step_ids_cpu] = True
+        selected_hard_negative_ids_cpu = self._empty_long_cpu()
+        hard_negative_budget = max(int(hard_negative_budget), 0)
+        hard_negative_budget_target = min(residual_capacity, hard_negative_budget)
+        if hard_negative_ids_cpu is not None and hard_negative_budget_target > 0:
+            hard_negative_ids_cpu = hard_negative_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+            selected_hard_negative_ids: list[int] = []
+            seen_hard_negative_ids: set[int] = set()
+            for token_id in hard_negative_ids_cpu.tolist():
+                token_id = int(token_id)
+                if token_id < 0 or token_id in seen_hard_negative_ids:
+                    continue
+                if bool(excluded_mask_cpu[token_id]):
+                    continue
+                seen_hard_negative_ids.add(token_id)
+                selected_hard_negative_ids.append(token_id)
+            planned_step_meta["hard_negative_candidate_count"] = len(selected_hard_negative_ids)
+            if selected_hard_negative_ids:
+                selected_hard_negative_ids_cpu = torch.tensor(
+                    selected_hard_negative_ids[:hard_negative_budget_target],
+                    dtype=torch.long,
+                )
+            if selected_hard_negative_ids_cpu.numel() > 0:
+                excluded_mask_cpu[selected_hard_negative_ids_cpu] = True
+        planned_step_meta["hard_negative_budget_target"] = int(hard_negative_budget_target)
+        planned_step_meta["hard_negative_ids_cpu"] = selected_hard_negative_ids_cpu
+
+        residual_capacity_after_hard_negative = max(residual_capacity - int(selected_hard_negative_ids_cpu.numel()), 0)
+        warm_budget = min(
+            residual_capacity_after_hard_negative,
+            max(int(round(residual_capacity_after_hard_negative * float(warm_proportion))), 0),
+        )
+        cold_budget = residual_capacity_after_hard_negative - warm_budget
         planned_step_meta["warm_budget_target"] = int(warm_budget)
         planned_step_meta["cold_budget_target"] = int(cold_budget)
 
-        excluded_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        excluded_mask_cpu[step_ids_cpu] = True
         prev_cloud_ids_cpu = self._get_resident_cloud_ids_cpu()
         prev_cloud_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
         if prev_cloud_ids_cpu.numel() > 0:
@@ -824,8 +862,14 @@ class DynamicVocabRuntime:
                 if cold_fill_ids_cpu.numel() > 0:
                     cold_ids_cpu = torch.cat((cold_ids_cpu, cold_fill_ids_cpu)) if cold_ids_cpu.numel() > 0 else cold_fill_ids_cpu
 
+        runtime_cold_ids_cpu = cold_ids_cpu
+        if selected_hard_negative_ids_cpu.numel() > 0:
+            runtime_cold_ids_cpu = (
+                torch.cat((selected_hard_negative_ids_cpu, cold_ids_cpu))
+                if cold_ids_cpu.numel() > 0 else selected_hard_negative_ids_cpu
+            )
         planned_step_meta["warm_ids_cpu"] = warm_ids_cpu
-        planned_step_meta["cold_ids_cpu"] = cold_ids_cpu
+        planned_step_meta["cold_ids_cpu"] = runtime_cold_ids_cpu
         planned_step_meta["warm_candidate_ids_cpu"] = warm_candidate_ids_cpu
         planned_step_meta["warm_candidate_count"] = int(warm_candidate_ids_cpu.numel())
         planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
@@ -2175,6 +2219,8 @@ class DynamicVocabRuntime:
                 (grad_accum_stage_ids_cpu.numel() if grad_accum_steps > 1 and not preserve_resident_grads else 0)
             ),
             cloud_residual_capacity=int(step_meta.get("cloud_residual_capacity", 0)),
+            hard_negative_budget_target=int(step_meta.get("hard_negative_budget_target", 0)),
+            hard_negative_candidate_count=int(step_meta.get("hard_negative_candidate_count", 0)),
             warm_budget_target=int(step_meta.get("warm_budget_target", 0)),
             cold_budget_target=int(step_meta.get("cold_budget_target", 0)),
             warm_candidate_count=int(step_meta.get("warm_candidate_count", 0)),
@@ -2191,6 +2237,7 @@ class DynamicVocabRuntime:
             grad_accum_ids_cpu=grad_accum_ids_cpu,
             lm_head_active_ids_cpu=grad_accum_ids_cpu if grad_accum_steps > 1 else lm_head_active_ids_cpu,
             lm_head_active_slot_ids_cpu=torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long) if grad_accum_steps > 1 else lm_head_active_slot_ids_cpu,
+            hard_negative_ids_cpu=step_meta.get("hard_negative_ids_cpu"),
             warm_ids_cpu=warm_ids_cpu,
             warm_slot_ids_cpu=warm_slot_ids_cpu,
             cold_ids_cpu=cold_ids_cpu,

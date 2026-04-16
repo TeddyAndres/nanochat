@@ -21,6 +21,7 @@ from nanochat.sparse_analysis import (
     select_topk_records,
 )
 from nanochat.sparse_window_accum import SparseRollingLossAccumulator
+from nanochat.sparse_window_accum import SparseDecayedHardNegativePool
 
 
 def test_collect_sparse_loss_topk_shapes_and_global_ids():
@@ -484,3 +485,59 @@ def test_sparse_rolling_loss_accumulator_accumulated_mode_sums_across_window():
 
     assert accumulator.correct_totals[10] == 6.0
     assert accumulator.incorrect_pair_totals[(20, 10)] == 4.5
+
+
+def test_sparse_decayed_hard_negative_pool_decays_and_prunes_pairs():
+    pool = SparseDecayedHardNegativePool(pool_size=2, decay=0.5)
+    incorrect_records = torch.tensor(
+        [
+            [0, 0, 0, 0, 0, 0, 10, 0, 20],
+            [0, 0, 0, 0, 0, 0, 11, 0, 30],
+        ],
+        dtype=torch.long,
+    )
+    pool.update_step(
+        0,
+        incorrect_scores=torch.tensor([4.0, 3.0], dtype=torch.float32),
+        incorrect_records=incorrect_records,
+    )
+    pool.update_step(
+        2,
+        incorrect_scores=torch.tensor([5.0], dtype=torch.float32),
+        incorrect_records=torch.tensor([[2, 0, 0, 0, 0, 0, 12, 0, 40]], dtype=torch.long),
+    )
+
+    ranked_pairs = pool.ranked_pairs(step=2)
+    assert [pair for pair, _ in ranked_pairs] == [(40, 12), (20, 10)]
+    assert pool.pair_count == 2
+
+
+def test_sparse_decayed_hard_negative_pool_selects_only_for_present_targets():
+    pool = SparseDecayedHardNegativePool(pool_size=4, decay=1.0)
+    incorrect_records = torch.tensor(
+        [
+            [0, 0, 0, 0, 0, 0, 10, 0, 20],
+            [0, 0, 0, 0, 0, 0, 10, 0, 21],
+            [0, 0, 0, 0, 0, 0, 11, 0, 30],
+        ],
+        dtype=torch.long,
+    )
+    pool.update_step(
+        0,
+        incorrect_scores=torch.tensor([4.0, 1.0, 3.0], dtype=torch.float32),
+        incorrect_records=incorrect_records,
+    )
+
+    selection = pool.select_for_targets({11}, step=0, limit=2, exclude={30})
+
+    assert selection["negative_ids"] == []
+    assert selection["candidate_count"] == 0
+    assert selection["matched_target_count"] == 1
+    assert selection["matched_pair_count"] == 1
+
+    selection = pool.select_for_targets({10}, step=0, limit=2, exclude={21})
+
+    assert selection["negative_ids"] == [20]
+    assert selection["candidate_count"] == 1
+    assert selection["matched_target_count"] == 1
+    assert selection["matched_pair_count"] == 2
