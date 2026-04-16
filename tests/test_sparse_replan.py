@@ -142,8 +142,7 @@ def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
 
     planner = SparseFutureWindowPlanner(
         grouping_manifest_path,
-        lookahead_steps=1,
-        window_steps=2,
+        interval_steps=2,
     )
     correct_records = torch.tensor(
         [
@@ -170,20 +169,169 @@ def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
         incorrect_records=incorrect_records,
     )
 
-    assert sorted(planned.keys()) == [1, 2]
-    step1 = planned[1]
-    assert len(step1["microsteps"]) == 4
-    assert step1["microsteps"][0]["planner_bucket"] == "positive"
-    assert step1["microsteps"][0]["sequence_id"] == 4
-    assert step1["microsteps"][0]["focus_token_id"] == 52
-    assert step1["microsteps"][1]["planner_bucket"] == "corrective"
-    assert step1["microsteps"][1]["sequence_id"] == 6
-    assert step1["microsteps"][1]["injected_negative_ids"] == [999]
-    assert 999 in step1["microsteps"][1]["active_ids"]
-    assert [microstep["sequence_id"] for microstep in step1["microsteps"][2:]] == [0, 1]
-
+    assert sorted(planned.keys()) == [2]
     step2 = planned[2]
-    assert [microstep["sequence_id"] for microstep in step2["microsteps"]] == [2, 3, 5, 7]
+    assert len(step2["microsteps"]) == 4
+    assert step2["microsteps"][0]["planner_bucket"] == "positive"
+    assert step2["microsteps"][0]["sequence_id"] == 4
+    assert step2["microsteps"][0]["focus_token_id"] == 52
+    assert step2["microsteps"][1]["planner_bucket"] == "corrective"
+    assert step2["microsteps"][1]["sequence_id"] == 6
+    assert step2["microsteps"][1]["injected_negative_ids"] == [999]
+    assert 999 in step2["microsteps"][1]["active_ids"]
+    assert [microstep["sequence_id"] for microstep in step2["microsteps"][2:]] == [5, 7]
+
+
+def test_sparse_future_window_planner_targets_exactly_one_future_step_per_update(tmp_path):
+    base_shard_path = tmp_path / "sequence_base_shard_000.sqlite"
+    base_manifest_path = tmp_path / "sequence_base.json"
+    grouping_shard_path = tmp_path / "grouping_shard_000.json"
+    grouping_manifest_path = tmp_path / "grouping_manifest.json"
+
+    sequence_units = []
+    for sequence_id, token_base in enumerate(range(10, 60, 10)):
+        sequence_units.append(
+            {
+                "sequence_id": sequence_id,
+                "state_dict": {"pq_idx": sequence_id, "rg_idx": 0, "epoch": 0},
+                "sequence_recipe": {"row_capacity": 3, "rows": []},
+                "num_unique_tokens": 2,
+                "unique_token_ids": [token_base + 1, token_base + 2],
+                "sequence_geometry": {"rows": 1, "tokens": 2},
+            }
+        )
+    save_sequence_manifest_shard(
+        base_shard_path,
+        build_sequence_manifest_shard_payload(
+            shard_index=0,
+            start_sequence_id=0,
+            sequence_units=sequence_units,
+        ),
+    )
+    save_sparse_manifest(
+        base_manifest_path,
+        build_sequence_manifest_payload(
+            split="train",
+            vocab_size=2048,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=3,
+            grad_accum_steps=3,
+            ddp_world_size=1,
+            num_iterations=5,
+            buffer_size=3,
+            num_sequence_units=len(sequence_units),
+            shard_sequence_count=len(sequence_units),
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(base_shard_path.relative_to(tmp_path)),
+                    "start_sequence_id": 0,
+                    "num_sequence_units": len(sequence_units),
+                }
+            ],
+        ),
+    )
+
+    steps = []
+    baseline_sequences = [
+        [0, 1, 2],
+        [0, 1, 2],
+        [1, 2, 3],
+        [1, 2, 3],
+        [2, 3, 4],
+    ]
+    for sequence_ids in baseline_sequences:
+        microsteps = []
+        grad_accum_active_ids = []
+        for micro_idx, sequence_id in enumerate(sequence_ids):
+            active_ids = sequence_units[sequence_id]["unique_token_ids"]
+            grad_accum_active_ids.extend(active_ids)
+            microsteps.append(
+                {
+                    "microstep": micro_idx,
+                    "sequence_id": sequence_id,
+                    "u_size": len(active_ids),
+                    "active_ids": active_ids,
+                    "next_active_ids": active_ids,
+                    "next_u_size": len(active_ids),
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                }
+            )
+        steps.append(
+            {
+                "grad_accum_u_size": len(set(grad_accum_active_ids)),
+                "grad_accum_active_ids": list(dict.fromkeys(grad_accum_active_ids)),
+                "microsteps": microsteps,
+            }
+        )
+    with grouping_shard_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "version": 4,
+                "manifest_kind": "grouping",
+                "shard_index": 0,
+                "start_step": 0,
+                "num_steps": len(steps),
+                "u_max": 3,
+                "grad_accum_u_max": 9,
+                "steps": steps,
+            },
+            f,
+        )
+    save_sparse_manifest(
+        grouping_manifest_path,
+        build_grouping_manifest_payload(
+            split="train",
+            vocab_size=2048,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=3,
+            grad_accum_steps=3,
+            ddp_world_size=1,
+            num_iterations=5,
+            buffer_size=3,
+            u_max=3,
+            grad_accum_u_max=9,
+            shard_step_count=len(steps),
+            shards=[
+                {
+                    "shard_index": 0,
+                    "path": str(grouping_shard_path.relative_to(tmp_path)),
+                    "start_step": 0,
+                    "num_steps": len(steps),
+                    "u_max": 3,
+                    "grad_accum_u_max": 9,
+                }
+            ],
+            base_manifest_path=str(base_manifest_path.relative_to(tmp_path)),
+        ),
+    )
+
+    planner = SparseFutureWindowPlanner(grouping_manifest_path, interval_steps=2)
+    planner.update_from_step_payload(
+        0,
+        correct_scores=torch.tensor([5.0], dtype=torch.float32),
+        correct_records=torch.tensor([[0, 0, 0, 0, 0, 0, 32]], dtype=torch.long),
+        incorrect_scores=torch.tensor([1.0], dtype=torch.float32),
+        incorrect_records=torch.tensor([[0, 0, 0, 0, 0, 0, 32, 0, 999]], dtype=torch.long),
+    )
+    first_override = planner.get_step_override(2)
+    assert first_override is not None
+    assert planner.get_step_override(3) is None
+
+    planner.update_from_step_payload(
+        1,
+        correct_scores=torch.tensor([4.0], dtype=torch.float32),
+        correct_records=torch.tensor([[1, 0, 0, 0, 0, 0, 42]], dtype=torch.long),
+        incorrect_scores=torch.tensor([2.0], dtype=torch.float32),
+        incorrect_records=torch.tensor([[1, 0, 0, 0, 0, 0, 42, 0, 888]], dtype=torch.long),
+    )
+
+    assert planner.get_step_override(2) == first_override
+    assert planner.get_step_override(3) is not None
+
 
 
 def test_sparse_future_window_planner_auto_injects_cold_negative_for_baseline_sequence(tmp_path):
@@ -271,7 +419,7 @@ def test_sparse_future_window_planner_auto_injects_cold_negative_for_baseline_se
         ),
     )
 
-    planner = SparseFutureWindowPlanner(grouping_manifest_path, lookahead_steps=1, window_steps=1, positive_fraction=0.0, corrective_fraction=0.0)
+    planner = SparseFutureWindowPlanner(grouping_manifest_path, interval_steps=1, positive_fraction=0.0, corrective_fraction=0.0)
     planner.update_from_step_payload(
         0,
         correct_scores=torch.tensor([1.0], dtype=torch.float32),
@@ -473,8 +621,7 @@ def test_sparse_future_window_planner_tracks_single_occurrence_rolling_maxima(tm
 
     planner = SparseFutureWindowPlanner(
         grouping_manifest_path,
-        lookahead_steps=1,
-        window_steps=1,
+        interval_steps=1,
         rolling_window_steps=2,
         positive_fraction=0.5,
         corrective_fraction=0.0,

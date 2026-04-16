@@ -66,8 +66,7 @@ class SparseFutureWindowPlanner:
         self,
         manifest_path: str | Path,
         *,
-        lookahead_steps: int = 2,
-        window_steps: int = 8,
+        interval_steps: int = 3,
         rolling_window_steps: int = 20,
         positive_fraction: float = 0.25,
         corrective_fraction: float = 0.25,
@@ -83,8 +82,7 @@ class SparseFutureWindowPlanner:
         self.grad_accum_steps = int(self.grouping_header["grad_accum_steps"])
         self.u_max = int(self.grouping_header["u_max"])
         self.grad_accum_u_max = int(self.grouping_header.get("grad_accum_u_max", self.u_max))
-        self.lookahead_steps = max(1, int(lookahead_steps))
-        self.window_steps = max(1, int(window_steps))
+        self.interval_steps = max(1, int(interval_steps))
         self.positive_fraction = float(positive_fraction)
         self.corrective_fraction = float(corrective_fraction)
         self.max_auto_negatives_per_microstep = max(0, int(max_auto_negatives_per_microstep))
@@ -152,99 +150,87 @@ class SparseFutureWindowPlanner:
         )
 
     def _plan_from_accumulator(self, step: int) -> dict[int, dict[str, Any]]:
-        start_step = int(step) + self.lookahead_steps
-        if start_step >= self.num_steps:
+        target_step = int(step) + self.interval_steps
+        if target_step >= self.num_steps:
             return {}
-        baseline_steps = self._load_steps_window(start_step, self.window_steps)
+        baseline_steps = self._load_steps_window(target_step, 1)
         if not baseline_steps:
             return {}
-        future_sequence_slots = [
-            int(microstep["sequence_id"])
-            for step_entry in baseline_steps
-            for microstep in step_entry.get("microsteps", [])
-        ]
+        baseline_step_entry = baseline_steps[0]
+        future_sequence_slots = [int(microstep["sequence_id"]) for microstep in baseline_step_entry.get("microsteps", [])]
         if len(future_sequence_slots) == 0:
             return {}
 
         positive_records = self.accumulator.sample_correct_tokens(len(future_sequence_slots), seed=self.sampling_seed + int(step) * 17 + 1)
         corrective_records = self.accumulator.sample_incorrect_pairs(len(future_sequence_slots), seed=self.sampling_seed + int(step) * 17 + 2)
-        planned_overrides: dict[int, dict[str, Any]] = {}
         remaining_slots = list(future_sequence_slots)
+        slot_count = len(baseline_step_entry.get("microsteps", []))
+        if slot_count <= 0:
+            return {}
+        positive_quota = min(int(math.floor(slot_count * self.positive_fraction)), slot_count)
+        corrective_quota = min(int(math.floor(slot_count * self.corrective_fraction)), slot_count - positive_quota)
+        baseline_quota = max(0, slot_count - positive_quota - corrective_quota)
 
-        for window_idx, baseline_step_entry in enumerate(baseline_steps):
-            override_step = start_step + window_idx
-            slot_count = len(baseline_step_entry.get("microsteps", []))
-            if slot_count <= 0:
+        selected_microsteps: list[dict[str, Any]] = []
+        for token_id in positive_records:
+            if positive_quota <= 0:
+                break
+            sequence_id = self._pop_sequence_for_token(remaining_slots, token_id)
+            if sequence_id is None:
                 continue
-            positive_quota = min(int(math.floor(slot_count * self.positive_fraction)), slot_count)
-            corrective_quota = min(int(math.floor(slot_count * self.corrective_fraction)), slot_count - positive_quota)
-            baseline_quota = max(0, slot_count - positive_quota - corrective_quota)
+            selected_microsteps.append(self._build_microstep(sequence_id, bucket="positive", focus_token_id=token_id))
+            positive_quota -= 1
 
-            selected_microsteps: list[dict[str, Any]] = []
-            for token_id in positive_records:
-                if positive_quota <= 0:
-                    break
-                sequence_id = self._pop_sequence_for_token(remaining_slots, token_id)
-                if sequence_id is None:
-                    continue
-                selected_microsteps.append(self._build_microstep(sequence_id, bucket="positive", focus_token_id=token_id))
-                positive_quota -= 1
-
-            for wrong_token_id, correct_token_id in corrective_records:
-                if corrective_quota <= 0:
-                    break
-                sequence_id = self._pop_sequence_for_token(remaining_slots, correct_token_id)
-                if sequence_id is None:
-                    continue
-                selected_microsteps.append(
-                    self._build_microstep(
-                        sequence_id,
-                        bucket="corrective",
-                        focus_token_id=correct_token_id,
-                        explicit_negative_entries=[(wrong_token_id, self.accumulator.incorrect_pair_totals.get((wrong_token_id, correct_token_id), 0.0))],
-                    )
+        for wrong_token_id, correct_token_id in corrective_records:
+            if corrective_quota <= 0:
+                break
+            sequence_id = self._pop_sequence_for_token(remaining_slots, correct_token_id)
+            if sequence_id is None:
+                continue
+            selected_microsteps.append(
+                self._build_microstep(
+                    sequence_id,
+                    bucket="corrective",
+                    focus_token_id=correct_token_id,
+                    explicit_negative_entries=[(wrong_token_id, self.accumulator.incorrect_pair_totals.get((wrong_token_id, correct_token_id), 0.0))],
                 )
-                corrective_quota -= 1
+            )
+            corrective_quota -= 1
 
-            while baseline_quota > 0 and remaining_slots:
-                sequence_id = remaining_slots.pop(0)
-                selected_microsteps.append(self._build_microstep(sequence_id, bucket="baseline"))
-                baseline_quota -= 1
+        while baseline_quota > 0 and remaining_slots:
+            sequence_id = remaining_slots.pop(0)
+            selected_microsteps.append(self._build_microstep(sequence_id, bucket="baseline"))
+            baseline_quota -= 1
 
-            while len(selected_microsteps) < slot_count and remaining_slots:
-                sequence_id = remaining_slots.pop(0)
-                selected_microsteps.append(self._build_microstep(sequence_id, bucket="baseline"))
+        while len(selected_microsteps) < slot_count and remaining_slots:
+            sequence_id = remaining_slots.pop(0)
+            selected_microsteps.append(self._build_microstep(sequence_id, bucket="baseline"))
 
-            if len(selected_microsteps) != slot_count:
-                selected_microsteps = [
-                    self._build_microstep(int(microstep["sequence_id"]), bucket="baseline")
-                    for microstep in baseline_step_entry.get("microsteps", [])
-                ]
+        if len(selected_microsteps) != slot_count:
+            selected_microsteps = [
+                self._build_microstep(int(microstep["sequence_id"]), bucket="baseline")
+                for microstep in baseline_step_entry.get("microsteps", [])
+            ]
 
+        grad_accum_active_ids = _dedupe_preserve_order(
+            [token_id for microstep in selected_microsteps for token_id in microstep["active_ids"]]
+        )
+        if len(grad_accum_active_ids) > self.grad_accum_u_max:
+            selected_microsteps = [
+                self._build_baseline_microstep(microstep)
+                for microstep in baseline_step_entry.get("microsteps", [])
+            ]
             grad_accum_active_ids = _dedupe_preserve_order(
                 [token_id for microstep in selected_microsteps for token_id in microstep["active_ids"]]
             )
-            if len(grad_accum_active_ids) > self.grad_accum_u_max:
-                selected_microsteps = [
-                    self._build_baseline_microstep(microstep)
-                    for microstep in baseline_step_entry.get("microsteps", [])
-                ]
-                grad_accum_active_ids = _dedupe_preserve_order(
-                    [token_id for microstep in selected_microsteps for token_id in microstep["active_ids"]]
-                )
-            planned_overrides[override_step] = {
-                "grad_accum_active_ids": grad_accum_active_ids,
-                "grad_accum_u_size": len(grad_accum_active_ids),
-                "microsteps": selected_microsteps,
-                "replanned_from_step": int(step),
-            }
-
-        override_end = start_step + len(planned_overrides)
-        for override_step in list(self._step_overrides.keys()):
-            if start_step <= override_step < override_end:
-                del self._step_overrides[override_step]
-        self._step_overrides.update(planned_overrides)
-        return planned_overrides
+        planned_override = {
+            "grad_accum_active_ids": grad_accum_active_ids,
+            "grad_accum_u_size": len(grad_accum_active_ids),
+            "microsteps": selected_microsteps,
+            "replanned_from_step": int(step),
+        }
+        self._step_overrides[target_step] = planned_override
+        return {target_step: planned_override}
 
     def _load_steps_window(self, start_step: int, count: int) -> list[dict[str, Any]]:
         steps: list[dict[str, Any]] = []

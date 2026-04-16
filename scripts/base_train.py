@@ -63,6 +63,7 @@ from scripts.base_eval import evaluate_core
 print_banner()
 
 SPARSE_RUNTIME_CAPACITY_MULTIPLE = 32
+SPARSE_TRAIN_PREFETCH_DEPTH = 2
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -128,8 +129,7 @@ parser.add_argument("--sparse-loss-topk-incorrect", type=int, default=50, help="
 parser.add_argument("--sparse-loss-topk-output", type=str, default="", help="dataset-side directory for async sparse top-K analysis output (empty = default beside token cache)")
 parser.add_argument("--sparse-loss-window-steps", type=int, default=20, help="rolling optimizer-step window used to accumulate sparse loss totals for replanning")
 parser.add_argument("--sparse-future-replan-enable", action="store_true", help="use per-step sparse top-K tensors to build delayed future grouping overrides in memory")
-parser.add_argument("--sparse-future-replan-lookahead", type=int, default=2, help="number of optimizer steps to delay sparse future-window replanning")
-parser.add_argument("--sparse-future-replan-window-steps", type=int, default=8, help="number of future optimizer steps to replan per sparse analysis update")
+parser.add_argument("--sparse-future-replan-interval", type=int, default=3, help="number of optimizer steps of lead time before a single future manifest step is replanned; with the current prefetch depth this must be at least 3")
 parser.add_argument("--sparse-auto-negative-per-microstep", type=int, default=4, help="maximum number of automatic corrective cold negatives to inject per replanned microstep")
 parser.add_argument("--sparse-replan-sampling-seed", type=int, default=0, help="deterministic seed offset used when sampling from rolling sparse loss lists")
 parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip global gradient norm (dense params only) to this value before optimizer step; 0 = disabled")
@@ -556,12 +556,16 @@ if args.sparse_future_replan_enable:
     assert args.sparse_mode, "--sparse-future-replan-enable requires --sparse-mode"
     assert hybrid_sparse, "--sparse-future-replan-enable requires --sparse-manifest"
     assert args.sparse_loss_topk_enable, "--sparse-future-replan-enable requires --sparse-loss-topk-enable"
+    min_safe_replan_interval = SPARSE_TRAIN_PREFETCH_DEPTH + 1
+    assert args.sparse_future_replan_interval >= min_safe_replan_interval, (
+        "--sparse-future-replan-interval must be at least "
+        f"{min_safe_replan_interval} with the current sparse prefetch depth={SPARSE_TRAIN_PREFETCH_DEPTH}"
+    )
     # Sequential planner executor — keeps planner updates ordered and off the analysis path
     _topk_planner_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="topk_planner")
     sparse_future_window_planner = SparseFutureWindowPlanner(
         args.sparse_manifest,
-        lookahead_steps=args.sparse_future_replan_lookahead,
-        window_steps=args.sparse_future_replan_window_steps,
+        interval_steps=args.sparse_future_replan_interval,
         rolling_window_steps=args.sparse_loss_window_steps,
         max_auto_negatives_per_microstep=args.sparse_auto_negative_per_microstep,
         sampling_seed=args.sparse_replan_sampling_seed,
@@ -589,7 +593,7 @@ if args.sparse_mode:
             token_cache_shard_batches=args.token_cache_shard_batches,
             token_cache_workers=token_cache_workers,
         )
-        train_loader = AsyncLoaderPrefetcher(train_loader, max_prefetch=2)
+        train_loader = AsyncLoaderPrefetcher(train_loader, max_prefetch=SPARSE_TRAIN_PREFETCH_DEPTH)
     else:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_dynamic(
             tokenizer,
@@ -604,7 +608,7 @@ if args.sparse_mode:
             token_cache_shard_batches=args.token_cache_shard_batches,
             token_cache_workers=token_cache_workers,
         )
-        train_loader = AsyncLoaderPrefetcher(train_loader, max_prefetch=2)
+        train_loader = AsyncLoaderPrefetcher(train_loader, max_prefetch=SPARSE_TRAIN_PREFETCH_DEPTH)
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer,
