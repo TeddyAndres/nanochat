@@ -95,6 +95,7 @@ class SparseFutureWindowPlanner:
         self.sampling_seed = int(sampling_seed)
         self.accumulator = SparseRollingLossAccumulator(window_steps=rolling_window_steps, ranking_mode=ranking_mode)
         self._step_overrides: dict[int, dict[str, Any]] = {}
+        self._last_planned_step: int | None = None
 
     def get_step_override(self, step: int) -> dict[str, Any] | None:
         return self._step_overrides.get(int(step))
@@ -108,10 +109,13 @@ class SparseFutureWindowPlanner:
         return {
             "step_overrides": self._step_overrides,
             "accumulator": self.accumulator.state_dict(),
+            "last_planned_step": self._last_planned_step,
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self._step_overrides = {int(step): value for step, value in state_dict.get("step_overrides", {}).items()}
+        last_planned_step = state_dict.get("last_planned_step")
+        self._last_planned_step = None if last_planned_step is None else int(last_planned_step)
         accumulator_state = state_dict.get("accumulator")
         if isinstance(accumulator_state, dict):
             self.accumulator.load_state_dict(accumulator_state)
@@ -158,6 +162,8 @@ class SparseFutureWindowPlanner:
     def _plan_from_accumulator(self, step: int) -> dict[int, dict[str, Any]]:
         if not self.accumulator.is_warmed_up:
             return {}
+        if self._last_planned_step is not None and int(step) < self._last_planned_step + self.interval_steps:
+            return {}
         target_step = int(step) + self.interval_steps
         if target_step >= self.num_steps:
             return {}
@@ -191,6 +197,7 @@ class SparseFutureWindowPlanner:
                 "microsteps": selected_microsteps,
                 "replanned_from_step": int(step),
             }
+            self._last_planned_step = int(step)
             self._step_overrides[target_step] = planned_override
             return {target_step: planned_override}
 
@@ -262,6 +269,7 @@ class SparseFutureWindowPlanner:
             "microsteps": selected_microsteps,
             "replanned_from_step": int(step),
         }
+        self._last_planned_step = int(step)
         self._step_overrides[target_step] = planned_override
         return {target_step: planned_override}
 

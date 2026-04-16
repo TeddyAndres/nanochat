@@ -81,7 +81,7 @@ RUNS = [
             '--adam-beta1 0.7 --adam-beta2 0.95 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
             '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan10step_5kstep '
-            '--sparse-future-replan-enable --sparse-future-replan-interval 10 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
+            '--sparse-future-replan-enable --sparse-future-replan-negative-only --sparse-future-replan-interval 10 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
         ),
     },
     {
@@ -100,7 +100,7 @@ RUNS = [
             '--adam-beta1 0.7 --adam-beta2 0.95 '           
             '--log-every 10 --eval-every 250 --core-metric-every 5000 '
             '--sparse-loss-topk-enable --sparse-loss-topk-output /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan10step_10kstep '
-            '--sparse-future-replan-enable --sparse-future-replan-interval 10 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
+            '--sparse-future-replan-enable --sparse-future-replan-negative-only --sparse-future-replan-interval 10 --sparse-auto-negative-per-microstep 100 --sparse-loss-window-steps 10 '
         ),
     },
     # Add more runs below:

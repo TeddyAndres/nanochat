@@ -183,7 +183,7 @@ def test_sparse_future_window_planner_builds_mixed_overrides(tmp_path):
     assert [microstep["sequence_id"] for microstep in step2["microsteps"][2:]] == [5, 7]
 
 
-def test_sparse_future_window_planner_targets_exactly_one_future_step_per_update(tmp_path):
+def test_sparse_future_window_planner_uses_interval_as_planning_cadence(tmp_path):
     base_shard_path = tmp_path / "sequence_base_shard_000.sqlite"
     base_manifest_path = tmp_path / "sequence_base.json"
     grouping_shard_path = tmp_path / "grouping_shard_000.json"
@@ -331,7 +331,17 @@ def test_sparse_future_window_planner_targets_exactly_one_future_step_per_update
     )
 
     assert planner.get_step_override(2) == first_override
-    assert planner.get_step_override(3) is not None
+    assert planner.get_step_override(3) is None
+
+    planner.update_from_step_payload(
+        2,
+        correct_scores=torch.tensor([3.0], dtype=torch.float32),
+        correct_records=torch.tensor([[2, 0, 0, 0, 0, 0, 52]], dtype=torch.long),
+        incorrect_scores=torch.tensor([2.5], dtype=torch.float32),
+        incorrect_records=torch.tensor([[2, 0, 0, 0, 0, 0, 52, 0, 777]], dtype=torch.long),
+    )
+
+    assert planner.get_step_override(4) is not None
 
 
 
