@@ -112,6 +112,8 @@ parser.add_argument("--sparse-cloud-router-topk", type=int, default=8, help="per
 parser.add_argument("--sparse-cloud-hidden-query-samples", type=int, default=32, help="number of subsampled causal positions from the next batch preview used to build warm-cloud hidden queries (0 uses the cheap preview-query path)")
 parser.add_argument("--sparse-cloud-hidden-query-strategy", type=str, default="uniform", choices=["uniform", "last"], help="subsampling strategy for warm-cloud hidden-state queries")
 parser.add_argument("--sparse-cloud-hidden-query-max-prefix-len", type=int, default=2048, help="maximum causal prefix length used when extracting each warm-cloud hidden query")
+parser.add_argument("--sparse-cloud-random-fill", action="store_true", help="fill the residual lm_head cloud capacity with random vocab tokens instead of frequency-ranked cold tokens")
+parser.add_argument("--sparse-cloud-random-fill-seed", type=int, default=0, help="deterministic seed offset for sparse random lm_head cloud fill")
 parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-debug-timing", action="store_true", help="log detailed sparse timing breakdowns for diagnosing sparse runtime overhead")
 parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", help="for sparse timing diagnosis, synchronize after each backward pass to separate deferred GPU work from grad-accum bookkeeping")
@@ -469,6 +471,9 @@ if args.sparse_mode:
     assert 0.0 <= args.sparse_cloud_warm_proportion <= 1.0, "--sparse-cloud-warm-proportion must be in [0, 1]"
     if sparse_lm_head_clouds:
         assert hybrid_sparse, "--sparse-cloud-max-u requires --sparse-manifest hybrid sparse mode"
+    if args.sparse_cloud_random_fill:
+        assert sparse_lm_head_clouds, "--sparse-cloud-random-fill requires --sparse-cloud-max-u"
+        assert hybrid_sparse, "--sparse-cloud-random-fill requires --sparse-manifest hybrid sparse mode"
     if args.sparse_logit_scale != 1.0:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
     if args.sparse_cold_bias_scale > 0.0:
@@ -501,6 +506,11 @@ if args.sparse_mode:
                 f"lm_head_u_max={sparse_lm_head_u_max:,} | warm_fraction={args.sparse_cloud_warm_proportion:.2f} | "
                 f"warm_lr={warm_lr:.6f} | cold_lr={cold_lr:.6f}"
             )
+            if args.sparse_cloud_random_fill:
+                print0(
+                    f"Sparse random cloud fill enabled: filling cold residual to lm_head_u_max with random tokens | "
+                    f"seed_offset={args.sparse_cloud_random_fill_seed}"
+                )
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,
@@ -517,6 +527,8 @@ if args.sparse_mode:
         cold_bias_reference_tokens=B_REF,
         unembedding_warm_lr=(None if args.sparse_unembedding_warm_lr < 0.0 else args.sparse_unembedding_warm_lr),
         unembedding_cold_lr=(None if args.sparse_unembedding_cold_lr < 0.0 else args.sparse_unembedding_cold_lr),
+        random_cloud_fill=args.sparse_cloud_random_fill,
+        random_cloud_fill_seed=args.sparse_cloud_random_fill_seed,
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
@@ -1033,6 +1045,8 @@ if args.sparse_mode:
             f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
             f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
         )
+    if args.sparse_cloud_random_fill:
+        assert grad_accum_steps > 1, "--sparse-cloud-random-fill is currently implemented only for manifest grad accumulation windows"
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -1552,12 +1566,15 @@ while True:
         warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
         cold_total_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
         cold_count = max(cold_total_count - hard_negative_count, 0)
+        random_fill_count = int(sparse_metrics.random_fill_count)
         if hard_negative_count > 0 or warm_count > 0 or cold_count > 0:
             sparse_str += (
                 f" | hard_neg: {hard_negative_count:,}/{sparse_metrics.hard_negative_budget_target:,}"
                 f" | warm: {warm_count:,}/{sparse_metrics.warm_budget_target:,}"
                 f" | cold: {cold_count:,}/{sparse_metrics.cold_budget_target:,}"
             )
+            if random_fill_count > 0:
+                sparse_str += f" | random: {random_fill_count:,}"
         if sparse_metrics.cold_bias_abs_max > 0.0 or sparse_metrics.cold_bias_clamped_count > 0:
             sparse_str += f" | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
             if sparse_metrics.cold_bias_clamped_count > 0:
@@ -1671,6 +1688,7 @@ while True:
                 "train/u_warm_target": sparse_metrics.warm_budget_target,
                 "train/u_cold_target": sparse_metrics.cold_budget_target,
                 "train/u_warm_candidates": sparse_metrics.warm_candidate_count,
+                "train/u_random_fill": sparse_metrics.random_fill_count,
                 "train/cloud_plan_ms": sparse_metrics.cloud_plan_ms,
                 "train/cloud_hidden_query_ms": sparse_metrics.cloud_hidden_query_ms,
                 "train/cloud_selection_ms": sparse_metrics.cloud_selection_ms,

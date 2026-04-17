@@ -73,6 +73,7 @@ class DynamicVocabStep:
     warm_budget_target: int = 0
     cold_budget_target: int = 0
     warm_candidate_count: int = 0
+    random_fill_count: int = 0
     cloud_plan_ms: float = 0.0
     cloud_hidden_query_ms: float = 0.0
     cloud_selection_ms: float = 0.0
@@ -94,6 +95,7 @@ class DynamicVocabStep:
     warm_slot_ids_cpu: Optional[torch.Tensor] = None
     cold_ids_cpu: Optional[torch.Tensor] = None
     cold_slot_ids_cpu: Optional[torch.Tensor] = None
+    random_fill_ids_cpu: Optional[torch.Tensor] = None
     cloud_stage_ids_cpu: Optional[torch.Tensor] = None
     cloud_stage_slot_ids_cpu: Optional[torch.Tensor] = None
     cloud_writeback_ids_cpu: Optional[torch.Tensor] = None
@@ -132,6 +134,8 @@ class DynamicVocabRuntime:
         value_embedding_lr=None,
         unembedding_warm_lr=None,
         unembedding_cold_lr=None,
+        random_cloud_fill=False,
+        random_cloud_fill_seed=0,
         adam_betas=(0.8, 0.95),
         eps=1e-10,
         weight_decay=0.0,
@@ -146,6 +150,8 @@ class DynamicVocabRuntime:
         self.first_hot_unembedding_lr = None if first_hot_unembedding_lr is None or first_hot_unembedding_lr <= 0.0 else float(first_hot_unembedding_lr)
         self.hot_unembedding_ramp_activations = max(0, int(hot_unembedding_ramp_activations))
         self.hot_unembedding_ramp_start_lr = None if hot_unembedding_ramp_start_lr is None or hot_unembedding_ramp_start_lr <= 0.0 else float(hot_unembedding_ramp_start_lr)
+        self.random_cloud_fill = bool(random_cloud_fill)
+        self.random_cloud_fill_seed = int(random_cloud_fill_seed)
         self.capacity_round_multiple = max(1, int(capacity_round_multiple))
         self.disable_fixed_overlap_reuse = os.getenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "0") == "1"
         fixed_u_max_value = 0 if fixed_u_max is None else round_capacity_up(int(fixed_u_max), self.capacity_round_multiple)
@@ -228,6 +234,7 @@ class DynamicVocabRuntime:
         self._grad_accum_hot_activation_counts_cpu = None
         self._grad_accum_warm_ids_cpu = None
         self._grad_accum_cold_ids_cpu = None
+        self._grad_accum_random_fill_ids_cpu = None
         self._grad_accum_window_cold_steps_cpu = None
         self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
@@ -467,6 +474,19 @@ class DynamicVocabRuntime:
         top_values, top_ids = torch.topk(counts, k=topk_count)
         valid_mask = top_values >= 0
         return top_ids[valid_mask]
+
+    def _sample_random_token_ids(self, excluded_mask_cpu: torch.Tensor, limit: int, *, seed: int) -> torch.Tensor:
+        if limit <= 0:
+            return self._empty_long_cpu()
+        candidate_ids_cpu = torch.nonzero(~excluded_mask_cpu, as_tuple=False).flatten()
+        if candidate_ids_cpu.numel() == 0:
+            return self._empty_long_cpu()
+        if limit >= candidate_ids_cpu.numel():
+            return candidate_ids_cpu
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed) & ((1 << 63) - 1))
+        sampled_indices_cpu = torch.randperm(candidate_ids_cpu.numel(), generator=generator)[:limit]
+        return candidate_ids_cpu.index_select(0, sampled_indices_cpu)
 
     def _get_resident_cloud_ids_cpu(self) -> torch.Tensor:
         if not self.fixed_u_mode or not self._fixed_live_state:
@@ -731,6 +751,8 @@ class DynamicVocabRuntime:
         planned_step_meta["warm_budget_target"] = 0
         planned_step_meta["cold_budget_target"] = 0
         planned_step_meta["warm_candidate_count"] = 0
+        planned_step_meta["random_fill_count"] = 0
+        planned_step_meta["random_fill_ids_cpu"] = self._empty_long_cpu()
         planned_step_meta["cloud_plan_ms"] = 0.0
         planned_step_meta["cloud_hidden_query_ms"] = 0.0
         planned_step_meta["cloud_selection_ms"] = 0.0
@@ -847,28 +869,44 @@ class DynamicVocabRuntime:
         if warm_candidate_ids_cpu.numel() > 0:
             excluded_mask_cpu[warm_candidate_ids_cpu] = True
         cold_ids_cpu = self._empty_long_cpu()
+        random_fill_ids_cpu = self._empty_long_cpu()
         if cold_budget > 0:
-            cold_candidate_pool = max(int(cold_budget) * 4, int(cold_budget))
-            cold_candidate_ids_cpu = self._rank_tokens_by_frequency(excluded_mask_cpu, cold_candidate_pool)
-            if cold_candidate_ids_cpu.numel() > 0:
-                ranked_prev_cold_mask_cpu = prev_cloud_mask_cpu.index_select(0, cold_candidate_ids_cpu)
-                retained_cold_ids_cpu = cold_candidate_ids_cpu[ranked_prev_cold_mask_cpu][:cold_budget]
-                if retained_cold_ids_cpu.numel() > 0:
-                    new_cold_ids_cpu = cold_candidate_ids_cpu[~ranked_prev_cold_mask_cpu]
-                    remaining_budget = cold_budget - int(retained_cold_ids_cpu.numel())
-                    cold_ids_cpu = torch.cat((retained_cold_ids_cpu, new_cold_ids_cpu[:remaining_budget])) if remaining_budget > 0 else retained_cold_ids_cpu
+            if self.random_cloud_fill:
+                seed_value = self.random_cloud_fill_seed + (self.runtime_step * 1_000_003)
+                if "step" in planned_step_meta:
+                    seed_value += int(planned_step_meta["step"]) * 97_409
                 else:
-                    cold_ids_cpu = cold_candidate_ids_cpu[:cold_budget]
-            if cold_ids_cpu.numel() < cold_budget:
-                cold_fill_excluded_cpu = excluded_mask_cpu.clone()
-                if cold_ids_cpu.numel() > 0:
-                    cold_fill_excluded_cpu[cold_ids_cpu] = True
-                cold_fill_ids_cpu = self._rank_tokens_by_frequency(
-                    cold_fill_excluded_cpu,
-                    cold_budget - int(cold_ids_cpu.numel()),
+                    sequence_id = int(planned_step_meta.get("sequence_id", -1))
+                    if sequence_id >= 0:
+                        seed_value += sequence_id * 97_409
+                random_fill_ids_cpu = self._sample_random_token_ids(
+                    excluded_mask_cpu,
+                    cold_budget,
+                    seed=seed_value,
                 )
-                if cold_fill_ids_cpu.numel() > 0:
-                    cold_ids_cpu = torch.cat((cold_ids_cpu, cold_fill_ids_cpu)) if cold_ids_cpu.numel() > 0 else cold_fill_ids_cpu
+                cold_ids_cpu = random_fill_ids_cpu
+            else:
+                cold_candidate_pool = max(int(cold_budget) * 4, int(cold_budget))
+                cold_candidate_ids_cpu = self._rank_tokens_by_frequency(excluded_mask_cpu, cold_candidate_pool)
+                if cold_candidate_ids_cpu.numel() > 0:
+                    ranked_prev_cold_mask_cpu = prev_cloud_mask_cpu.index_select(0, cold_candidate_ids_cpu)
+                    retained_cold_ids_cpu = cold_candidate_ids_cpu[ranked_prev_cold_mask_cpu][:cold_budget]
+                    if retained_cold_ids_cpu.numel() > 0:
+                        new_cold_ids_cpu = cold_candidate_ids_cpu[~ranked_prev_cold_mask_cpu]
+                        remaining_budget = cold_budget - int(retained_cold_ids_cpu.numel())
+                        cold_ids_cpu = torch.cat((retained_cold_ids_cpu, new_cold_ids_cpu[:remaining_budget])) if remaining_budget > 0 else retained_cold_ids_cpu
+                    else:
+                        cold_ids_cpu = cold_candidate_ids_cpu[:cold_budget]
+                if cold_ids_cpu.numel() < cold_budget:
+                    cold_fill_excluded_cpu = excluded_mask_cpu.clone()
+                    if cold_ids_cpu.numel() > 0:
+                        cold_fill_excluded_cpu[cold_ids_cpu] = True
+                    cold_fill_ids_cpu = self._rank_tokens_by_frequency(
+                        cold_fill_excluded_cpu,
+                        cold_budget - int(cold_ids_cpu.numel()),
+                    )
+                    if cold_fill_ids_cpu.numel() > 0:
+                        cold_ids_cpu = torch.cat((cold_ids_cpu, cold_fill_ids_cpu)) if cold_ids_cpu.numel() > 0 else cold_fill_ids_cpu
 
         runtime_cold_ids_cpu = cold_ids_cpu
         if selected_hard_negative_ids_cpu.numel() > 0:
@@ -880,6 +918,8 @@ class DynamicVocabRuntime:
         planned_step_meta["cold_ids_cpu"] = runtime_cold_ids_cpu
         planned_step_meta["warm_candidate_ids_cpu"] = warm_candidate_ids_cpu
         planned_step_meta["warm_candidate_count"] = int(warm_candidate_ids_cpu.numel())
+        planned_step_meta["random_fill_count"] = int(random_fill_ids_cpu.numel())
+        planned_step_meta["random_fill_ids_cpu"] = random_fill_ids_cpu
         planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
         return planned_step_meta
 
@@ -995,6 +1035,7 @@ class DynamicVocabRuntime:
         self._grad_accum_hot_activation_counts_cpu = None
         self._grad_accum_warm_ids_cpu = None
         self._grad_accum_cold_ids_cpu = None
+        self._grad_accum_random_fill_ids_cpu = None
         self._grad_accum_window_cold_steps_cpu = None
         self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
@@ -1114,6 +1155,7 @@ class DynamicVocabRuntime:
         )
         self._grad_accum_warm_ids_cpu = torch.empty(0, dtype=torch.long)
         self._grad_accum_cold_ids_cpu = torch.empty(0, dtype=torch.long)
+        self._grad_accum_random_fill_ids_cpu = torch.empty(0, dtype=torch.long)
         self._grad_accum_window_cold_steps_cpu = None
         self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
@@ -1747,6 +1789,7 @@ class DynamicVocabRuntime:
         union_targets_cpu_local = step_meta.get("targets_union_cpu_local")
         warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
+        random_fill_ids_cpu = step_meta.get("random_fill_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         union_input_tables = grad_accum_steps > 1
         preserve_resident_grads = (
             grad_accum_steps > 1 and
@@ -1761,15 +1804,18 @@ class DynamicVocabRuntime:
             self._start_grad_accum_window(grad_accum_ids_cpu)
         if grad_accum_steps > 1:
             if preserve_resident_grads:
-                if self._grad_accum_warm_ids_cpu is None or self._grad_accum_cold_ids_cpu is None:
+                if self._grad_accum_warm_ids_cpu is None or self._grad_accum_cold_ids_cpu is None or self._grad_accum_random_fill_ids_cpu is None:
                     raise RuntimeError("Sparse grad accumulation cloud state is missing for resident window")
                 warm_ids_cpu = self._grad_accum_warm_ids_cpu
                 cold_ids_cpu = self._grad_accum_cold_ids_cpu
+                random_fill_ids_cpu = self._grad_accum_random_fill_ids_cpu
             else:
                 assert self._grad_accum_warm_ids_cpu is not None
                 assert self._grad_accum_cold_ids_cpu is not None
+                assert self._grad_accum_random_fill_ids_cpu is not None
                 self._grad_accum_warm_ids_cpu = warm_ids_cpu.clone()
                 self._grad_accum_cold_ids_cpu = cold_ids_cpu.clone()
+                self._grad_accum_random_fill_ids_cpu = random_fill_ids_cpu.clone()
         active_union_row_ids_cpu = self._empty_long_cpu()
         union_cold_steps_cpu = self._empty_long_cpu().to(dtype=torch.long)
         cold_steps_cpu = self._empty_long_cpu().to(dtype=torch.long)
@@ -2265,6 +2311,7 @@ class DynamicVocabRuntime:
             warm_budget_target=int(step_meta.get("warm_budget_target", 0)),
             cold_budget_target=int(step_meta.get("cold_budget_target", 0)),
             warm_candidate_count=int(step_meta.get("warm_candidate_count", 0)),
+            random_fill_count=int(random_fill_ids_cpu.numel()),
             cloud_plan_ms=float(step_meta.get("cloud_plan_ms", 0.0)),
             cloud_hidden_query_ms=float(step_meta.get("cloud_hidden_query_ms", 0.0)),
             cloud_selection_ms=float(step_meta.get("cloud_selection_ms", 0.0)),
@@ -2293,6 +2340,7 @@ class DynamicVocabRuntime:
             warm_slot_ids_cpu=warm_slot_ids_cpu,
             cold_ids_cpu=cold_ids_cpu,
             cold_slot_ids_cpu=cold_slot_ids_cpu,
+            random_fill_ids_cpu=random_fill_ids_cpu,
             cloud_stage_ids_cpu=cloud_stage_ids_cpu,
             cloud_stage_slot_ids_cpu=cloud_stage_slot_ids_cpu,
             cloud_writeback_ids_cpu=cloud_writeback_ids_cpu,
@@ -2906,6 +2954,13 @@ class DynamicVocabRuntime:
             d2h_bytes=d2h_bytes,
             optimizer_ms=apply_ms,
             fixed_u_mode=self.fixed_u_mode,
+            warm_ids_cpu=grad_accum_warm_ids_cpu,
+            cold_ids_cpu=grad_accum_cold_ids_cpu,
+            random_fill_ids_cpu=self._grad_accum_random_fill_ids_cpu,
+            random_fill_count=(
+                int(self._grad_accum_random_fill_ids_cpu.numel())
+                if self._grad_accum_random_fill_ids_cpu is not None else 0
+            ),
             cold_bias_clamped_count=self._grad_accum_window_cold_bias_clamped_count,
             cold_bias_abs_max=self._grad_accum_window_cold_bias_abs_max,
         )

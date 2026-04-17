@@ -40,6 +40,8 @@ def build_fixed_step_meta(
     inputs_cpu_local=None,
     inputs_union_cpu_local=None,
     targets_cpu_local=None,
+    random_fill_ids=None,
+    sequence_id=-1,
     is_last_step=False,
     grad_accum_ids=None,
     grad_accum_steps=1,
@@ -67,11 +69,14 @@ def build_fixed_step_meta(
         "grad_accum_micro_step": grad_accum_micro_step,
         "is_grad_accum_boundary": is_grad_accum_boundary,
         "is_last_step": is_last_step,
+        "sequence_id": int(sequence_id),
     }
     if warm_ids is not None:
         step_meta["warm_ids_cpu"] = torch.tensor(warm_ids, dtype=torch.long)
     if cold_ids is not None:
         step_meta["cold_ids_cpu"] = torch.tensor(cold_ids, dtype=torch.long)
+    if random_fill_ids is not None:
+        step_meta["random_fill_ids_cpu"] = torch.tensor(random_fill_ids, dtype=torch.long)
     if inputs_cpu_local is not None:
         step_meta["inputs_cpu_local"] = torch.tensor(inputs_cpu_local, dtype=torch.long)
     if inputs_union_cpu_local is not None:
@@ -847,6 +852,122 @@ def test_plan_next_lm_head_cloud_uses_grad_accum_union_for_capacity_and_exclusio
     assert planned["warm_ids_cpu"].numel() == 0
     assert planned["cold_ids_cpu"].tolist() == [6, 7]
     assert all(token_id not in planned["cold_ids_cpu"].tolist() for token_id in [2, 3, 4, 5])
+
+
+def test_plan_next_lm_head_cloud_random_fill_samples_union_complement():
+    torch.manual_seed(0)
+    model = build_tiny_model(vocab_size=16)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.1,
+        fixed_u_max=4,
+        lm_head_u_max=10,
+        random_cloud_fill=True,
+        random_cloud_fill_seed=13,
+    )
+
+    step_meta = build_fixed_step_meta(
+        slot_to_global=[0, 1, -1, -1],
+        stage_slots=[0, 1],
+        stage_ids=[0, 1],
+        writeback_slots=[0, 1],
+        writeback_ids=[0, 1],
+        inputs_cpu_local=[[0, 1, 0, 1]],
+        grad_accum_ids=[0, 1, 2, 3, 4, 5],
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+        sequence_id=123,
+        is_last_step=False,
+    )
+    planned = runtime.plan_next_lm_head_cloud(
+        step_meta,
+        warm_proportion=0.0,
+        router_candidate_pool_size=0,
+        router_topk=0,
+        source_token_limit=0,
+    )
+
+    random_fill_ids = planned["random_fill_ids_cpu"]
+    assert planned["cloud_residual_capacity"] == 4
+    assert planned["random_fill_count"] == 4
+    assert random_fill_ids.numel() == 4
+    assert planned["warm_ids_cpu"].numel() == 0
+    assert torch.equal(planned["cold_ids_cpu"], random_fill_ids)
+    assert torch.unique(random_fill_ids).numel() == random_fill_ids.numel()
+    assert all(token_id not in [0, 1, 2, 3, 4, 5] for token_id in random_fill_ids.tolist())
+
+
+def test_fixed_u_grad_accum_random_fill_stays_window_stable():
+    torch.manual_seed(0)
+    runtime = DynamicVocabRuntime(
+        build_tiny_model(vocab_size=12),
+        device="cpu",
+        embedding_lr=0.01,
+        value_embedding_lr=0.01,
+        unembedding_lr=0.01,
+        fixed_u_max=3,
+        grad_accum_u_max=4,
+        lm_head_u_max=7,
+        random_cloud_fill=True,
+        random_cloud_fill_seed=29,
+    )
+
+    micro0 = build_fixed_step_meta(
+        slot_to_global=[1, 3, 7],
+        stage_slots=[0, 1, 2],
+        stage_ids=[1, 3, 7],
+        writeback_slots=[],
+        writeback_ids=[],
+        grad_accum_ids=[1, 3, 7, 9],
+        grad_accum_steps=2,
+        grad_accum_micro_step=0,
+        is_grad_accum_boundary=False,
+        sequence_id=200,
+        is_last_step=False,
+    )
+    planned0 = runtime.plan_next_lm_head_cloud(
+        micro0,
+        warm_proportion=0.0,
+        router_candidate_pool_size=0,
+        router_topk=0,
+        source_token_limit=0,
+    )
+    micro0_ctx = runtime.prepare_step(planned0)
+
+    assert micro0_ctx.random_fill_ids_cpu is not None
+    first_random_fill = micro0_ctx.random_fill_ids_cpu.clone()
+    assert first_random_fill.numel() == 3
+    assert micro0_ctx.cold_ids_cpu is not None
+    assert torch.equal(micro0_ctx.cold_ids_cpu, first_random_fill)
+
+    set_zero_sparse_grads(micro0_ctx)
+    runtime.accumulate_gradients(micro0_ctx)
+
+    micro1 = build_fixed_step_meta(
+        slot_to_global=[9, 3, 7],
+        stage_slots=[0],
+        stage_ids=[9],
+        writeback_slots=[1],
+        writeback_ids=[3],
+        cold_ids=[0, 2, 4],
+        random_fill_ids=[0, 2, 4],
+        grad_accum_ids=[1, 3, 7, 9],
+        grad_accum_steps=2,
+        grad_accum_micro_step=1,
+        is_grad_accum_boundary=True,
+        sequence_id=201,
+        is_last_step=False,
+    )
+    micro1_ctx = runtime.prepare_step(micro1)
+
+    assert micro1_ctx.random_fill_ids_cpu is not None
+    assert torch.equal(micro1_ctx.random_fill_ids_cpu, first_random_fill)
+    assert micro1_ctx.cold_ids_cpu is not None
+    assert torch.equal(micro1_ctx.cold_ids_cpu, first_random_fill)
 
 
 def test_fixed_u_clouds_expand_only_lm_head_capacity():
