@@ -102,7 +102,7 @@ parser.add_argument("--sparse-mode", action="store_true", help="enable first-pas
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
 parser.add_argument("--sparse-cold-bias-scale", type=float, default=0.0, help="sparse-only cold-token bias coefficient; effective magnitude also follows sparse unembedding LR, LR schedule, and total batch size")
-parser.add_argument("--sparse-cold-row-decay", "--sparse-cold-row-decrement", dest="sparse_cold_row_decay", type=float, default=0.0, help="sparse-only fixed per-step CPU multiplicative decay applied to lm_head rows outside the next-step sparse table")
+parser.add_argument("--sparse-cold-row-decay", "--sparse-cold-row-decrement", dest="sparse_cold_row_decay", type=float, default=0.0, help="sparse-only fixed per-step CPU signed lm_head adjustment applied outside the next-step sparse table; effective multiplier is (1 - adjustment)")
 parser.add_argument("--sparse-cloud-max-u", type=int, default=0, help="fixed lm_head sparse capacity for step_U + warm + cold rows (0 disables cloud expansion)")
 parser.add_argument("--sparse-cloud-warm-proportion", type=float, default=0.5, help="fraction of lm_head cloud capacity to allocate to warm rows; cold receives the remainder")
 parser.add_argument("--sparse-unembedding-warm-lr", type=float, default=-1.0, help="lm_head LR for warm cloud rows in sparse mode; negative values reuse --unembedding-lr")
@@ -465,7 +465,7 @@ optimizer_data_sparse = None
 if args.sparse_mode:
     assert args.sparse_logit_scale > 0.0, "--sparse-logit-scale must be positive"
     assert args.sparse_cold_bias_scale >= 0.0, "--sparse-cold-bias-scale must be non-negative"
-    assert 0.0 <= args.sparse_cold_row_decay <= 1.0, "--sparse-cold-row-decay must be in [0, 1]"
+    assert -1.0 <= args.sparse_cold_row_decay <= 1.0, "--sparse-cold-row-decay must be in [-1, 1]"
     assert 0.0 <= args.sparse_cloud_warm_proportion <= 1.0, "--sparse-cloud-warm-proportion must be in [0, 1]"
     if sparse_lm_head_clouds:
         assert hybrid_sparse, "--sparse-cloud-max-u requires --sparse-manifest hybrid sparse mode"
@@ -473,8 +473,11 @@ if args.sparse_mode:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
     if args.sparse_cold_bias_scale > 0.0:
         print0(f"Sparse cold-token bias enabled: base_scale={args.sparse_cold_bias_scale:.4f}")
-    if args.sparse_cold_row_decay > 0.0:
-        print0(f"Sparse cold-row decay enabled: base_decay={args.sparse_cold_row_decay:.6f}")
+    if args.sparse_cold_row_decay != 0.0:
+        print0(
+            f"Sparse cold-row adjustment enabled: base_adjustment={args.sparse_cold_row_decay:.6f}, "
+            f"base_multiplier={1.0 - args.sparse_cold_row_decay:.6f}"
+        )
     sparse_fixed_u_max = None
     sparse_lm_head_u_max = None
     sparse_grad_accum_u_max = None
@@ -769,7 +772,7 @@ def get_sparse_cold_bias_scale(it):
 
 
 def get_sparse_cold_row_decay(it):
-    if not args.sparse_mode or args.sparse_cold_row_decay <= 0.0:
+    if not args.sparse_mode or args.sparse_cold_row_decay == 0.0:
         return 0.0
     return args.sparse_cold_row_decay * get_lr_multiplier(it)
 
@@ -787,12 +790,12 @@ if args.sparse_mode and args.sparse_cold_bias_scale > 0.0:
         f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
     )
 
-if args.sparse_mode and args.sparse_cold_row_decay > 0.0:
+if args.sparse_mode and args.sparse_cold_row_decay != 0.0:
     decay_start = get_sparse_cold_row_decay(0)
     decay_mid = get_sparse_cold_row_decay(max(num_iterations // 2, 0))
     decay_end = get_sparse_cold_row_decay(max(num_iterations - 1, 0))
     print0(
-        f"Sparse cold-row decay schedule: effective_decay(start/mid/end)={decay_start:.6f}/{decay_mid:.6f}/{decay_end:.6f}, "
+        f"Sparse cold-row adjustment schedule: effective_adjustment(start/mid/end)={decay_start:.6f}/{decay_mid:.6f}/{decay_end:.6f}, "
         f"effective_multiplier(start/mid/end)={1.0 - decay_start:.6f}/{1.0 - decay_mid:.6f}/{1.0 - decay_end:.6f}"
     )
 

@@ -1,7 +1,7 @@
 """CLI analysis tool for sparse loss top-k metrics produced during training.
 
 Usage:
-    python -m scripts.analyze_loss_topk /media/teddy/Ventoy/nanochat/nanochat/base_data_climbmix_token_cache_v3_sparse_analysis <subcommand> [options]
+    python -m scripts.analyze_loss_topk /media/teddy/Ventoy/nanochat/nanochat/topk_analysis/d6_replan10step_5kstep <subcommand> [options]
 
 Subcommands:
     summary    overview of step files, record counts, and score distributions

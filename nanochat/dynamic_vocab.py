@@ -742,14 +742,20 @@ class DynamicVocabRuntime:
             return planned_step_meta
 
         step_ids_cpu = planned_step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        residual_capacity = max(self.lm_head_u_max - int(step_ids_cpu.numel()), 0)
+        lm_head_base_ids_cpu = step_ids_cpu
+        grad_accum_ids_cpu = planned_step_meta.get("grad_accum_ids_cpu")
+        if grad_accum_ids_cpu is not None:
+            grad_accum_ids_cpu = grad_accum_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+            if grad_accum_ids_cpu.numel() > 0:
+                lm_head_base_ids_cpu = grad_accum_ids_cpu
+        residual_capacity = max(self.lm_head_u_max - int(lm_head_base_ids_cpu.numel()), 0)
         planned_step_meta["cloud_residual_capacity"] = int(residual_capacity)
         if residual_capacity <= 0:
             planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
             return planned_step_meta
 
         excluded_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        excluded_mask_cpu[step_ids_cpu] = True
+        excluded_mask_cpu[lm_head_base_ids_cpu] = True
         selected_hard_negative_ids_cpu = self._empty_long_cpu()
         hard_negative_budget = max(int(hard_negative_budget), 0)
         hard_negative_budget_target = min(residual_capacity, hard_negative_budget)
@@ -798,7 +804,7 @@ class DynamicVocabRuntime:
             if inputs_cpu_local is not None:
                 warm_ids_cpu, warm_candidate_ids_cpu = self.select_warm_cloud(
                     inputs_cpu_local.detach().to(device="cpu", dtype=torch.long),
-                    step_ids_cpu,
+                    lm_head_base_ids_cpu,
                     max_warm=warm_budget,
                     topk_per_position=router_topk,
                     shortlist_limit=router_candidate_pool_size,
@@ -1599,7 +1605,7 @@ class DynamicVocabRuntime:
         exempt_global_ids_cpu: torch.Tensor,
         cold_row_decay: float,
     ) -> None:
-        if cold_row_decay <= 0.0:
+        if cold_row_decay == 0.0:
             return
         vocab_size = int(self.model.config.vocab_size)
         if vocab_size <= 0:
@@ -1653,8 +1659,8 @@ class DynamicVocabRuntime:
         cold_row_decay: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
-        if cold_row_decay > 0.0:
-            raise ValueError("sparse cold-row decay currently requires fixed-U sparse mode")
+        if cold_row_decay != 0.0:
+            raise ValueError("sparse cold-row adjustment currently requires fixed-U sparse mode")
         self._flush_pending_cpu_writeback()
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
@@ -2139,7 +2145,7 @@ class DynamicVocabRuntime:
             self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
             self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
 
-        if cold_row_decay > 0.0 and (grad_accum_steps == 1 or not preserve_resident_grads):
+        if cold_row_decay != 0.0 and (grad_accum_steps == 1 or not preserve_resident_grads):
             self._apply_fixed_lm_head_cold_row_decay_(next_step_lm_head_ids_cpu, cold_row_decay)
 
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
