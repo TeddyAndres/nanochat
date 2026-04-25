@@ -5,8 +5,276 @@ import math
 import torch
 import torch.distributed as dist
 
+
+DEFAULT_VOCAB_CHUNK_SIZE = 4096
+
+
+def _get_valid_targets_and_num_bytes(targets, token_bytes):
+    """Return safe targets, byte counts, and a mask of valid non-special tokens."""
+    if (targets.int() < 0).any():  # mps does not currently have kernel for < 0 for int64, only int32
+        valid = targets >= 0
+        targets_safe = torch.where(valid, targets, torch.zeros_like(targets))
+    else:
+        valid = torch.ones_like(targets, dtype=torch.bool)
+        targets_safe = targets
+    num_bytes = torch.where(
+        valid,
+        token_bytes[targets_safe],
+        torch.zeros_like(targets, dtype=token_bytes.dtype),
+    )
+    valid = valid & (num_bytes > 0)
+    return targets_safe, num_bytes, valid
+
+
+def _can_chunk_logits(model):
+    return hasattr(model, "forward_features") and hasattr(model, "compute_logits")
+
+
+def _resolve_vocab_chunk_size(model, vocab_chunk_size):
+    if vocab_chunk_size is not None and vocab_chunk_size > 0:
+        return vocab_chunk_size
+    if not hasattr(model, "iter_logits"):
+        return None
+    model_vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
+    if model_vocab_size is None:
+        return DEFAULT_VOCAB_CHUNK_SIZE
+    return min(DEFAULT_VOCAB_CHUNK_SIZE, int(model_vocab_size))
+
+
+def _iter_model_logit_chunks(model, x, logit_scale=1.0, logit_bias=None, vocab_chunk_size=None):
+    resolved_vocab_chunk_size = _resolve_vocab_chunk_size(model, vocab_chunk_size)
+    if hasattr(model, "iter_logits"):
+        yield from model.iter_logits(
+            x,
+            logit_scale=logit_scale,
+            logit_bias=logit_bias,
+            force_float=True,
+            vocab_chunk_size=resolved_vocab_chunk_size,
+        )
+        return
+    logits = model.compute_logits(x, logit_scale=logit_scale, logit_bias=logit_bias)
+    yield 0, logits.size(-1), logits
+
+
+def stream_flat_logit_stats(model, flat_features, flat_targets, logit_scale=1.0, logit_bias=None, vocab_chunk_size=None, return_predictions=False):
+    if flat_features.ndim != 2:
+        raise ValueError(f"Expected flat_features to be rank-2, got shape {tuple(flat_features.shape)}")
+    if flat_targets.ndim != 1:
+        raise ValueError(f"Expected flat_targets to be rank-1, got shape {tuple(flat_targets.shape)}")
+    if flat_features.size(0) != flat_targets.size(0):
+        raise ValueError("flat_features and flat_targets must have matching leading dimensions")
+
+    num_rows = flat_features.size(0)
+    device = flat_features.device
+    target_logits = torch.empty(num_rows, dtype=torch.float32, device=device)
+    log_denom = torch.full((num_rows,), -float("inf"), dtype=torch.float32, device=device)
+    predictions = None
+    max_logits = None
+    if return_predictions:
+        predictions = torch.zeros(num_rows, dtype=torch.long, device=device)
+        max_logits = torch.full((num_rows,), -float("inf"), dtype=torch.float32, device=device)
+
+    for start, end, logits_chunk in _iter_model_logit_chunks(
+        model,
+        flat_features,
+        logit_scale=logit_scale,
+        logit_bias=logit_bias,
+        vocab_chunk_size=vocab_chunk_size,
+    ):
+        flat_chunk = logits_chunk.reshape(num_rows, end - start)
+        chunk_log_denom = torch.logsumexp(flat_chunk, dim=-1)
+        log_denom = torch.logaddexp(log_denom, chunk_log_denom)
+
+        in_chunk = (flat_targets >= start) & (flat_targets < end)
+        if in_chunk.any():
+            local_targets = (flat_targets[in_chunk] - start).to(dtype=torch.long)
+            target_logits[in_chunk] = flat_chunk[in_chunk, local_targets]
+
+        if return_predictions:
+            local_max_logits, local_predictions = flat_chunk.max(dim=-1)
+            update_mask = local_max_logits > max_logits
+            max_logits = torch.where(update_mask, local_max_logits, max_logits)
+            predictions = torch.where(update_mask, local_predictions.to(dtype=torch.long) + start, predictions)
+
+    out = {
+        "target_logits": target_logits,
+        "log_denom": log_denom,
+    }
+    if return_predictions:
+        out["predictions"] = predictions
+        out["max_logits"] = max_logits
+    return out
+
+
+def _accumulate_bpb_and_ece_from_features(model, features, targets, token_bytes, total_nats, total_bytes, bin_counts, bin_confidence_sums, bin_correct_sums, logit_scale=1.0, logit_bias=None, vocab_chunk_size=None):
+    flat_features = features.reshape(-1, features.size(-1))
+    flat_targets = targets.reshape(-1)
+    targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+    if valid.any():
+        valid_features = flat_features[valid]
+        targets_safe = targets_safe[valid]
+        num_bytes = num_bytes[valid]
+        stats = stream_flat_logit_stats(
+            model,
+            valid_features,
+            targets_safe,
+            logit_scale=logit_scale,
+            logit_bias=logit_bias,
+            vocab_chunk_size=vocab_chunk_size,
+            return_predictions=True,
+        )
+        total_nats += (stats["log_denom"] - stats["target_logits"]).sum()
+        total_bytes += num_bytes.sum()
+
+        confidences = torch.exp(stats["max_logits"] - stats["log_denom"])
+        correctness = (stats["predictions"] == targets_safe).to(torch.float64)
+        num_bins = bin_counts.numel()
+        bin_indices = torch.clamp((confidences * num_bins).to(torch.long), max=num_bins - 1)
+        bin_counts += torch.bincount(bin_indices, minlength=num_bins).to(torch.float64)
+        bin_confidence_sums += torch.bincount(bin_indices, weights=confidences.to(torch.float64), minlength=num_bins)
+        bin_correct_sums += torch.bincount(bin_indices, weights=correctness, minlength=num_bins)
+
+
+def _accumulate_bpb_from_features(model, features, targets, token_bytes, total_nats, total_bytes, logit_scale=1.0, logit_bias=None, vocab_chunk_size=None):
+    flat_features = features.reshape(-1, features.size(-1))
+    flat_targets = targets.reshape(-1)
+    targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+    if valid.any():
+        valid_features = flat_features[valid]
+        targets_safe = targets_safe[valid]
+        num_bytes = num_bytes[valid]
+        stats = stream_flat_logit_stats(
+            model,
+            valid_features,
+            targets_safe,
+            logit_scale=logit_scale,
+            logit_bias=logit_bias,
+            vocab_chunk_size=vocab_chunk_size,
+            return_predictions=False,
+        )
+        total_nats += (stats["log_denom"] - stats["target_logits"]).sum()
+        total_bytes += num_bytes.sum()
+
+
+def _accumulate_bpb_and_ece_from_logits(logits, targets, token_bytes, total_nats, total_bytes, bin_counts, bin_confidence_sums, bin_correct_sums):
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+    if valid.any():
+        flat_logits = flat_logits[valid]
+        targets_safe = targets_safe[valid]
+        num_bytes = num_bytes[valid]
+        log_denom = torch.logsumexp(flat_logits, dim=-1)
+        target_logits = flat_logits.gather(1, targets_safe.unsqueeze(1)).squeeze(1)
+        total_nats += (log_denom - target_logits).sum()
+        total_bytes += num_bytes.sum()
+
+        max_logits, predictions = flat_logits.max(dim=-1)
+        confidences = torch.exp(max_logits - log_denom)
+        correctness = (predictions == targets_safe).to(torch.float64)
+        num_bins = bin_counts.numel()
+        bin_indices = torch.clamp((confidences * num_bins).to(torch.long), max=num_bins - 1)
+        bin_counts += torch.bincount(bin_indices, minlength=num_bins).to(torch.float64)
+        bin_confidence_sums += torch.bincount(bin_indices, weights=confidences.to(torch.float64), minlength=num_bins)
+        bin_correct_sums += torch.bincount(bin_indices, weights=correctness, minlength=num_bins)
+
+
+def _accumulate_bpb_from_logits(logits, targets, token_bytes, total_nats, total_bytes):
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    targets_safe, num_bytes, valid = _get_valid_targets_and_num_bytes(flat_targets, token_bytes)
+    if valid.any():
+        flat_logits = flat_logits[valid]
+        targets_safe = targets_safe[valid]
+        num_bytes = num_bytes[valid]
+        log_denom = torch.logsumexp(flat_logits, dim=-1)
+        target_logits = flat_logits.gather(1, targets_safe.unsqueeze(1)).squeeze(1)
+        total_nats += (log_denom - target_logits).sum()
+        total_bytes += num_bytes.sum()
+
+
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb_and_ece(model, batches, steps, token_bytes, token_chunk_size=64, num_bins=15, logit_scale=1.0, logit_bias=None, vocab_chunk_size=0):
+    """
+    Evaluate validation bits-per-byte and token-level expected calibration error.
+
+    ECE is computed over next-token predictions using the same token masking semantics
+    as BPB: ignore_index targets and zero-byte special tokens are excluded.
+    """
+    device = model.get_device()
+    total_nats = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+    bin_counts = torch.zeros(num_bins, dtype=torch.float64, device=device)
+    bin_confidence_sums = torch.zeros(num_bins, dtype=torch.float64, device=device)
+    bin_correct_sums = torch.zeros(num_bins, dtype=torch.float64, device=device)
+
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y = next(batch_iter)
+        if _can_chunk_logits(model):
+            features = model.forward_features(x)
+            for start in range(0, x.size(1), token_chunk_size):
+                end = min(start + token_chunk_size, x.size(1))
+                _accumulate_bpb_and_ece_from_features(
+                    model,
+                    features[:, start:end],
+                    y[:, start:end],
+                    token_bytes,
+                    total_nats,
+                    total_bytes,
+                    bin_counts,
+                    bin_confidence_sums,
+                    bin_correct_sums,
+                    logit_scale=logit_scale,
+                    logit_bias=logit_bias,
+                    vocab_chunk_size=vocab_chunk_size,
+                )
+            del features
+        else:
+            logits = model(x, logit_scale=logit_scale, logit_bias=logit_bias)
+            _accumulate_bpb_and_ece_from_logits(
+                logits,
+                y,
+                token_bytes,
+                total_nats,
+                total_bytes,
+                bin_counts,
+                bin_confidence_sums,
+                bin_correct_sums,
+            )
+            del logits
+        del x, y
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if world_size > 1:
+        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bin_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bin_confidence_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bin_correct_sums, op=dist.ReduceOp.SUM)
+
+    total_nats = total_nats.item()
+    total_bytes = total_bytes.item()
+    if total_bytes == 0:
+        return float('inf'), float('nan')
+
+    bpb = total_nats / (math.log(2) * total_bytes)
+
+    total_count = bin_counts.sum().item()
+    if total_count == 0:
+        ece = float('nan')
+    else:
+        nonzero = bin_counts > 0
+        avg_confidence = torch.zeros_like(bin_confidence_sums)
+        avg_accuracy = torch.zeros_like(bin_correct_sums)
+        avg_confidence[nonzero] = bin_confidence_sums[nonzero] / bin_counts[nonzero]
+        avg_accuracy[nonzero] = bin_correct_sums[nonzero] / bin_counts[nonzero]
+        ece = ((avg_accuracy[nonzero] - avg_confidence[nonzero]).abs() * (bin_counts[nonzero] / total_count)).sum().item()
+
+    return bpb, ece
+
+@torch.no_grad()
+def evaluate_bpb(model, batches, steps, token_bytes, logit_scale=1.0, logit_bias=None, vocab_chunk_size=0):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -30,27 +298,31 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
-        loss2d = loss2d.view(-1) # flatten
-        y = y.view(-1) # flatten
-        if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32
-            # slightly more complex code path if some target tokens are ignore_index (e.g. -1)
-            # any target token < 0 is to be ignored: do NOT index token_bytes with negatives
-            valid = y >= 0
-            y_safe = torch.where(valid, y, torch.zeros_like(y))
-            # map valid targets to their byte length; ignored targets contribute 0 bytes
-            num_bytes2d = torch.where(
-                valid,
-                token_bytes[y_safe],
-                torch.zeros_like(y, dtype=token_bytes.dtype)
-            )
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
-            total_bytes += num_bytes2d.sum()
+        if _can_chunk_logits(model):
+            features = model.forward_features(x)
+            for start in range(0, x.size(1), 64):
+                end = min(start + 64, x.size(1))
+                _accumulate_bpb_from_features(
+                    model,
+                    features[:, start:end],
+                    y[:, start:end],
+                    token_bytes,
+                    total_nats,
+                    total_bytes,
+                    logit_scale=logit_scale,
+                    logit_bias=logit_bias,
+                    vocab_chunk_size=vocab_chunk_size,
+                )
+            del features
         else:
-            # fast path: no ignored targets, safe to index directly
-            num_bytes2d = token_bytes[y]
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
+            loss2d = model(x, y, loss_reduction='none', logit_scale=logit_scale, logit_bias=logit_bias) # (B, T)
+            loss2d = loss2d.view(-1) # flatten
+            y = y.view(-1) # flatten
+            _, num_bytes2d, valid = _get_valid_targets_and_num_bytes(y, token_bytes)
+            total_nats += (loss2d * valid).sum()
             total_bytes += num_bytes2d.sum()
+            del loss2d
+        del x, y
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:

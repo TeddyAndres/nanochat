@@ -11,6 +11,8 @@ from jinja2 import Template
 import torch
 import torch.distributed as dist
 
+from nanochat.loss_eval import stream_flat_logit_stats
+
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
 
@@ -148,19 +150,29 @@ def forward_model(model, input_ids):
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
-    # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
-    losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
-        reduction='none'
-    ).view(batch_size, seq_len)
-    # Set the last column to be nan because there is no autoregressive loss there
+
+    if hasattr(model, "forward_features") and hasattr(model, "compute_logits"):
+        features = model.forward_features(input_ids)
+        flat_features = features.reshape(batch_size * seq_len, -1)
+        stats = stream_flat_logit_stats(
+            model,
+            flat_features,
+            target_ids.view(-1),
+            return_predictions=True,
+        )
+        losses = (stats["log_denom"] - stats["target_logits"]).view(batch_size, seq_len)
+        predictions = stats["predictions"].view(batch_size, seq_len)
+    else:
+        outputs = model(input_ids)
+        losses = torch.nn.functional.cross_entropy(
+            outputs.view(batch_size * seq_len, -1),
+            target_ids.view(batch_size * seq_len),
+            reduction='none'
+        ).view(batch_size, seq_len)
+        predictions = outputs.argmax(dim=-1)
+
     losses[:, -1] = float('nan')
-    # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
     return losses, predictions
 
 
