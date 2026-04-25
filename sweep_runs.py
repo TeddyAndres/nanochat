@@ -71,16 +71,15 @@ RUNS = [
             '-m scripts.base_train '
             '--sparse-mode --window-pattern L --fp8 '
             '--token-cache-dir "" --token-cache-workers 8 '
-            '--depth=24 --aspect-ratio 64 '
-            '--total-batch-size 131072 --max-seq-len 2048 --device-batch-size=16 '
-            '--num-iterations=15000 '            
-            '--run \"d24 65kvoc 2kseq 16batch 4accum 64aspect 15kstep unembedlr0.005 0warmup 0.65warmdown 0.2embedlr 0.01matrix 0.27scalar 0wd 0.7adam1 0.95adam2\" '
-            '--sparse-manifest manifests/65kvocab_2kseq_16batch_4accum_30kstep.json '
-            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.1 '
+            '--depth=14 --aspect-ratio 128 '
+            '--total-batch-size 524288 --max-seq-len 2048 --device-batch-size=8 '
+            '--num-iterations=12500 '            
+            '--run \"d14 65kvoc 2kseq 8batch 32accum 128aspect 12.5kstep unembedlr0.005 0warmup 0.65warmdown 0.2embedlr 0.01matrix 0.27scalar 0wd 0.7adam1 0.95adam2\" '
+            '--sparse-manifest manifests/65kvocab_2kseq_8batch_32accum_15kstep.json '
+            '--warmup-ratio 0 --warmdown-ratio 0.65 --final-lr-frac 0.10 '
             '--embedding-lr 0.2 --unembedding-lr=0.005 --matrix-lr 0.01 --scalar-lr 0.27 --weight-decay 0 '
             '--adam-beta1 0.7 --adam-beta2 0.95 '          
-            '--log-every 10 --eval-every 250 --core-metric-every 5000 '
-            '--sparse-cloud-random-fill '
+            '--log-every 10 --eval-every 250 --core-metric-every 2500 --save-every 5000 '
         ),
     },
     # Add more runs below:

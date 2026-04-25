@@ -300,8 +300,21 @@ class HuggingFaceTokenizer:
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
 import rustbpe
-import sentencepiece as spm
 import tiktoken
+
+try:
+    import sentencepiece as spm
+except ModuleNotFoundError:
+    spm = None
+
+
+def _require_sentencepiece():
+    if spm is None:
+        raise ModuleNotFoundError(
+            "sentencepiece is only required for SentencePiece tokenizer backends. "
+            "Install it or switch the tokenizer backend to rustbpe/huggingface."
+        )
+    return spm
 
 class RustBPETokenizer(ChatTokenizerMixin):
     """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
@@ -433,8 +446,9 @@ class SentencePieceTokenizer(ChatTokenizerMixin):
         remove_extra_whitespaces=False,
         train_extremely_large_corpus=False,
     ):
+        spm_module = _require_sentencepiece()
         model_buffer = io.BytesIO()
-        spm.SentencePieceTrainer.train(
+        spm_module.SentencePieceTrainer.train(
             sentence_iterator=text_iterator,
             model_writer=model_buffer,
             vocab_size=vocab_size,
@@ -458,13 +472,14 @@ class SentencePieceTokenizer(ChatTokenizerMixin):
             user_defined_symbols=SPECIAL_TOKENS,
             hard_vocab_limit=False,
         )
-        processor = spm.SentencePieceProcessor(model_proto=model_buffer.getvalue())
+        processor = spm_module.SentencePieceProcessor(model_proto=model_buffer.getvalue())
         return cls(processor)
 
     @classmethod
     def from_directory(cls, tokenizer_dir):
+        spm_module = _require_sentencepiece()
         model_path = os.path.join(tokenizer_dir, "tokenizer.model")
-        processor = spm.SentencePieceProcessor(model_file=model_path)
+        processor = spm_module.SentencePieceProcessor(model_file=model_path)
         return cls(processor)
 
     def get_vocab_size(self):
