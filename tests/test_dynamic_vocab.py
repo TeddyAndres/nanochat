@@ -2567,7 +2567,7 @@ def test_fixed_u_grad_accum_prepare_emits_union_inputs_for_input_tables():
     assert torch.equal(step_ctx.union_inputs.cpu(), torch.tensor([[2, 0, 1, 2]], dtype=torch.long))
 
 
-def test_fixed_u_grad_accum_prepare_exposes_exact_union_width_active_vocab():
+def test_fixed_u_grad_accum_prepare_keeps_fixed_width_active_vocab_with_mask():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=16)
     runtime = DynamicVocabRuntime(
@@ -2596,9 +2596,14 @@ def test_fixed_u_grad_accum_prepare_exposes_exact_union_width_active_vocab():
     )
 
     assert step_ctx.active_vocab is not None
-    assert step_ctx.active_vocab["wte"].shape[0] == 3
-    assert step_ctx.active_vocab["lm_head"].shape[0] == 3
-    assert step_ctx.active_vocab["value_embeds"]["1"].shape[0] == 3
-    assert "logit_mask" not in step_ctx.active_vocab
+    assert step_ctx.active_vocab["wte"].shape[0] == runtime.fixed_input_u_max
+    assert step_ctx.active_vocab["lm_head"].shape[0] == runtime.lm_head_u_max
+    assert step_ctx.active_vocab["value_embeds"]["1"].shape[0] == runtime.fixed_input_u_max
+    assert "logit_mask" in step_ctx.active_vocab
+    assert torch.equal(
+        step_ctx.active_vocab["logit_mask"][:3],
+        torch.ones(3, dtype=torch.bool),
+    )
+    assert not step_ctx.active_vocab["logit_mask"][3:].any()
     assert runtime.fixed_input_slot_to_global_cpu is not None
     assert torch.equal(runtime.fixed_input_slot_to_global_cpu[:3], torch.tensor([7, 9, 4], dtype=torch.long))

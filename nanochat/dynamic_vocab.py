@@ -2253,34 +2253,12 @@ class DynamicVocabRuntime:
             "lm_head": self.fixed_active_vocab["lm_head"],
         }
         if grad_accum_steps > 1:
-            union_count = int(grad_accum_ids_cpu.numel())
-            lm_head_exposed_count = int(union_count + cloud_ids_cpu.numel())
-            wte_view = self.fixed_params["wte"][:union_count]
-            lm_head_view = self.fixed_params["lm_head"][:lm_head_exposed_count]
-            if not self.use_cuda:
-                wte_view.retain_grad()
-                lm_head_view.retain_grad()
-                if self.fixed_params["wte"].grad is not None:
-                    wte_view.grad = self.fixed_params["wte"].grad[:union_count]
-                if self.fixed_params["lm_head"].grad is not None:
-                    lm_head_view.grad = self.fixed_params["lm_head"].grad[:lm_head_exposed_count]
-            value_embed_views = {}
-            for layer_name in self.fixed_active_vocab["value_embeds"]:
-                value_view = self.fixed_params[f"value_embeds.{layer_name}"][:union_count]
-                if not self.use_cuda:
-                    value_view.retain_grad()
-                    base_grad = self.fixed_params[f"value_embeds.{layer_name}"].grad
-                    if base_grad is not None:
-                        value_view.grad = base_grad[:union_count]
-                value_embed_views[layer_name] = value_view
-            step_active_vocab["wte"] = wte_view
-            step_active_vocab["value_embeds"] = value_embed_views
-            step_active_vocab["lm_head"] = lm_head_view
-            step_active_vocab.pop("logit_mask", None)
             if use_cold_logit_bias:
-                step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias[:lm_head_exposed_count]
+                step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias
             else:
                 step_active_vocab.pop("cold_logit_bias", None)
+            if use_logit_mask:
+                step_active_vocab["logit_mask"] = self.fixed_logit_mask
         else:
             if use_logit_mask:
                 step_active_vocab["logit_mask"] = self.fixed_logit_mask
