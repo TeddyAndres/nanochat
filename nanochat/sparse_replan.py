@@ -12,6 +12,7 @@ from nanochat.sparse_analysis import SPARSE_LOSS_TOPK_RANKING_SINGLE, SparseLoss
 from nanochat.sparse_window_accum import SparseRollingLossAccumulator
 from nanochat.sparse_manifest import (
     SequenceManifestShardAccessor,
+    get_microstep_sequence_ids,
     load_sequence_manifest_shard,
     load_sparse_manifest_header,
     resolve_grouping_base_manifest_path,
@@ -78,6 +79,9 @@ class SparseFutureWindowPlanner:
         self.manifest_path = Path(manifest_path)
         self.grouping_header = load_sparse_manifest_header(self.manifest_path)
         self.negative_only = bool(negative_only)
+        self.ddp_world_size = int(self.grouping_header.get("ddp_world_size", 1))
+        if self.ddp_world_size > 1 and not self.negative_only:
+            raise ValueError("SparseFutureWindowPlanner only supports ddp_world_size > 1 manifests in negative-only mode")
         self.requires_sequence_base_manifest = not self.negative_only
         self.base_manifest_path = None
         self.sequence_units: dict[int, SequenceUnitView] = {}
@@ -377,8 +381,8 @@ class SparseFutureWindowPlanner:
         remaining_slots = max(0, self.u_max - len(active_ids))
         auto_negative_ids = [int(token_id) for token_id, _ in auto_negative_entries[:remaining_slots]]
         selected_active_ids = _dedupe_preserve_order(active_ids + auto_negative_ids)
+        sequence_ids = get_microstep_sequence_ids(microstep, ddp_world_size=self.ddp_world_size)
         payload = {
-            "sequence_id": int(microstep.get("sequence_id", -1)),
             "active_ids": selected_active_ids,
             "u_size": len(selected_active_ids),
             "next_active_ids": selected_active_ids,
@@ -387,6 +391,10 @@ class SparseFutureWindowPlanner:
             "next_new_ids": [],
             "planner_bucket": "baseline",
         }
+        if len(sequence_ids) == 1:
+            payload["sequence_id"] = int(sequence_ids[0])
+        elif len(sequence_ids) > 1:
+            payload["sequence_ids"] = [int(sequence_id) for sequence_id in sequence_ids]
         if auto_negative_ids:
             payload["injected_negative_ids"] = auto_negative_ids
             payload["auto_injected_negative_ids"] = auto_negative_ids
@@ -394,8 +402,7 @@ class SparseFutureWindowPlanner:
 
     def _build_baseline_microstep(self, microstep: dict[str, Any]) -> dict[str, Any]:
         active_ids = [int(token_id) for token_id in microstep.get("active_ids", [])]
-        return {
-            "sequence_id": int(microstep.get("sequence_id", -1)),
+        payload = {
             "active_ids": active_ids,
             "u_size": len(active_ids),
             "next_active_ids": active_ids,
@@ -404,6 +411,12 @@ class SparseFutureWindowPlanner:
             "next_new_ids": [],
             "planner_bucket": "baseline",
         }
+        sequence_ids = get_microstep_sequence_ids(microstep, ddp_world_size=self.ddp_world_size)
+        if len(sequence_ids) == 1:
+            payload["sequence_id"] = int(sequence_ids[0])
+        elif len(sequence_ids) > 1:
+            payload["sequence_ids"] = [int(sequence_id) for sequence_id in sequence_ids]
+        return payload
 
     def _valid_correct_records(self, records: torch.Tensor | None) -> list[int]:
         if records is None:

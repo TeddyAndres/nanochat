@@ -627,6 +627,160 @@ def test_dual_manifest_loader_uses_sequence_manifest(tmp_path, monkeypatch):
     assert state1["pq_idx"] == 1
 
 
+def test_dual_manifest_loader_selects_rank_local_sequence_ids(tmp_path, monkeypatch):
+    sequence_units = [
+        {
+            "sequence_id": 0,
+            "state_dict": {"pq_idx": 0, "rg_idx": 0, "epoch": 1},
+            "sequence_recipe": {
+                "device_batch_size": 1,
+                "max_seq_len": 2,
+                "row_capacity": 3,
+                "rows": [{
+                    "row_index": 0,
+                    "segments": [{
+                        "source_state": {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0},
+                        "doc_index_in_batch": 0,
+                        "start_offset": 0,
+                        "end_offset": 3,
+                    }],
+                }],
+            },
+            "num_unique_tokens": 3,
+            "unique_token_ids": [1, 2, 3],
+        },
+        {
+            "sequence_id": 1,
+            "state_dict": {"pq_idx": 1, "rg_idx": 1, "epoch": 1},
+            "sequence_recipe": {
+                "device_batch_size": 1,
+                "max_seq_len": 2,
+                "row_capacity": 3,
+                "rows": [{
+                    "row_index": 0,
+                    "segments": [{
+                        "source_state": {"pq_idx": 1, "rg_idx": 1, "epoch": 1, "text_batch_index": 0},
+                        "doc_index_in_batch": 0,
+                        "start_offset": 0,
+                        "end_offset": 3,
+                    }],
+                }],
+            },
+            "num_unique_tokens": 3,
+            "unique_token_ids": [2, 3, 4],
+        },
+    ]
+    sequence_shard_payload = build_sequence_manifest_shard_payload(
+        shard_index=0,
+        start_sequence_id=0,
+        sequence_units=sequence_units,
+    )
+    sequence_shard_path = tmp_path / "sequence_manifest_shards" / "sequence_manifest.shard00000.sqlite"
+    save_sequence_manifest_shard(sequence_shard_path, sequence_shard_payload)
+    base_manifest_path = tmp_path / "sequence_manifest.json"
+    save_sparse_manifest(
+        base_manifest_path,
+        build_sequence_manifest_payload(
+            split="train",
+            vocab_size=16,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=4,
+            grad_accum_steps=1,
+            ddp_world_size=2,
+            num_iterations=1,
+            buffer_size=4,
+            num_sequence_units=2,
+            shard_sequence_count=2,
+            shards=[{
+                "shard_index": 0,
+                "path": str(sequence_shard_path.relative_to(tmp_path)),
+                "start_sequence_id": 0,
+                "num_sequence_units": 2,
+            }],
+        ),
+    )
+
+    grouping_shard_path = tmp_path / "grouping_manifest_shards" / "grouping_manifest.shard00000.json"
+    save_sparse_manifest(
+        grouping_shard_path,
+        build_manifest_shard_payload(
+            shard_index=0,
+            start_step=0,
+            steps=[{
+                "step": 0,
+                "grad_accum_u_size": 4,
+                "grad_accum_active_ids": [1, 2, 3, 4],
+                "microsteps": [{
+                    "microstep": 0,
+                    "sequence_ids": [0, 1],
+                    "u_size": 4,
+                    "active_ids": [1, 2, 3, 4],
+                    "next_common_ids": [],
+                    "next_leaving_ids": [],
+                    "next_new_ids": [],
+                }],
+            }],
+        ),
+    )
+    grouping_manifest_path = tmp_path / "grouping_manifest.json"
+    save_sparse_manifest(
+        grouping_manifest_path,
+        build_grouping_manifest_payload(
+            split="train",
+            vocab_size=16,
+            device_batch_size=1,
+            max_seq_len=2,
+            total_batch_size=4,
+            grad_accum_steps=1,
+            ddp_world_size=2,
+            num_iterations=1,
+            buffer_size=4,
+            u_max=4,
+            grad_accum_u_max=4,
+            shard_step_count=1,
+            shards=[{
+                "shard_index": 0,
+                "path": str(grouping_shard_path.relative_to(tmp_path)),
+                "start_step": 0,
+                "num_steps": 1,
+                "u_max": 4,
+                "grad_accum_u_max": 4,
+            }],
+            base_manifest_path=str(base_manifest_path.relative_to(tmp_path)),
+        ),
+    )
+
+    monkeypatch.setattr(dataloader_module, "get_dist_info", lambda: (True, 1, 1, 2))
+    monkeypatch.setattr(
+        dataloader_module,
+        "load_cached_token_batch_by_state",
+        lambda cache_dir, split, *, pq_idx, rg_idx, text_batch_index: [
+            torch.tensor([1, 2, 3], dtype=torch.long)
+        ] if pq_idx == 0 else [torch.tensor([2, 3, 4], dtype=torch.long)],
+    )
+
+    loader = dataloader_module.tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
+        tokenizer=None,
+        B=1,
+        T=2,
+        split="train",
+        manifest_path=grouping_manifest_path,
+        device="cpu",
+        vocab_size=16,
+        include_local_batch=False,
+    )
+
+    inputs, targets, step_meta, state = next(loader)
+
+    assert torch.equal(inputs.clone(), torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(targets.clone(), torch.tensor([[2, 3]], dtype=torch.long))
+    assert torch.equal(step_meta["inputs_union_cpu_local"], torch.tensor([[1, 2]], dtype=torch.long))
+    assert torch.equal(step_meta["targets_union_cpu_local"], torch.tensor([[2, 3]], dtype=torch.long))
+    assert step_meta["sequence_id"] == 1
+    assert state["pq_idx"] == 1
+
+
 def test_bestfit_loader_emits_sequence_recipe(tmp_path, monkeypatch):
     fake_batches = [
         ([torch.tensor([99, 1, 2], dtype=torch.long)], {"pq_idx": 0, "rg_idx": 0, "epoch": 1, "text_batch_index": 0}),
@@ -1007,6 +1161,7 @@ def test_resolve_batch_geometry_defaults_to_one_microbatch():
         max_seq_len=8,
         total_batch_size=-1,
         grad_accum_steps=-1,
+        ddp_world_size=1,
     )
 
     assert total_batch_size == 16
@@ -1019,6 +1174,7 @@ def test_resolve_batch_geometry_accepts_explicit_grad_accum_steps():
         max_seq_len=8,
         total_batch_size=-1,
         grad_accum_steps=4,
+        ddp_world_size=1,
     )
 
     assert total_batch_size == 64
@@ -1032,8 +1188,22 @@ def test_resolve_batch_geometry_rejects_inconsistent_inputs():
             max_seq_len=8,
             total_batch_size=32,
             grad_accum_steps=3,
+            ddp_world_size=1,
         )
     except ValueError as exc:
         assert "grad_accum_steps mismatch" in str(exc)
     else:
         raise AssertionError("Expected resolve_batch_geometry to reject inconsistent inputs")
+
+
+def test_resolve_batch_geometry_scales_with_target_world_size():
+    total_batch_size, grad_accum_steps = resolve_batch_geometry(
+        device_batch_size=32,
+        max_seq_len=2048,
+        total_batch_size=-1,
+        grad_accum_steps=1,
+        ddp_world_size=8,
+    )
+
+    assert total_batch_size == 32 * 2048 * 8
+    assert grad_accum_steps == 1

@@ -40,6 +40,34 @@ def tensor_ids_to_list(ids: torch.Tensor) -> list[int]:
     return [int(x) for x in ids.tolist()]
 
 
+def get_microstep_sequence_ids(
+    microstep: dict[str, Any],
+    *,
+    ddp_world_size: int | None = None,
+    require_all_ranks: bool = False,
+) -> list[int]:
+    sequence_ids = microstep.get("sequence_ids")
+    if sequence_ids is not None:
+        if not isinstance(sequence_ids, list) or len(sequence_ids) == 0:
+            raise ValueError("Sparse manifest microstep sequence_ids must be a non-empty list")
+        resolved = [int(sequence_id) for sequence_id in sequence_ids]
+    elif "sequence_id" in microstep:
+        resolved = [int(microstep.get("sequence_id", -1))]
+    else:
+        resolved = []
+    if any(sequence_id < 0 for sequence_id in resolved):
+        raise ValueError("Sparse manifest microstep sequence ids must be non-negative")
+    if ddp_world_size is not None and len(resolved) not in {0, 1, int(ddp_world_size)}:
+        raise ValueError(
+            f"Sparse manifest microstep sequence id count must be 1 or ddp_world_size={int(ddp_world_size)}, found {len(resolved)}"
+        )
+    if require_all_ranks and ddp_world_size is not None and len(resolved) != int(ddp_world_size):
+        raise ValueError(
+            f"Sparse manifest microstep must define exactly ddp_world_size={int(ddp_world_size)} sequence ids, found {len(resolved)}"
+        )
+    return resolved
+
+
 def compute_next_transition(current_ids: torch.Tensor, next_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     current_ids = current_ids.detach().to(device="cpu", dtype=torch.long)
     next_ids = next_ids.detach().to(device="cpu", dtype=torch.long)
@@ -690,7 +718,7 @@ def validate_sparse_manifest(
         if num_shards is not None and int(num_shards) != len(shards):
             raise ValueError("Sparse manifest num_shards does not match the number of shard entries")
     version = int(payload.get("version", 1))
-    if version == 2 and steps is not None:
+    if version >= 2 and steps is not None:
         for step_idx, step_entry in enumerate(steps):
             microsteps = step_entry.get("microsteps")
             if not isinstance(microsteps, list) or len(microsteps) != grad_accum_steps:
@@ -710,6 +738,17 @@ def validate_sparse_manifest(
             if grad_accum_u_size > grad_accum_u_max:
                 raise ValueError(
                     f"Sparse manifest step {step_idx} grad_accum_u_size exceeds grad_accum_u_max: {grad_accum_u_size} > {grad_accum_u_max}"
+                )
+            for micro_idx, microstep in enumerate(microsteps):
+                sequence_ids = get_microstep_sequence_ids(microstep, ddp_world_size=ddp_world_size)
+                if len(sequence_ids) == 0:
+                    continue
+                if len(sequence_ids) == int(ddp_world_size):
+                    continue
+                if int(ddp_world_size) == 1 and len(sequence_ids) == 1:
+                    continue
+                raise ValueError(
+                    f"Sparse manifest step {step_idx} microstep {micro_idx} stores {len(sequence_ids)} sequence ids for ddp_world_size={ddp_world_size}"
                 )
 
 

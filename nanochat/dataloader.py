@@ -29,6 +29,7 @@ from nanochat.sparse_manifest import (
     SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
     SequenceManifestShardAccessor,
     compute_next_transition,
+    get_microstep_sequence_ids,
     get_sparse_manifest_kind,
     load_sparse_manifest_header,
     resolve_grouping_base_manifest_path,
@@ -66,8 +67,15 @@ def _iter_tokenized_document_batches(
     token_cache_dir,
     token_cache_shard_batches,
     token_cache_workers,
+    ddp_rank_override=None,
+    ddp_world_size_override=None,
 ):
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    del ddp, ddp_local_rank
+    if ddp_rank_override is not None:
+        ddp_rank = int(ddp_rank_override)
+    if ddp_world_size_override is not None:
+        ddp_world_size = int(ddp_world_size_override)
     bos_token = tokenizer.get_bos_token_id()
     if token_cache_dir is not None:
         resolved_cache_dir = resolve_token_cache_dir(token_cache_dir)
@@ -142,6 +150,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     token_cache_dir=None,
     token_cache_shard_batches=256,
     token_cache_workers=1,
+    ddp_rank_override=None,
+    ddp_world_size_override=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -171,6 +181,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         token_cache_dir=token_cache_dir,
         token_cache_shard_batches=token_cache_shard_batches,
         token_cache_workers=token_cache_workers,
+        ddp_rank_override=ddp_rank_override,
+        ddp_world_size_override=ddp_world_size_override,
     )
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
@@ -605,7 +617,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                     "Runtime sparse overrides without sequence-base manifest loading must preserve the baseline microstep count"
                 )
             for micro_idx, (default_microstep, override_microstep) in enumerate(zip(default_microsteps, override_microsteps)):
-                if int(default_microstep.get("sequence_id", -1)) != int(override_microstep.get("sequence_id", -1)):
+                default_sequence_ids = get_microstep_sequence_ids(default_microstep, ddp_world_size=ddp_world_size)
+                override_sequence_ids = get_microstep_sequence_ids(override_microstep, ddp_world_size=ddp_world_size)
+                if default_sequence_ids != override_sequence_ids:
                     raise ValueError(
                         "Runtime sparse overrides that change sequence_id require sequence-base manifest loading "
                         f"(step={step_index}, micro={micro_idx})"
@@ -673,19 +687,25 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                 current_new_ids, current_new_slots, _, _ = reconcile_active_ids(desired_active_ids)
             state_matches_current_entry = True
         loaded_sequence_unique_ids = None
+        active_sequence_id = -1
         if use_dual_manifest:
             assert resolve_sequence_unit is not None
             assert resolved_cache_dir is not None
-            sequence_id = int(current_micro_entry.get("sequence_id", -1))
-            if sequence_id < 0:
+            sequence_ids = get_microstep_sequence_ids(
+                current_micro_entry,
+                ddp_world_size=ddp_world_size,
+                require_all_ranks=ddp_world_size > 1,
+            )
+            if len(sequence_ids) == 0:
                 raise ValueError("Dual-manifest microsteps must define a non-negative sequence_id")
-            sequence_unit = resolve_sequence_unit(sequence_id)
+            active_sequence_id = int(sequence_ids[ddp_rank if len(sequence_ids) > 1 else 0])
+            sequence_unit = resolve_sequence_unit(active_sequence_id)
             if "inputs" in sequence_unit and "targets" in sequence_unit:
                 base_inputs = torch.as_tensor(sequence_unit["inputs"], dtype=torch.long)
                 base_targets = torch.as_tensor(sequence_unit["targets"], dtype=torch.long)
                 if tuple(base_inputs.shape) != (B, T) or tuple(base_targets.shape) != (B, T):
                     raise ValueError(
-                        f"Sequence manifest batch shape mismatch for sequence_id={sequence_id}: "
+                        f"Sequence manifest batch shape mismatch for sequence_id={active_sequence_id}: "
                         f"expected {(B, T)}, found inputs={tuple(base_inputs.shape)} targets={tuple(base_targets.shape)}"
                     )
             else:
@@ -695,18 +715,18 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                 row_capacity = int(sequence_recipe.get("row_capacity", T + 1))
                 if row_capacity != T + 1:
                     raise ValueError(
-                        f"Sequence manifest row_capacity mismatch for sequence_id={sequence_id}: expected {T + 1}, found {row_capacity}"
+                        f"Sequence manifest row_capacity mismatch for sequence_id={active_sequence_id}: expected {T + 1}, found {row_capacity}"
                     )
                 recipe_rows = sequence_recipe.get("rows")
                 if not isinstance(recipe_rows, list) or len(recipe_rows) != B:
                     raise ValueError(
-                        f"Sequence manifest rows mismatch for sequence_id={sequence_id}: expected {B}, found {0 if recipe_rows is None else len(recipe_rows)}"
+                        f"Sequence manifest rows mismatch for sequence_id={active_sequence_id}: expected {B}, found {0 if recipe_rows is None else len(recipe_rows)}"
                     )
                 row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
                 for row_idx, row_entry in enumerate(recipe_rows):
                     segments = row_entry.get("segments") if isinstance(row_entry, dict) else None
                     if not isinstance(segments, list) or len(segments) == 0:
-                        raise ValueError(f"Sequence manifest row {row_idx} is missing segments for sequence_id={sequence_id}")
+                        raise ValueError(f"Sequence manifest row {row_idx} is missing segments for sequence_id={active_sequence_id}")
                     pos = 0
                     for segment in segments:
                         if not isinstance(segment, dict):
@@ -736,26 +756,26 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                         doc_index_in_batch = int(segment.get("doc_index_in_batch", -1))
                         if doc_index_in_batch < 0 or doc_index_in_batch >= len(token_lists):
                             raise ValueError(
-                                f"Sequence manifest segment doc_index_in_batch={doc_index_in_batch} is invalid for sequence_id={sequence_id}"
+                                f"Sequence manifest segment doc_index_in_batch={doc_index_in_batch} is invalid for sequence_id={active_sequence_id}"
                             )
                         source_tokens = token_lists[doc_index_in_batch]
                         start_offset = int(segment.get("start_offset", 0))
                         end_offset = int(segment.get("end_offset", -1))
                         if start_offset < 0 or end_offset < start_offset or end_offset > source_tokens.numel():
                             raise ValueError(
-                                f"Sequence manifest segment offsets are invalid for sequence_id={sequence_id}: [{start_offset}, {end_offset})"
+                                f"Sequence manifest segment offsets are invalid for sequence_id={active_sequence_id}: [{start_offset}, {end_offset})"
                             )
                         segment_tokens = source_tokens[start_offset:end_offset]
                         next_pos = pos + int(segment_tokens.numel())
                         if next_pos > row_capacity:
                             raise ValueError(
-                                f"Sequence manifest row overflow for sequence_id={sequence_id}: row {row_idx} exceeds row_capacity={row_capacity}"
+                                f"Sequence manifest row overflow for sequence_id={active_sequence_id}: row {row_idx} exceeds row_capacity={row_capacity}"
                             )
                         row_buffer[row_idx, pos:next_pos] = segment_tokens
                         pos = next_pos
                     if pos != row_capacity:
                         raise ValueError(
-                            f"Sequence manifest row underfill for sequence_id={sequence_id}: row {row_idx} filled {pos} tokens, expected {row_capacity}"
+                            f"Sequence manifest row underfill for sequence_id={active_sequence_id}: row {row_idx} filled {pos} tokens, expected {row_capacity}"
                         )
                 base_inputs = row_buffer[:, :-1]
                 base_targets = row_buffer[:, 1:]
@@ -789,7 +809,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
                     ~torch.isin(loaded_sequence_unique_ids, desired_active_ids_debug)
                 ]
             raise ValueError(
-                f"Sparse manifest mismatch at step {manifest_step} micro={current_micro_idx} sequence_id={int(current_micro_entry.get('sequence_id', -1))}: "
+                f"Sparse manifest mismatch at step {manifest_step} micro={current_micro_idx} sequence_id={active_sequence_id}: "
                 f"live batch contains {missing_ids.numel()} tokens missing from manifest active_ids; "
                 f"sample_missing_ids={missing_ids[:16].tolist()} | "
                 f"override_step={current_step_is_override} state_matches={state_matches_current_entry} "
@@ -885,7 +905,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             "grad_accum_steps": accum_steps,
             "grad_accum_micro_step": micro_step_index,
             "is_grad_accum_boundary": micro_step_index == accum_steps - 1,
-            "sequence_id": int(current_micro_entry.get("sequence_id", -1)),
+            "sequence_id": int(active_sequence_id),
         }
         if include_local_batch:
             step_meta["inputs_cpu_local"] = cpu_inputs.clone()
