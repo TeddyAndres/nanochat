@@ -1,43 +1,168 @@
 #!/bin/bash
+set -euo pipefail
 
 # This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
 # It is designed to run on a blank 8XH100 GPU node and takes approximately 3 hours to complete.
-
-# 1) Example launch (simplest):
+#
+# Defaults preserve the original dense speedrun behavior.
+# Override with env vars when you want a faster sparse+manifest launch path on pre-staged nodes.
+#
+# 1) Example dense launch:
 # bash runs/speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~3 hours):
-# screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
+# 2) Example sparse launch with pre-staged data + manifest:
+# SPEEDRUN_SPARSE_MODE=1 \
+# SPEEDRUN_SPARSE_MANIFEST=manifests/65kvocab_2kseq_16batch_2accum_8ddp_10kstep.json \
+# SPEEDRUN_SKIP_DOWNLOADS=1 \
+# bash runs/speedrun.sh
+# 3) Example launch in a screen session:
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 
-# Default intermediate artifacts directory is in ~/.cache/nanochat
+die() {
+    echo "speedrun.sh: $*" >&2
+    exit 1
+}
+
+require_file() {
+    local path="$1"
+    local message="$2"
+    [[ -f "$path" ]] || die "$message ($path)"
+}
+
+require_dir() {
+    local path="$1"
+    local message="$2"
+    [[ -d "$path" ]] || die "$message ($path)"
+}
+
+tokenizer_ready() {
+    local tokenizer_dir="$1"
+    [[ -f "$tokenizer_dir/tokenizer.model" || -f "$tokenizer_dir/tokenizer.json" || -f "$tokenizer_dir/tokenizer.pkl" ]]
+}
+
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+
+# Preserve user-provided storage roots and keep large runtime caches off /tmp.
+: "${NANOCHAT_BASE_DIR:=$HOME/.cache/nanochat}"
+export NANOCHAT_BASE_DIR
+mkdir -p "$NANOCHAT_BASE_DIR"
+
+: "${TORCHINDUCTOR_CACHE_DIR:=$NANOCHAT_BASE_DIR/torchinductor-cache}"
+: "${TRITON_CACHE_DIR:=$NANOCHAT_BASE_DIR/triton-cache}"
+export TORCHINDUCTOR_CACHE_DIR
+export TRITON_CACHE_DIR
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+
+: "${SPEEDRUN_VENV_PATH:=.venv}"
+: "${SPEEDRUN_SKIP_VENV_SETUP:=0}"
+: "${SPEEDRUN_SKIP_UV_SYNC:=0}"
+: "${SPEEDRUN_SKIP_DOWNLOADS:=0}"
+: "${SPEEDRUN_SKIP_DATASET_DOWNLOAD:=0}"
+: "${SPEEDRUN_SKIP_IDENTITY_DOWNLOAD:=0}"
+: "${SPEEDRUN_SKIP_TOKENIZER_TRAIN:=0}"
+: "${SPEEDRUN_SKIP_BASE_EVAL:=0}"
+: "${SPEEDRUN_SKIP_SFT:=0}"
+: "${SPEEDRUN_SKIP_CHAT_EVAL:=0}"
+: "${SPEEDRUN_NPROC_PER_NODE:=8}"
+: "${SPEEDRUN_MODEL_DEPTH:=24}"
+: "${SPEEDRUN_TARGET_PARAM_DATA_RATIO:=8}"
+: "${SPEEDRUN_ENABLE_FP8:=1}"
+: "${SPEEDRUN_DEVICE_BATCH_SIZE:=}"
+: "${SPEEDRUN_EVAL_DEVICE_BATCH_SIZE:=}"
+: "${SPEEDRUN_SFT_DEVICE_BATCH_SIZE:=}"
+: "${SPEEDRUN_TOTAL_BATCH_SIZE:=}"
+: "${SPEEDRUN_SPARSE_MODE:=0}"
+: "${SPEEDRUN_SPARSE_MANIFEST:=}"
+: "${SPEEDRUN_TOKEN_CACHE_DIR:=}"
+: "${SPEEDRUN_BASE_TRAIN_EXTRA_ARGS:=}"
+: "${SPEEDRUN_BASE_EVAL_EXTRA_ARGS:=}"
+: "${SPEEDRUN_CHAT_SFT_EXTRA_ARGS:=}"
+: "${SPEEDRUN_CHAT_EVAL_EXTRA_ARGS:=}"
+
+if [[ "$SPEEDRUN_SKIP_DOWNLOADS" == "1" ]]; then
+    SPEEDRUN_SKIP_DATASET_DOWNLOAD=1
+    SPEEDRUN_SKIP_IDENTITY_DOWNLOAD=1
+fi
+
+DATA_DIR="$NANOCHAT_BASE_DIR/base_data_climbmix"
+TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer"
+IDENTITY_CONVERSATIONS_PATH="$NANOCHAT_BASE_DIR/identity_conversations.jsonl"
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
 
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
-source .venv/bin/activate
+if [[ "$SPEEDRUN_SKIP_VENV_SETUP" != "1" ]]; then
+    command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+    [[ -d "$SPEEDRUN_VENV_PATH" ]] || uv venv "$SPEEDRUN_VENV_PATH"
+    if [[ "$SPEEDRUN_SKIP_UV_SYNC" != "1" ]]; then
+        uv sync --extra gpu
+    fi
+    source "$SPEEDRUN_VENV_PATH/bin/activate"
+fi
 
 # -----------------------------------------------------------------------------
 # wandb setup
-# If you wish to use wandb for logging (it's nice!, recommended).
-# 1) Make sure to first log in to wandb, e.g. run:
-#    `wandb login`
-# 2) Set the WANDB_RUN environment variable when running this script, e.g.:
-#    `WANDB_RUN=d26 bash speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
+
+if [[ -z "${WANDB_RUN:-}" ]]; then
     WANDB_RUN=dummy
 fi
+
+if [[ "$SPEEDRUN_SPARSE_MODE" == "1" ]]; then
+    [[ -n "$SPEEDRUN_SPARSE_MANIFEST" ]] || die "SPEEDRUN_SPARSE_MODE=1 requires SPEEDRUN_SPARSE_MANIFEST"
+    require_file "$SPEEDRUN_SPARSE_MANIFEST" "Sparse manifest not found"
+
+    mapfile -t manifest_meta < <(python - "$SPEEDRUN_SPARSE_MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    payload = json.load(f)
+
+for key in ("device_batch_size", "total_batch_size", "ddp_world_size", "grad_accum_steps", "u_max", "grad_accum_u_max"):
+    print(payload.get(key, ""))
+PY
+    )
+
+    manifest_device_batch_size="${manifest_meta[0]}"
+    manifest_total_batch_size="${manifest_meta[1]}"
+    manifest_world_size="${manifest_meta[2]}"
+    manifest_grad_accum_steps="${manifest_meta[3]}"
+    manifest_u_max="${manifest_meta[4]}"
+    manifest_grad_accum_u_max="${manifest_meta[5]}"
+
+    [[ "$manifest_world_size" == "$SPEEDRUN_NPROC_PER_NODE" ]] || die "Sparse manifest world size $manifest_world_size does not match SPEEDRUN_NPROC_PER_NODE=$SPEEDRUN_NPROC_PER_NODE"
+    [[ -n "$manifest_device_batch_size" ]] || die "Sparse manifest is missing device_batch_size"
+    [[ -n "$manifest_total_batch_size" ]] || die "Sparse manifest is missing total_batch_size"
+
+    if [[ -z "$SPEEDRUN_DEVICE_BATCH_SIZE" ]]; then
+        SPEEDRUN_DEVICE_BATCH_SIZE="$manifest_device_batch_size"
+    fi
+    if [[ -z "$SPEEDRUN_TOTAL_BATCH_SIZE" ]]; then
+        SPEEDRUN_TOTAL_BATCH_SIZE="$manifest_total_batch_size"
+    fi
+
+    echo "Sparse speedrun mode enabled"
+    echo "  manifest: $SPEEDRUN_SPARSE_MANIFEST"
+    echo "  world size: $manifest_world_size"
+    echo "  device batch size: $SPEEDRUN_DEVICE_BATCH_SIZE"
+    echo "  total batch size: $SPEEDRUN_TOTAL_BATCH_SIZE"
+    echo "  grad accum steps: $manifest_grad_accum_steps"
+    echo "  u_max: $manifest_u_max"
+    echo "  grad_accum_u_max: $manifest_grad_accum_u_max"
+fi
+
+if [[ -z "$SPEEDRUN_DEVICE_BATCH_SIZE" ]]; then
+    SPEEDRUN_DEVICE_BATCH_SIZE=16
+fi
+if [[ -z "$SPEEDRUN_EVAL_DEVICE_BATCH_SIZE" ]]; then
+    SPEEDRUN_EVAL_DEVICE_BATCH_SIZE="$SPEEDRUN_DEVICE_BATCH_SIZE"
+fi
+if [[ -z "$SPEEDRUN_SFT_DEVICE_BATCH_SIZE" ]]; then
+    SPEEDRUN_SFT_DEVICE_BATCH_SIZE="$SPEEDRUN_DEVICE_BATCH_SIZE"
+fi
+
+echo "Using NANOCHAT_BASE_DIR=$NANOCHAT_BASE_DIR"
+echo "Using TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR"
+echo "Using TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
 
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
@@ -48,42 +173,74 @@ python -m nanochat.report reset
 # -----------------------------------------------------------------------------
 # Tokenizer
 
-# Download the first ~2B characters of pretraining dataset
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-# look at dev/repackage_data_reference.py for details on how this data was prepared
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
-# The maximum total number of shards available in the entire dataset is 6542.
-python -m nanochat.dataset -n 170 &
-DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+DATASET_DOWNLOAD_PID=""
+if [[ "$SPEEDRUN_SKIP_DATASET_DOWNLOAD" != "1" ]]; then
+    # Download the first ~2B characters of pretraining dataset.
+    python -m nanochat.dataset -n 8
+    # Immediately also kick off downloading more shards in the background while tokenizer trains.
+    python -m nanochat.dataset -n 170 &
+    DATASET_DOWNLOAD_PID=$!
+else
+    require_dir "$DATA_DIR" "Dataset download skipped but dataset directory is missing"
+fi
+
+if [[ "$SPEEDRUN_SKIP_TOKENIZER_TRAIN" != "1" ]]; then
+    python -m scripts.tok_train
+    python -m scripts.tok_eval
+else
+    tokenizer_ready "$TOKENIZER_DIR" || die "Tokenizer training skipped but tokenizer artifacts are missing from $TOKENIZER_DIR"
+fi
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
 
-# d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
-# evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+if [[ -n "$DATASET_DOWNLOAD_PID" ]]; then
+    echo "Waiting for dataset download to complete..."
+    wait "$DATASET_DOWNLOAD_PID"
+fi
+
+base_train_args=(
+    "--depth=$SPEEDRUN_MODEL_DEPTH"
+    "--target-param-data-ratio=$SPEEDRUN_TARGET_PARAM_DATA_RATIO"
+    "--device-batch-size=$SPEEDRUN_DEVICE_BATCH_SIZE"
+    "--run=$WANDB_RUN"
+)
+
+if [[ "$SPEEDRUN_ENABLE_FP8" == "1" ]]; then
+    base_train_args+=("--fp8")
+fi
+if [[ -n "$SPEEDRUN_TOTAL_BATCH_SIZE" ]]; then
+    base_train_args+=("--total-batch-size=$SPEEDRUN_TOTAL_BATCH_SIZE")
+fi
+if [[ -n "$SPEEDRUN_TOKEN_CACHE_DIR" ]]; then
+    base_train_args+=("--token-cache-dir=$SPEEDRUN_TOKEN_CACHE_DIR")
+fi
+if [[ "$SPEEDRUN_SPARSE_MODE" == "1" ]]; then
+    base_train_args+=("--sparse-mode" "--sparse-manifest=$SPEEDRUN_SPARSE_MANIFEST")
+fi
+
+torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_train -- "${base_train_args[@]}" ${SPEEDRUN_BASE_TRAIN_EXTRA_ARGS}
+
+if [[ "$SPEEDRUN_SKIP_BASE_EVAL" != "1" ]]; then
+    torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_eval -- --device-batch-size="$SPEEDRUN_EVAL_DEVICE_BATCH_SIZE" ${SPEEDRUN_BASE_EVAL_EXTRA_ARGS}
+fi
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
 
-# download 2.3MB of synthetic identity conversations to impart a personality to nanochat
-# see dev/gen_synthetic_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+if [[ "$SPEEDRUN_SKIP_SFT" != "1" ]]; then
+    if [[ "$SPEEDRUN_SKIP_IDENTITY_DOWNLOAD" != "1" ]]; then
+        curl -L -o "$IDENTITY_CONVERSATIONS_PATH" https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+    else
+        require_file "$IDENTITY_CONVERSATIONS_PATH" "Identity conversations download skipped but file is missing"
+    fi
 
-# run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+    torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.chat_sft -- --device-batch-size="$SPEEDRUN_SFT_DEVICE_BATCH_SIZE" --run="$WANDB_RUN" ${SPEEDRUN_CHAT_SFT_EXTRA_ARGS}
+
+    if [[ "$SPEEDRUN_SKIP_CHAT_EVAL" != "1" ]]; then
+        torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.chat_eval -- -i sft ${SPEEDRUN_CHAT_EVAL_EXTRA_ARGS}
+    fi
+fi
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
