@@ -58,7 +58,7 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 : "${SPEEDRUN_SKIP_DOWNLOADS:=0}"
 : "${SPEEDRUN_SKIP_DATASET_DOWNLOAD:=0}"
 : "${SPEEDRUN_SKIP_IDENTITY_DOWNLOAD:=0}"
-: "${SPEEDRUN_SKIP_TOKENIZER_TRAIN:=0}"
+: "${SPEEDRUN_SKIP_TOKENIZER_TRAIN:=1}"
 : "${SPEEDRUN_SKIP_BASE_EVAL:=0}"
 : "${SPEEDRUN_SKIP_SFT:=0}"
 : "${SPEEDRUN_SKIP_CHAT_EVAL:=0}"
@@ -73,6 +73,9 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 : "${SPEEDRUN_SPARSE_MODE:=0}"
 : "${SPEEDRUN_SPARSE_MANIFEST:=}"
 : "${SPEEDRUN_TOKEN_CACHE_DIR:=}"
+: "${SPEEDRUN_TRAIN_EVAL_EVERY:=-1}"
+: "${SPEEDRUN_TRAIN_CORE_METRIC_EVERY:=-1}"
+: "${SPEEDRUN_TRAIN_SAMPLE_EVERY:=-1}"
 : "${SPEEDRUN_BASE_TRAIN_EXTRA_ARGS:=}"
 : "${SPEEDRUN_BASE_EVAL_EXTRA_ARGS:=}"
 : "${SPEEDRUN_CHAT_SFT_EXTRA_ARGS:=}"
@@ -189,6 +192,7 @@ if [[ "$SPEEDRUN_SKIP_TOKENIZER_TRAIN" != "1" ]]; then
     python -m scripts.tok_eval
 else
     tokenizer_ready "$TOKENIZER_DIR" || die "Tokenizer training skipped but tokenizer artifacts are missing from $TOKENIZER_DIR"
+    echo "Skipping tokenizer training; using pre-staged tokenizer from $TOKENIZER_DIR"
 fi
 
 # -----------------------------------------------------------------------------
@@ -203,6 +207,9 @@ base_train_args=(
     "--depth=$SPEEDRUN_MODEL_DEPTH"
     "--target-param-data-ratio=$SPEEDRUN_TARGET_PARAM_DATA_RATIO"
     "--device-batch-size=$SPEEDRUN_DEVICE_BATCH_SIZE"
+    "--eval-every=$SPEEDRUN_TRAIN_EVAL_EVERY"
+    "--core-metric-every=$SPEEDRUN_TRAIN_CORE_METRIC_EVERY"
+    "--sample-every=$SPEEDRUN_TRAIN_SAMPLE_EVERY"
     "--run=$WANDB_RUN"
 )
 
@@ -222,7 +229,7 @@ fi
 torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_train -- "${base_train_args[@]}" ${SPEEDRUN_BASE_TRAIN_EXTRA_ARGS}
 
 if [[ "$SPEEDRUN_SKIP_BASE_EVAL" != "1" ]]; then
-    torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_eval -- --device-batch-size="$SPEEDRUN_EVAL_DEVICE_BATCH_SIZE" ${SPEEDRUN_BASE_EVAL_EXTRA_ARGS}
+    torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_eval -- --eval=core,bpb,sample --device-batch-size="$SPEEDRUN_EVAL_DEVICE_BATCH_SIZE" ${SPEEDRUN_BASE_EVAL_EXTRA_ARGS}
 fi
 
 # -----------------------------------------------------------------------------
