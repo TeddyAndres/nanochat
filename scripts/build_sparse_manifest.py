@@ -3,7 +3,6 @@ Build a sparse-manifest JSON for hybrid fixed-U sparse training.
 
 Example:
 python -m scripts.build_sparse_manifest --num-iterations 2000 --grad-accum-steps 1 --output manifests/d6_sparse.json
-python -m scripts.build_sparse_manifest --num-iterations 10000 --grad-accum-steps 1 --ddp-world-size 8 --output manifests/65kvocab_2kseq_32batch_1accum_10kstep.json --token-cache-dir "" --token-cache-workers 8 --device-batch-size 32 --dual-manifest
 """
 
 import argparse
@@ -17,13 +16,9 @@ from nanochat.common import get_dist_info, print0
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.sparse_manifest import (
     build_manifest_shard_payload,
-    build_grouping_manifest_payload,
-    build_sequence_manifest_payload,
-    build_sequence_manifest_shard_payload,
     build_sharded_manifest_payload,
     compute_next_transition,
     save_sparse_manifest,
-    save_sequence_manifest_shard,
     tensor_ids_to_list,
 )
 from nanochat.tokenizer import get_tokenizer
@@ -80,17 +75,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="number of completed optimizer steps to buffer per shard before flushing to disk",
-    )
-    parser.add_argument(
-        "--dual-manifest",
-        action="store_true",
-        help="emit a base sequence manifest plus a grouping manifest instead of a single monolithic manifest",
-    )
-    parser.add_argument(
-        "--base-output",
-        type=str,
-        default="",
-        help="optional output path for the base sequence manifest when --dual-manifest is enabled",
     )
     return parser
 
@@ -168,7 +152,7 @@ def main() -> None:
             device="cpu",
             resume_state_dict=None,
             buffer_size=args.buffer_size,
-            return_sequence_recipe=args.dual_manifest,
+            return_sequence_recipe=False,
             vocab_size=vocab_size,
             token_cache_dir=args.token_cache_dir,
             token_cache_shard_batches=args.token_cache_shard_batches,
@@ -188,22 +172,6 @@ def main() -> None:
         raise ValueError(f"--shard-steps must be positive, got {args.shard_steps}")
 
     output_path = Path(args.output)
-    base_output_path = None
-    base_shard_dir = None
-    base_sequence_units: list[dict] = []
-    base_shard_entries: list[dict] = []
-    next_sequence_id = 0
-    if args.dual_manifest:
-        if args.base_output != "":
-            base_output_path = Path(args.base_output)
-        else:
-            base_output_path = output_path.with_name(f"{output_path.stem}.base.json")
-        if base_output_path == output_path:
-            raise ValueError("--base-output must differ from --output when --dual-manifest is enabled")
-        base_shard_dir = base_output_path.parent / f"{base_output_path.stem}_shards"
-        base_shard_index = 0
-    else:
-        base_shard_index = 0
     shard_dir = output_path.parent / f"{output_path.stem}_shards"
     shard_steps: list[dict] = []
     shard_entries: list[dict] = []
@@ -246,30 +214,6 @@ def main() -> None:
         if len(shard_steps) >= args.shard_steps:
             flush_shard()
 
-    def flush_base_shard() -> None:
-        nonlocal base_shard_index, base_sequence_units
-        if not args.dual_manifest or not base_sequence_units:
-            return
-        assert base_output_path is not None
-        assert base_shard_dir is not None
-        start_sequence_id = int(base_sequence_units[0]["sequence_id"])
-        shard_payload = build_sequence_manifest_shard_payload(
-            shard_index=base_shard_index,
-            start_sequence_id=start_sequence_id,
-            sequence_units=base_sequence_units,
-        )
-        shard_filename = f"{base_output_path.stem}.shard{base_shard_index:05d}.sqlite"
-        shard_path = base_shard_dir / shard_filename
-        save_sequence_manifest_shard(shard_path, shard_payload)
-        base_shard_entries.append({
-            "shard_index": base_shard_index,
-            "path": str(shard_path.relative_to(base_output_path.parent)),
-            "start_sequence_id": start_sequence_id,
-            "num_sequence_units": int(shard_payload["num_sequence_units"]),
-        })
-        base_shard_index += 1
-        base_sequence_units = []
-
     previous_active_ids = None
     previous_microstep_entry = None
     pending_step_entry = None
@@ -284,30 +228,8 @@ def main() -> None:
                 inputs_cpu = cast(torch.Tensor, batch[0]).to(device="cpu")
                 targets_cpu = cast(torch.Tensor, batch[1]).to(device="cpu")
                 state_dict = dict(cast(dict, batch[2]))
-                sequence_recipe = None
-                if args.dual_manifest:
-                    batch_with_recipe = cast(tuple[torch.Tensor, torch.Tensor, dict, dict], batch)
-                    sequence_recipe = dict(batch_with_recipe[3])
                 local_active_ids_cpu = torch.unique(torch.cat((inputs_cpu.reshape(-1), targets_cpu.reshape(-1))), sorted=True)
                 rank_active_ids.append(local_active_ids_cpu)
-                if args.dual_manifest:
-                    assert sequence_recipe is not None
-                    sequence_id = next_sequence_id
-                    next_sequence_id += 1
-                    rank_sequence_ids.append(int(sequence_id))
-                    base_sequence_units.append({
-                        "sequence_id": int(sequence_id),
-                        "state_dict": state_dict,
-                        "sequence_recipe": sequence_recipe,
-                        "num_unique_tokens": int(local_active_ids_cpu.numel()),
-                        "unique_token_ids": tensor_ids_to_list(local_active_ids_cpu),
-                        "sequence_geometry": {
-                            "device_batch_size": int(args.device_batch_size),
-                            "max_seq_len": int(args.max_seq_len),
-                        },
-                    })
-                    if len(base_sequence_units) >= args.shard_steps * grad_accum_steps * target_ddp_world_size:
-                        flush_base_shard()
             active_ids_cpu = torch.unique(torch.cat(rank_active_ids), sorted=True)
             active_ids_list.append(active_ids_cpu)
             if previous_active_ids is not None and previous_microstep_entry is not None:
@@ -323,11 +245,6 @@ def main() -> None:
                 "next_leaving_ids": [],
                 "next_new_ids": [],
             }
-            if args.dual_manifest:
-                if target_ddp_world_size == 1:
-                    microstep_entry["sequence_id"] = int(rank_sequence_ids[0])
-                else:
-                    microstep_entry["sequence_ids"] = rank_sequence_ids
             microsteps.append(microstep_entry)
             previous_active_ids = active_ids_cpu
             previous_microstep_entry = microstep_entry
@@ -348,59 +265,21 @@ def main() -> None:
     if pending_step_entry is not None:
         append_completed_step(pending_step_entry)
     flush_shard()
-    if args.dual_manifest:
-        flush_base_shard()
-
-    if args.dual_manifest:
-        assert base_output_path is not None
-        base_payload = build_sequence_manifest_payload(
-            split=args.split,
-            vocab_size=vocab_size,
-            device_batch_size=args.device_batch_size,
-            max_seq_len=args.max_seq_len,
-            total_batch_size=total_batch_size,
-            grad_accum_steps=grad_accum_steps,
-            ddp_world_size=target_ddp_world_size,
-            num_iterations=args.num_iterations,
-            buffer_size=args.buffer_size,
-            num_sequence_units=args.num_iterations * grad_accum_steps * target_ddp_world_size,
-            shard_sequence_count=args.shard_steps * grad_accum_steps * target_ddp_world_size,
-            shards=base_shard_entries,
-        )
-        save_sparse_manifest(base_output_path, base_payload)
-        base_manifest_rel_path = os.path.relpath(base_output_path, output_path.parent)
-        payload = build_grouping_manifest_payload(
-            split=args.split,
-            vocab_size=vocab_size,
-            device_batch_size=args.device_batch_size,
-            max_seq_len=args.max_seq_len,
-            total_batch_size=total_batch_size,
-            grad_accum_steps=grad_accum_steps,
-            ddp_world_size=target_ddp_world_size,
-            num_iterations=args.num_iterations,
-            buffer_size=args.buffer_size,
-            u_max=global_u_max,
-            grad_accum_u_max=global_grad_accum_u_max,
-            shard_step_count=args.shard_steps,
-            shards=shard_entries,
-            base_manifest_path=base_manifest_rel_path,
-        )
-    else:
-        payload = build_sharded_manifest_payload(
-            split=args.split,
-            vocab_size=vocab_size,
-            device_batch_size=args.device_batch_size,
-            max_seq_len=args.max_seq_len,
-            total_batch_size=total_batch_size,
-            grad_accum_steps=grad_accum_steps,
-            ddp_world_size=target_ddp_world_size,
-            num_iterations=args.num_iterations,
-            buffer_size=args.buffer_size,
-            u_max=global_u_max,
-            grad_accum_u_max=global_grad_accum_u_max,
-            shard_step_count=args.shard_steps,
-            shards=shard_entries,
-        )
+    payload = build_sharded_manifest_payload(
+        split=args.split,
+        vocab_size=vocab_size,
+        device_batch_size=args.device_batch_size,
+        max_seq_len=args.max_seq_len,
+        total_batch_size=total_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        ddp_world_size=target_ddp_world_size,
+        num_iterations=args.num_iterations,
+        buffer_size=args.buffer_size,
+        u_max=global_u_max,
+        grad_accum_u_max=global_grad_accum_u_max,
+        shard_step_count=args.shard_steps,
+        shards=shard_entries,
+    )
     save_sparse_manifest(args.output, payload)
     print0(
         f"Saved sparse manifest to {args.output} | u_max={payload['u_max']:,} | "
@@ -408,13 +287,6 @@ def main() -> None:
         f"steps={payload['num_steps']:,} | grad_accum_steps={grad_accum_steps:,} | "
         f"shards={payload['num_shards']:,}"
     )
-    if args.dual_manifest:
-        assert base_output_path is not None
-        print0(
-            f"Saved base sequence manifest to {base_output_path} | "
-            f"sequence_units={args.num_iterations * grad_accum_steps * target_ddp_world_size:,} | shards={len(base_shard_entries):,}"
-        )
-
 
 if __name__ == "__main__":
     main()

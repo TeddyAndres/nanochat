@@ -24,7 +24,6 @@ import time
 import math
 import argparse
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -37,28 +36,14 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.dynamic_vocab import COLD_LOGIT_BIAS_CLAMP_MAX, COLD_LOGIT_BIAS_CLAMP_MIN, DynamicVocabRuntime
+from nanochat.dynamic_vocab import DynamicVocabRuntime
 from nanochat.loss_eval import evaluate_bpb_and_ece
 from nanochat.prefetch import AsyncLoaderPrefetcher
-from nanochat.sparse_analysis import (
-    SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
-    SPARSE_LOSS_TOPK_RANKING_MODES,
-    SparseLossAnalysisWriter,
-    collect_sparse_loss_candidate_pool_from_stats,
-    collect_sparse_loss_topk_from_candidate_pool,
-    collect_sparse_loss_topk_from_stats,
-    merge_topk_records,
-    select_topk_records,
-)
-from nanochat.sparse_replan import SparseFutureWindowPlanner
-from nanochat.sparse_window_accum import SparseDecayedHardNegativePool
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from nanochat.sparse_manifest import (
     load_sparse_manifest_header,
-    resolve_grouping_base_manifest_path,
     resolve_sparse_manifest_grad_accum_u_max,
-    validate_sequence_manifest,
     validate_sparse_manifest,
 )
 from scripts.base_eval import evaluate_core
@@ -102,20 +87,6 @@ parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 f
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
-parser.add_argument("--sparse-cold-bias-scale", type=float, default=0.0, help="sparse-only cold-token bias coefficient; effective magnitude also follows sparse unembedding LR, LR schedule, and total batch size")
-parser.add_argument("--sparse-cold-row-decay", "--sparse-cold-row-decrement", dest="sparse_cold_row_decay", type=float, default=0.0, help="sparse-only fixed per-step CPU signed lm_head adjustment applied outside the next-step sparse table; effective multiplier is (1 - adjustment)")
-parser.add_argument("--sparse-cloud-max-u", type=int, default=0, help="fixed lm_head sparse capacity for step_U + warm + cold rows (0 disables cloud expansion)")
-parser.add_argument("--sparse-cloud-warm-proportion", type=float, default=0.5, help="fraction of lm_head cloud capacity to allocate to warm rows; cold receives the remainder")
-parser.add_argument("--sparse-unembedding-warm-lr", type=float, default=-1.0, help="lm_head LR for warm cloud rows in sparse mode; negative values reuse --unembedding-lr")
-parser.add_argument("--sparse-unembedding-cold-lr", type=float, default=-1.0, help="lm_head LR for cold cloud rows in sparse mode; negative values reuse --unembedding-lr")
-parser.add_argument("--sparse-cloud-router-candidate-pool", type=int, default=2048, help="top global-frequency candidate pool size for warm cloud routing on CPU")
-parser.add_argument("--sparse-cloud-router-topk", type=int, default=8, help="per-source top-k candidate count aggregated into the warm cloud ranking")
-parser.add_argument("--sparse-cloud-hidden-query-samples", type=int, default=32, help="number of subsampled causal positions from the next batch preview used to build warm-cloud hidden queries (0 uses the cheap preview-query path)")
-parser.add_argument("--sparse-cloud-hidden-query-strategy", type=str, default="uniform", choices=["uniform", "last"], help="subsampling strategy for warm-cloud hidden-state queries")
-parser.add_argument("--sparse-cloud-hidden-query-max-prefix-len", type=int, default=2048, help="maximum causal prefix length used when extracting each warm-cloud hidden query")
-parser.add_argument("--sparse-cloud-random-fill", action="store_true", help="fill the residual lm_head cloud capacity with random vocab tokens instead of frequency-ranked cold tokens")
-parser.add_argument("--sparse-cloud-random-fill-seed", type=int, default=0, help="deterministic seed offset for sparse random lm_head cloud fill")
-parser.add_argument("--sparse-logit-chunk-size", type=int, default=0, help="reserved for future sparse-logit chunking work")
 parser.add_argument("--sparse-debug-timing", action="store_true", help="log detailed sparse timing breakdowns for diagnosing sparse runtime overhead")
 parser.add_argument("--sparse-debug-sync-after-backward", action="store_true", help="for sparse timing diagnosis, synchronize after each backward pass to separate deferred GPU work from grad-accum bookkeeping")
 parser.add_argument("--sparse-empty-cache-every", type=int, default=0, help="in sparse mode, call torch.cuda.empty_cache() every N steps after writeback (0 disables)")
@@ -126,21 +97,6 @@ parser.add_argument("--sparse-unembed-warmup-steps", type=int, default=0, help="
 parser.add_argument("--sparse-first-hot-unembedding-lr", type=float, default=0.0, help="for lm_head rows only, use this LR the first time a token becomes active, then revert to the configured sparse unembedding LR (0 = disabled)")
 parser.add_argument("--sparse-hot-unembed-ramp-activations", type=int, default=0, help="for lm_head rows only, ramp per-token sparse unembedding LR over this many hot activations (0 = disabled)")
 parser.add_argument("--sparse-hot-unembed-ramp-start-lr", type=float, default=0.0, help="starting lm_head LR for the per-token hot-activation ramp; used with --sparse-hot-unembed-ramp-activations (0 = disabled)")
-parser.add_argument("--sparse-loss-topk-enable", action="store_true", help="capture bounded per-step sparse token-loss top-K tensors for analysis and future replanning")
-parser.add_argument("--sparse-loss-topk-ranking-mode", type=str, default="single", choices=SPARSE_LOSS_TOPK_RANKING_MODES, help="ranking mode for sparse top-K dedupe: 'single' keeps the worst single occurrence per token or pair, 'accumulated' sums repeated occurrences")
-parser.add_argument("--sparse-loss-topk-correct", type=int, default=50, help="maximum number of under-predicted correct-token records to keep per optimizer step")
-parser.add_argument("--sparse-loss-topk-incorrect", type=int, default=50, help="maximum number of over-predicted incorrect-token records to keep per optimizer step")
-parser.add_argument("--sparse-loss-topk-output", type=str, default="", help="dataset-side directory for async sparse top-K analysis output (empty = default beside token cache)")
-parser.add_argument("--sparse-loss-window-steps", type=int, default=20, help="rolling optimizer-step window used to accumulate sparse loss totals for replanning")
-parser.add_argument("--sparse-future-replan-enable", action="store_true", help="use per-step sparse top-K tensors to build delayed future grouping overrides in memory")
-parser.add_argument("--sparse-future-replan-interval", type=int, default=3, help="number of optimizer steps of lead time before a single future manifest step is replanned; with the current prefetch depth this must be at least 3")
-parser.add_argument("--sparse-future-replan-negative-only", action="store_true", help="keep baseline future microsteps but inject hard negatives from sparse top-K results instead of reordering future sequences")
-parser.add_argument("--sparse-auto-negative-per-microstep", type=int, default=4, help="maximum number of automatic corrective cold negatives to inject per replanned microstep")
-parser.add_argument("--sparse-hard-negative-cloud-enable", action="store_true", help="use a per-step decayed hard-negative pool to reserve lm_head cloud rows when paired targets are present")
-parser.add_argument("--sparse-hard-negative-budget", type=int, default=0, help="maximum number of runtime hard-negative lm_head cloud rows to reserve per step")
-parser.add_argument("--sparse-hard-negative-pool-size", type=int, default=1000, help="maximum number of decayed (wrong, correct) pairs retained in the runtime hard-negative pool")
-parser.add_argument("--sparse-hard-negative-decay", type=float, default=0.98, help="per-optimizer-step exponential decay factor for runtime hard-negative pair scores")
-parser.add_argument("--sparse-replan-sampling-seed", type=int, default=0, help="deterministic seed offset used when sampling from rolling sparse loss lists")
 parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip global gradient norm (dense params only) to this value before optimizer step; 0 = disabled")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -261,16 +217,10 @@ output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 sparse_manifest = None
-sparse_base_manifest = None
-sparse_base_manifest_path = ""
 sparse_resolved_grad_accum_u_max = None
 hybrid_sparse = args.sparse_mode and args.sparse_manifest != ""
-sparse_lm_head_clouds = args.sparse_cloud_max_u > 0
 if hybrid_sparse:
     sparse_manifest = load_sparse_manifest_header(args.sparse_manifest)
-    if "base_manifest_path" in sparse_manifest:
-        sparse_base_manifest_path = str(resolve_grouping_base_manifest_path(args.sparse_manifest, sparse_manifest))
-        sparse_base_manifest = load_sparse_manifest_header(sparse_base_manifest_path)
 if args.sparse_mode:
     if ddp:
         assert hybrid_sparse, "Sparse DDP currently requires --sparse-manifest fixed-U sparse mode"
@@ -288,10 +238,6 @@ if resuming:
         checkpoint_manifest = meta_data.get("sparse_manifest", "")
         assert checkpoint_manifest == args.sparse_manifest, (
             f"Sparse manifest mismatch on resume: checkpoint uses '{checkpoint_manifest}', current run uses '{args.sparse_manifest}'"
-        )
-        checkpoint_base_manifest = meta_data.get("sparse_base_manifest", "")
-        assert checkpoint_base_manifest == sparse_base_manifest_path, (
-            f"Sparse base manifest mismatch on resume: checkpoint uses '{checkpoint_base_manifest}', current run uses '{sparse_base_manifest_path}'"
         )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
@@ -480,23 +426,8 @@ dynamic_vocab = None
 optimizer_data_sparse = None
 if args.sparse_mode:
     assert args.sparse_logit_scale > 0.0, "--sparse-logit-scale must be positive"
-    assert args.sparse_cold_bias_scale >= 0.0, "--sparse-cold-bias-scale must be non-negative"
-    assert -1.0 <= args.sparse_cold_row_decay <= 1.0, "--sparse-cold-row-decay must be in [-1, 1]"
-    assert 0.0 <= args.sparse_cloud_warm_proportion <= 1.0, "--sparse-cloud-warm-proportion must be in [0, 1]"
-    if sparse_lm_head_clouds:
-        assert hybrid_sparse, "--sparse-cloud-max-u requires --sparse-manifest hybrid sparse mode"
-    if args.sparse_cloud_random_fill:
-        assert sparse_lm_head_clouds, "--sparse-cloud-random-fill requires --sparse-cloud-max-u"
-        assert hybrid_sparse, "--sparse-cloud-random-fill requires --sparse-manifest hybrid sparse mode"
     if args.sparse_logit_scale != 1.0:
         print0(f"Sparse logit scaling enabled: multiplying sparse train/val logits by {args.sparse_logit_scale:.4f} before CE")
-    if args.sparse_cold_bias_scale > 0.0:
-        print0(f"Sparse cold-token bias enabled: base_scale={args.sparse_cold_bias_scale:.4f}")
-    if args.sparse_cold_row_decay != 0.0:
-        print0(
-            f"Sparse cold-row adjustment enabled: base_adjustment={args.sparse_cold_row_decay:.6f}, "
-            f"base_multiplier={1.0 - args.sparse_cold_row_decay:.6f}"
-        )
     sparse_fixed_u_max = None
     sparse_lm_head_u_max = None
     sparse_grad_accum_u_max = None
@@ -506,25 +437,8 @@ if args.sparse_mode:
         sparse_fixed_u_max = int(sparse_manifest["u_max"])
         sparse_resolved_grad_accum_u_max = resolve_sparse_manifest_grad_accum_u_max(args.sparse_manifest, sparse_manifest)
         sparse_grad_accum_u_max = sparse_resolved_grad_accum_u_max
-        sparse_lm_head_u_max = sparse_fixed_u_max if not sparse_lm_head_clouds else int(args.sparse_cloud_max_u)
+        sparse_lm_head_u_max = sparse_fixed_u_max
         sparse_runtime_capacity_multiple = SPARSE_RUNTIME_CAPACITY_MULTIPLE
-        if sparse_lm_head_u_max < sparse_fixed_u_max:
-            raise ValueError(
-                f"--sparse-cloud-max-u must be at least manifest u_max={sparse_fixed_u_max}, got {sparse_lm_head_u_max}"
-            )
-        if sparse_lm_head_clouds:
-            warm_lr = sparse_unembedding_lr if args.sparse_unembedding_warm_lr < 0.0 else float(args.sparse_unembedding_warm_lr)
-            cold_lr = sparse_unembedding_lr if args.sparse_unembedding_cold_lr < 0.0 else float(args.sparse_unembedding_cold_lr)
-            print0(
-                f"Sparse lm_head clouds enabled: manifest_u_max={sparse_fixed_u_max:,} | "
-                f"lm_head_u_max={sparse_lm_head_u_max:,} | warm_fraction={args.sparse_cloud_warm_proportion:.2f} | "
-                f"warm_lr={warm_lr:.6f} | cold_lr={cold_lr:.6f}"
-            )
-            if args.sparse_cloud_random_fill:
-                print0(
-                    f"Sparse random cloud fill enabled: filling cold residual to lm_head_u_max with random tokens | "
-                    f"seed_offset={args.sparse_cloud_random_fill_seed}"
-                )
     dynamic_vocab = DynamicVocabRuntime(
         orig_model,
         device=device,
@@ -538,11 +452,6 @@ if args.sparse_mode:
         lm_head_u_max=sparse_lm_head_u_max,
         grad_accum_u_max=sparse_grad_accum_u_max,
         capacity_round_multiple=sparse_runtime_capacity_multiple,
-        cold_bias_reference_tokens=B_REF,
-        unembedding_warm_lr=(None if args.sparse_unembedding_warm_lr < 0.0 else args.sparse_unembedding_warm_lr),
-        unembedding_cold_lr=(None if args.sparse_unembedding_cold_lr < 0.0 else args.sparse_unembedding_cold_lr),
-        random_cloud_fill=args.sparse_cloud_random_fill,
-        random_cloud_fill_seed=args.sparse_cloud_random_fill_seed,
         adam_betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=0.0,
     )
@@ -578,54 +487,6 @@ if args.sparse_mode:
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 token_cache_workers = max(1, args.token_cache_workers) if args.token_cache_workers > 0 else max(1, min(8, os.cpu_count() or 1))
 sparse_loss_analysis_writer = None
-sparse_future_window_planner = None
-sparse_hard_negative_pool = None
-_topk_analysis_executor = None
-_topk_planner_executor = None
-_topk_analysis_lock = threading.Lock()
-if args.sparse_loss_topk_enable:
-    assert args.sparse_mode, "--sparse-loss-topk-enable requires --sparse-mode"
-    sparse_loss_analysis_writer = SparseLossAnalysisWriter(args.sparse_loss_topk_output, args.token_cache_dir)
-    # 2 workers so consecutive steps can overlap on CPU while one waits for D2H sync
-    _topk_analysis_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="topk_analysis")
-if args.sparse_future_replan_enable:
-    assert args.sparse_mode, "--sparse-future-replan-enable requires --sparse-mode"
-    assert hybrid_sparse, "--sparse-future-replan-enable requires --sparse-manifest"
-    assert args.sparse_loss_topk_enable, "--sparse-future-replan-enable requires --sparse-loss-topk-enable"
-    min_safe_replan_interval = SPARSE_TRAIN_PREFETCH_DEPTH + 1
-    assert args.sparse_future_replan_interval >= min_safe_replan_interval, (
-        "--sparse-future-replan-interval must be at least "
-        f"{min_safe_replan_interval} with the current sparse prefetch depth={SPARSE_TRAIN_PREFETCH_DEPTH}"
-    )
-    # Sequential planner executor — keeps planner updates ordered and off the analysis path
-    _topk_planner_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="topk_planner")
-    sparse_future_window_planner = SparseFutureWindowPlanner(
-        args.sparse_manifest,
-        interval_steps=args.sparse_future_replan_interval,
-        rolling_window_steps=args.sparse_loss_window_steps,
-        max_auto_negatives_per_microstep=args.sparse_auto_negative_per_microstep,
-        sampling_seed=args.sparse_replan_sampling_seed,
-        ranking_mode=args.sparse_loss_topk_ranking_mode,
-        negative_only=args.sparse_future_replan_negative_only,
-    )
-    if resuming and args.sparse_mode:
-        planner_state = optimizer_data.get("sparse_planner") if isinstance(optimizer_data, dict) else None
-        if isinstance(planner_state, dict):
-            sparse_future_window_planner.load_state_dict(planner_state)
-if args.sparse_hard_negative_cloud_enable:
-    assert args.sparse_mode, "--sparse-hard-negative-cloud-enable requires --sparse-mode"
-    assert sparse_lm_head_clouds, "--sparse-hard-negative-cloud-enable requires --sparse-cloud-max-u"
-    assert args.sparse_loss_topk_enable, "--sparse-hard-negative-cloud-enable requires --sparse-loss-topk-enable"
-    assert args.sparse_hard_negative_budget > 0, "--sparse-hard-negative-budget must be positive when hard-negative clouds are enabled"
-    sparse_hard_negative_pool = SparseDecayedHardNegativePool(
-        pool_size=args.sparse_hard_negative_pool_size,
-        decay=args.sparse_hard_negative_decay,
-        ranking_mode=args.sparse_loss_topk_ranking_mode,
-    )
-    if resuming and args.sparse_mode:
-        hard_negative_state = optimizer_data.get("sparse_hard_negative_pool") if isinstance(optimizer_data, dict) else None
-        if isinstance(hard_negative_state, dict):
-            sparse_hard_negative_pool.load_state_dict(hard_negative_state)
 if args.sparse_mode:
     if hybrid_sparse:
         train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
@@ -638,9 +499,6 @@ if args.sparse_mode:
             resume_state_dict=dataloader_resume_state_dict,
             pin_memory_output=(device_type == "cuda"),
             vocab_size=vocab_size,
-            include_local_batch=sparse_lm_head_clouds,
-            step_override_provider=None if sparse_future_window_planner is None else sparse_future_window_planner.get_step_override,
-            use_sequence_base_manifest=None if sparse_future_window_planner is None else sparse_future_window_planner.requires_sequence_base_manifest,
             token_cache_dir=args.token_cache_dir,
             token_cache_shard_batches=args.token_cache_shard_batches,
             token_cache_workers=token_cache_workers,
@@ -685,64 +543,8 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
 )
 
 
-def _resolve_step_target_global_ids_cpu(step_meta):
-    if "targets_union_cpu_local" in step_meta and "grad_accum_ids_cpu" in step_meta:
-        target_local = step_meta["targets_union_cpu_local"].detach().to(device="cpu", dtype=torch.long).reshape(-1)
-        target_source = step_meta["grad_accum_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-    elif "targets_cpu_local" in step_meta:
-        target_local = step_meta["targets_cpu_local"].detach().to(device="cpu", dtype=torch.long).reshape(-1)
-        target_source = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-    else:
-        return torch.empty(0, dtype=torch.long)
-    valid_mask = torch.logical_and(target_local >= 0, target_local < target_source.numel())
-    if not valid_mask.any():
-        return torch.empty(0, dtype=torch.long)
-    return torch.unique(target_source.index_select(0, target_local[valid_mask]), sorted=False)
-
-
 def plan_sparse_batch_meta(step_meta):
-    if not sparse_lm_head_clouds:
-        return step_meta
-    assert dynamic_vocab is not None
-    hard_negative_ids_cpu = None
-    hard_negative_budget = 0
-    if sparse_hard_negative_pool is not None:
-        target_ids_cpu = _resolve_step_target_global_ids_cpu(step_meta)
-        if target_ids_cpu.numel() > 0:
-            exclude_ids = set(int(token_id) for token_id in step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long).tolist())
-            with _topk_analysis_lock:
-                hard_negative_selection = sparse_hard_negative_pool.select_for_targets(
-                    target_ids_cpu.tolist(),
-                    step=dynamic_vocab.runtime_step,
-                    limit=args.sparse_hard_negative_budget,
-                    exclude=exclude_ids,
-                )
-            selected_ids = hard_negative_selection["negative_ids"]
-            candidate_count = hard_negative_selection["candidate_count"]
-            matched_target_count = hard_negative_selection["matched_target_count"]
-            matched_pair_count = hard_negative_selection["matched_pair_count"]
-            assert isinstance(selected_ids, list)
-            assert isinstance(candidate_count, int)
-            assert isinstance(matched_target_count, int)
-            assert isinstance(matched_pair_count, int)
-            if selected_ids:
-                hard_negative_ids_cpu = torch.tensor(selected_ids, dtype=torch.long)
-            step_meta = dict(step_meta)
-            step_meta["hard_negative_candidate_count"] = candidate_count
-            step_meta["hard_negative_matched_target_count"] = matched_target_count
-            step_meta["hard_negative_matched_pair_count"] = matched_pair_count
-            hard_negative_budget = int(args.sparse_hard_negative_budget)
-    return dynamic_vocab.plan_next_lm_head_cloud(
-        step_meta,
-        warm_proportion=args.sparse_cloud_warm_proportion,
-        router_candidate_pool_size=args.sparse_cloud_router_candidate_pool,
-        router_topk=args.sparse_cloud_router_topk,
-        source_token_limit=args.sparse_cloud_hidden_query_samples,
-        hidden_query_strategy=args.sparse_cloud_hidden_query_strategy,
-        hidden_query_max_prefix_len=args.sparse_cloud_hidden_query_max_prefix_len,
-        hard_negative_ids_cpu=hard_negative_ids_cpu,
-        hard_negative_budget=hard_negative_budget,
-    )
+    return step_meta
 
 
 def stage_batch_to_device(batch_x, batch_y):
@@ -790,40 +592,6 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-
-def get_sparse_cold_bias_scale(it):
-    if not args.sparse_mode or args.sparse_cold_bias_scale <= 0.0:
-        return 0.0
-    return args.sparse_cold_bias_scale
-
-
-def get_sparse_cold_row_decay(it):
-    if not args.sparse_mode or args.sparse_cold_row_decay == 0.0:
-        return 0.0
-    return args.sparse_cold_row_decay * get_lr_multiplier(it)
-
-
-if args.sparse_mode and args.sparse_cold_bias_scale > 0.0:
-    bias_examples = []
-    for cold_steps in (1, 10, 100):
-        raw_bias = args.sparse_cold_bias_scale * math.log1p(cold_steps * total_batch_size / B_REF)
-        clamped_bias = max(min(raw_bias, COLD_LOGIT_BIAS_CLAMP_MAX), COLD_LOGIT_BIAS_CLAMP_MIN)
-        bias_examples.append(f"{cold_steps}: raw={raw_bias:.2f}, clamped={clamped_bias:.2f}")
-    print0(
-        f"Sparse cold-token bias: scale={args.sparse_cold_bias_scale:.4f}, "
-        f"first_seen_bias=0, reference_tokens={B_REF:,}, total_batch={total_batch_size:,}, "
-        f"clamp=[{COLD_LOGIT_BIAS_CLAMP_MIN:.0f}, {COLD_LOGIT_BIAS_CLAMP_MAX:.0f}], "
-        f"bias_examples(steps -> raw/clamped): {'; '.join(bias_examples)}"
-    )
-
-if args.sparse_mode and args.sparse_cold_row_decay != 0.0:
-    decay_start = get_sparse_cold_row_decay(0)
-    decay_mid = get_sparse_cold_row_decay(max(num_iterations // 2, 0))
-    decay_end = get_sparse_cold_row_decay(max(num_iterations - 1, 0))
-    print0(
-        f"Sparse cold-row adjustment schedule: effective_adjustment(start/mid/end)={decay_start:.6f}/{decay_mid:.6f}/{decay_end:.6f}, "
-        f"effective_multiplier(start/mid/end)={1.0 - decay_start:.6f}/{1.0 - decay_mid:.6f}/{1.0 - decay_end:.6f}"
-    )
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
@@ -897,145 +665,6 @@ def average_sparse_fixed_grads(dynamic_vocab):
         work.wait()
 
 # -----------------------------------------------------------------------------
-# Off-hot-path sparse loss topk analysis
-# Runs in a background thread so it never stalls the fwd-bwd-opt critical path.
-
-def _run_topk_analysis(
-    event,
-    transferred_microsteps,
-    step,
-    topk_correct,
-    topk_incorrect,
-    ranking_mode,
-    writer,
-    planner_executor,
-    planner,
-    hard_negative_pool,
-    lock,
-):
-    """
-    Process sparse loss topk analysis on CPU in a background thread.
-
-    All tensors in `transferred_microsteps` are already on CPU (D2H was fired
-    non-blocking from the main thread).  We wait for those transfers here, inside
-    this thread, via event.synchronize() — the main thread never blocks.
-
-    The planner update (if any) is submitted to a separate sequential executor so
-    it never blocks the analysis→write critical path.
-    """
-    if event is not None:
-        event.synchronize()
-
-    step_correct_scores_all = None
-    step_correct_records_all = None
-    step_incorrect_scores_all = None
-    step_incorrect_records_all = None
-
-    for entry in transferred_microsteps:
-        payload = collect_sparse_loss_topk_from_candidate_pool(
-            entry["active_ids_cpu"],
-            correct_candidate_scores=entry["correct_candidate_scores"],
-            correct_candidate_records=entry["correct_candidate_records"],
-            incorrect_candidate_scores=entry["incorrect_candidate_scores"],
-            incorrect_candidate_records=entry["incorrect_candidate_records"],
-            topk_correct=None,
-            topk_incorrect=None,
-            ranking_mode=ranking_mode,
-        )
-        step_correct_scores_all, step_correct_records_all = merge_topk_records(
-            step_correct_scores_all,
-            step_correct_records_all,
-            payload["correct_scores"],
-            payload["correct_records"],
-            topk=topk_correct,
-            ranking_mode=ranking_mode,
-        )
-        step_incorrect_scores_all, step_incorrect_records_all = merge_topk_records(
-            step_incorrect_scores_all,
-            step_incorrect_records_all,
-            payload["incorrect_scores"],
-            payload["incorrect_records"],
-            topk=topk_incorrect,
-            ranking_mode=ranking_mode,
-        )
-
-    if step_correct_scores_all is None or step_correct_records_all is None:
-        return
-    if step_incorrect_scores_all is None or step_incorrect_records_all is None:
-        return
-
-    bounded_correct_scores, bounded_correct_records = select_topk_records(
-        step_correct_scores_all,
-        step_correct_records_all,
-        topk=topk_correct,
-        ranking_mode=ranking_mode,
-    )
-    bounded_incorrect_scores, bounded_incorrect_records = select_topk_records(
-        step_incorrect_scores_all,
-        step_incorrect_records_all,
-        topk=topk_incorrect,
-        ranking_mode=ranking_mode,
-    )
-    analysis_cpu_payload = {
-        "step": step,
-        "correct_scores": bounded_correct_scores,
-        "correct_records": bounded_correct_records,
-        "incorrect_scores": bounded_incorrect_scores,
-        "incorrect_records": bounded_incorrect_records,
-    }
-    if writer is not None:
-        writer.submit(step, analysis_cpu_payload)
-    if hard_negative_pool is not None:
-        with lock:
-            hard_negative_pool.update_step(
-                step,
-                incorrect_scores=step_incorrect_scores_all,
-                incorrect_records=step_incorrect_records_all,
-            )
-    # Planner update is submitted to a separate executor so it never serialises
-    # with the analysis→write path above.
-    if planner is not None:
-        if planner_executor is not None:
-            planner_executor.submit(
-                _run_planner_update,
-                planner,
-                lock,
-                step,
-                step_correct_scores_all,
-                step_correct_records_all,
-                step_incorrect_scores_all,
-                step_incorrect_records_all,
-            )
-        else:
-            _run_planner_update(
-                planner, lock, step,
-                step_correct_scores_all, step_correct_records_all,
-                step_incorrect_scores_all, step_incorrect_records_all,
-            )
-
-
-def _run_planner_update(
-    planner,
-    lock,
-    step,
-    correct_scores,
-    correct_records,
-    incorrect_scores,
-    incorrect_records,
-):
-    """Update the future-window planner on its own dedicated sequential thread."""
-    with lock:
-        planner.update_from_step_payload(
-            step,
-            correct_scores=correct_scores,
-            correct_records=correct_records,
-            incorrect_scores=incorrect_scores,
-            incorrect_records=incorrect_records,
-        )
-        planner.prune_consumed(step)
-
-
-# -----------------------------------------------------------------------------
 # Training loop
 
 # Loop state (variables updated by the training loop)
@@ -1072,8 +701,6 @@ if args.sparse_mode:
             f"Set --total-batch-size {world_tokens_per_fwdbwd} for the current settings "
             f"(device_batch_size={args.device_batch_size}, max_seq_len={args.max_seq_len}, world_size={ddp_world_size})."
         )
-    if args.sparse_cloud_random_fill:
-        assert grad_accum_steps > 1, "--sparse-cloud-random-fill is currently implemented only for manifest grad accumulation windows"
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -1095,15 +722,6 @@ if hybrid_sparse:
         grad_accum_steps=grad_accum_steps,
         ddp_world_size=ddp_world_size,
     )
-    if sparse_base_manifest is not None:
-        validate_sequence_manifest(
-            sparse_base_manifest,
-            split="train",
-            vocab_size=vocab_size,
-            device_batch_size=args.device_batch_size,
-            max_seq_len=args.max_seq_len,
-            ddp_world_size=ddp_world_size,
-        )
     print0(
         f"Sparse hybrid manifest: {args.sparse_manifest} | "
         f"manifest_U_max={int(sparse_manifest['u_max']):,} | "
@@ -1112,11 +730,6 @@ if hybrid_sparse:
         f"manifest_grad_accum_U_max={resolved_grad_accum_u_max:,} | "
         f"model_grad_accum_U_max={dynamic_vocab.grad_accum_u_max:,}"
     )
-    if sparse_base_manifest is not None:
-        print0(
-            f"Sparse base sequence manifest: {sparse_base_manifest_path} | "
-            f"sequence_units={int(sparse_base_manifest['num_sequence_units']):,}"
-        )
 
 if args.sparse_mode:
     startup_fetch_t0 = time.perf_counter()
@@ -1244,10 +857,6 @@ while True:
                 "base_optimizer": optimizer_payload,
                 "dynamic_vocab": dynamic_vocab.state_dict(),
             }
-            if sparse_future_window_planner is not None:
-                optimizer_payload["sparse_planner"] = sparse_future_window_planner.state_dict()
-            if sparse_hard_negative_pool is not None:
-                optimizer_payload["sparse_hard_negative_pool"] = sparse_hard_negative_pool.state_dict()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -1259,7 +868,7 @@ while True:
                 "val_ece": val_ece,
                 "sparse_mode": args.sparse_mode,
                 "sparse_manifest": (args.sparse_manifest if hybrid_sparse else ""),
-                "sparse_base_manifest": (sparse_base_manifest_path if hybrid_sparse else ""),
+                "sparse_base_manifest": "",
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
@@ -1318,10 +927,7 @@ while True:
     sparse_accum_flush_ms = 0.0
     sparse_accum_queue_ms = 0.0
     sparse_accum_rows_queued = 0
-    sparse_apply_call_ms = 0.0
-    sparse_cold_bias = get_sparse_cold_bias_scale(step)
-    sparse_cold_row_decay = get_sparse_cold_row_decay(step)
-    _micro_analysis = []  # accumulates compact GPU tensors per micro-step for async topk analysis
+        sparse_apply_call_ms = 0.0
     next_x = None
     next_y = None
     next_sparse_batch_meta = None
@@ -1336,9 +942,6 @@ while True:
             prepare_t0 = time.perf_counter()
             sparse_step_ctx = dynamic_vocab.prepare_step(
                 sparse_batch_meta,
-                cold_bias_scale=sparse_cold_bias,
-                cold_row_decay=sparse_cold_row_decay,
-                cold_bias_tokens_per_step=total_batch_size,
             )
             sparse_prepare_ms += (time.perf_counter() - prepare_t0) * 1000.0
             sparse_prep_writeback_wait_ms += sparse_step_ctx.prep_writeback_wait_ms
@@ -1359,37 +962,14 @@ while True:
             sparse_metrics = sparse_step_ctx
             x_for_model = sparse_step_ctx.union_inputs if sparse_step_ctx.union_inputs is not None else current_x
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
-            analysis_token_losses = None
-            analysis_top2_logits = None
-            analysis_top2_local = None
-            analysis_target_logits = None
             forward_t0 = time.perf_counter()
-            model_result = model(
+            loss = model(
                 x_for_model,
                 y_for_loss,
                 active_vocab=sparse_step_ctx.active_vocab,
                 logit_scale=args.sparse_logit_scale,
-                return_sparse_analysis=args.sparse_loss_topk_enable,
             )
             sparse_forward_call_ms += (time.perf_counter() - forward_t0) * 1000.0
-            if args.sparse_loss_topk_enable:
-                loss, analysis_token_losses, analysis_top2_logits, analysis_top2_local, analysis_target_logits = model_result
-            else:
-                loss = model_result
-            if args.sparse_loss_topk_enable:
-                # Stash GPU sparse-analysis tensors. We prune them on device after the
-                # optimizer step so CPU only sees a bounded candidate pool per microstep.
-                analysis_active_ids_cpu = sparse_step_ctx.lm_head_active_ids_cpu if sparse_step_ctx.lm_head_active_ids_cpu is not None else sparse_step_ctx.active_ids_cpu
-                _micro_analysis.append({
-                    "targets": y_for_loss,
-                    "token_losses": analysis_token_losses.detach(),
-                    "top2_logits": analysis_top2_logits.detach(),
-                    "top2_local": analysis_top2_local.detach(),
-                    "target_logits": analysis_target_logits.detach(),
-                    "active_ids_cpu": analysis_active_ids_cpu,
-                    "micro_step": micro_step,
-                    "sequence_id": int(sparse_batch_meta.get("sequence_id", -1)),
-                })
         else:
             forward_t0 = time.perf_counter()
             loss = model(current_x, current_y)
@@ -1511,48 +1091,6 @@ while True:
             sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
-    if args.sparse_loss_topk_enable and _micro_analysis and _topk_analysis_executor is not None:
-        # GPU-prune each microstep to a bounded candidate pool before D2H.
-        # The background thread receives only the reduced candidate tensors.
-        _topk_event = torch.cuda.Event() if device_type == "cuda" else None
-        _transferred = []
-        for _entry in _micro_analysis:
-            candidate_payload = collect_sparse_loss_candidate_pool_from_stats(
-                _entry["targets"],
-                candidate_pool_correct=SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
-                candidate_pool_incorrect=SPARSE_LOSS_TOPK_APPROX_CANDIDATE_POOL,
-                step=step,
-                micro_step=_entry["micro_step"],
-                sequence_id=_entry["sequence_id"],
-                losses=_entry["token_losses"],
-                top2_logits=_entry["top2_logits"],
-                top2_local=_entry["top2_local"],
-                target_logits=_entry["target_logits"],
-            )
-            _transferred.append({
-                "correct_candidate_scores": candidate_payload["correct_candidate_scores"].to(device="cpu", non_blocking=True),
-                "correct_candidate_records": candidate_payload["correct_candidate_records"].to(device="cpu", non_blocking=True),
-                "incorrect_candidate_scores": candidate_payload["incorrect_candidate_scores"].to(device="cpu", non_blocking=True),
-                "incorrect_candidate_records": candidate_payload["incorrect_candidate_records"].to(device="cpu", non_blocking=True),
-                "active_ids_cpu": _entry["active_ids_cpu"],
-            })
-        if _topk_event is not None:
-            _topk_event.record()
-        _micro_analysis.clear()
-        _topk_analysis_executor.submit(
-            _run_topk_analysis,
-            _topk_event,
-            _transferred,
-            step,
-            args.sparse_loss_topk_correct,
-            args.sparse_loss_topk_incorrect,
-            args.sparse_loss_topk_ranking_mode,
-            sparse_loss_analysis_writer,
-            _topk_planner_executor,
-            sparse_future_window_planner,
-            sparse_hard_negative_pool,
-            _topk_analysis_lock,
-        )
     model.zero_grad(set_to_none=True)
     should_trim_sparse_cache = False
     if (
@@ -1806,11 +1344,5 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-if _topk_analysis_executor is not None:
-    _topk_analysis_executor.shutdown(wait=True)
-if _topk_planner_executor is not None:
-    _topk_planner_executor.shutdown(wait=True)
-if sparse_loss_analysis_writer is not None:
-    sparse_loss_analysis_writer.close()
 wandb_run.finish() # wandb run finish
 compute_cleanup()

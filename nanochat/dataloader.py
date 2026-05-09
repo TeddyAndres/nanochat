@@ -24,24 +24,16 @@ import torch
 
 from nanochat.common import get_dist_info
 from nanochat.sparse_manifest import (
-    DUAL_SPARSE_MANIFEST_VERSION,
-    SPARSE_GROUPING_MANIFEST_KIND,
-    SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
-    SequenceManifestShardAccessor,
     compute_next_transition,
     get_microstep_sequence_ids,
-    get_sparse_manifest_kind,
     load_sparse_manifest_header,
-    resolve_grouping_base_manifest_path,
     stream_sparse_manifest_steps,
-    validate_sequence_manifest,
     validate_sparse_manifest,
 )
 from nanochat.token_cache import (
     ensure_token_cache,
     iter_cached_token_batches,
     iter_document_text_batches,
-    load_cached_token_batch_by_state,
     prepare_token_cache_writer,
     resolve_token_cache_dir,
 )
@@ -332,9 +324,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     buffer_size=1000,
     pin_memory_output=False,
     vocab_size=None,
-    include_local_batch=False,
-    step_override_provider=None,
-    use_sequence_base_manifest=None,
     token_cache_dir="",
     token_cache_shard_batches=256,
     token_cache_workers=1,
@@ -348,9 +337,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     manifest = load_sparse_manifest_header(manifest_path)
     manifest_version = int(manifest.get("version", 1))
-    manifest_kind = get_sparse_manifest_kind(manifest)
-    if manifest_kind != SPARSE_GROUPING_MANIFEST_KIND:
-        raise ValueError("Manifest sparse loader requires a grouping sparse manifest")
     validate_sparse_manifest(
         manifest,
         split=split,
@@ -377,80 +363,21 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             f"Sparse manifest step {manifest_step} is out of range for {num_manifest_steps} stored steps"
         )
 
-    override_requires_sequence_base_manifest = (
-        manifest_version >= DUAL_SPARSE_MANIFEST_VERSION and
-        "base_manifest_path" in manifest
-        if use_sequence_base_manifest is None else
-        bool(use_sequence_base_manifest)
+    base_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        B,
+        T,
+        split,
+        tokenizer_threads=tokenizer_threads,
+        tokenizer_batch_size=tokenizer_batch_size,
+        device="cpu",
+        resume_state_dict=base_resume_state,
+        buffer_size=buffer_size,
+        pin_memory_output=pin_memory_output,
+        token_cache_dir=token_cache_dir,
+        token_cache_shard_batches=token_cache_shard_batches,
+        token_cache_workers=token_cache_workers,
     )
-    use_dual_manifest = (
-        manifest_version >= DUAL_SPARSE_MANIFEST_VERSION and
-        "base_manifest_path" in manifest and
-        override_requires_sequence_base_manifest
-    )
-    base_loader = None
-    resolve_sequence_unit = None
-    resolved_cache_dir = None
-    token_batch_cache = OrderedDict()
-    if use_dual_manifest:
-        base_manifest_path = resolve_grouping_base_manifest_path(manifest_path, manifest)
-        base_manifest = load_sparse_manifest_header(base_manifest_path)
-        if get_sparse_manifest_kind(base_manifest) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
-            raise ValueError("Grouping manifest base_manifest_path must reference a sequence-base manifest")
-        validate_sequence_manifest(
-            base_manifest,
-            split=split,
-            vocab_size=vocab_size,
-            device_batch_size=B,
-            max_seq_len=T,
-            ddp_world_size=ddp_world_size,
-        )
-
-        shard_entries = base_manifest.get("shards")
-        assert isinstance(shard_entries, list) and len(shard_entries) > 0
-        resolved_cache_dir = resolve_token_cache_dir(token_cache_dir)
-        shard_ranges = []
-        for shard_entry in shard_entries:
-            start_sequence_id = int(shard_entry.get("start_sequence_id", -1))
-            shard_num_units = int(shard_entry.get("num_sequence_units", 0))
-            if start_sequence_id < 0 or shard_num_units <= 0:
-                raise ValueError("Sequence manifest shard entries must define start_sequence_id and num_sequence_units")
-            shard_ranges.append((start_sequence_id, start_sequence_id + shard_num_units, shard_entry))
-        loaded_sequence_shard_path = None
-        loaded_sequence_shard_accessor = None
-
-        def resolve_sequence_unit(sequence_id: int) -> dict:
-            nonlocal loaded_sequence_shard_path, loaded_sequence_shard_accessor
-            for start_sequence_id, end_sequence_id, shard_entry in shard_ranges:
-                if start_sequence_id <= sequence_id < end_sequence_id:
-                    shard_path = base_manifest_path.parent / str(shard_entry["path"])
-                    if loaded_sequence_shard_path != shard_path:
-                        if loaded_sequence_shard_accessor is not None:
-                            loaded_sequence_shard_accessor.close()
-                        loaded_sequence_shard_accessor = SequenceManifestShardAccessor(shard_path)
-                        loaded_sequence_shard_path = shard_path
-                    assert loaded_sequence_shard_accessor is not None
-                    sequence_unit = loaded_sequence_shard_accessor.get_sequence_unit(sequence_id)
-                    if sequence_unit is None:
-                        raise ValueError(f"Sequence manifest shard is missing sequence_id={sequence_id}")
-                    return sequence_unit
-            raise ValueError(f"Sequence manifest is missing sequence_id={sequence_id}")
-    else:
-        base_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-            tokenizer,
-            B,
-            T,
-            split,
-            tokenizer_threads=tokenizer_threads,
-            tokenizer_batch_size=tokenizer_batch_size,
-            device="cpu",
-            resume_state_dict=base_resume_state,
-            buffer_size=buffer_size,
-            pin_memory_output=pin_memory_output,
-            token_cache_dir=token_cache_dir,
-            token_cache_shard_batches=token_cache_shard_batches,
-            token_cache_workers=token_cache_workers,
-        )
 
     output_device = torch.device(device)
     use_cuda = output_device.type == "cuda"
@@ -502,42 +429,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         global_to_slot[next_new_ids] = assigned_slots_tensor
         return next_new_ids, assigned_slots_tensor, next_leaving_ids, leaving_slots
 
-    def reconcile_active_ids(desired_active_ids: torch.Tensor):
-        desired_active_ids = desired_active_ids.detach().to(device="cpu", dtype=torch.long)
-        current_active_slot_ids = torch.nonzero(slot_to_global >= 0, as_tuple=False).flatten()
-        current_active_ids = slot_to_global[current_active_slot_ids] if current_active_slot_ids.numel() > 0 else torch.empty(0, dtype=torch.long)
-        _, next_leaving_ids, next_new_ids = compute_next_transition(current_active_ids, desired_active_ids)
-        leaving_slots = torch.empty(0, dtype=torch.long)
-        if next_leaving_ids.numel() > 0:
-            leaving_slots = global_to_slot[next_leaving_ids]
-            if (leaving_slots < 0).any():
-                raise ValueError("Sparse manifest leaving ids are not present in the current slot map")
-            slot_to_global[leaving_slots] = -1
-            global_to_slot[next_leaving_ids] = -1
-        else:
-            leaving_slots = torch.empty(0, dtype=torch.long)
-        if next_new_ids.numel() == 0:
-            return next_new_ids, torch.empty(0, dtype=torch.long), next_leaving_ids, leaving_slots
-        reusable_slots = leaving_slots.tolist()
-        reusable_slots.extend(torch.nonzero(slot_to_global < 0, as_tuple=False).flatten().tolist())
-        assigned_slots = []
-        seen = set()
-        for slot in reusable_slots:
-            if slot in seen:
-                continue
-            seen.add(slot)
-            assigned_slots.append(int(slot))
-            if len(assigned_slots) == next_new_ids.numel():
-                break
-        if len(assigned_slots) < next_new_ids.numel():
-            raise ValueError(
-                f"Sparse manifest overflow: need {next_new_ids.numel()} new slots, only found {len(assigned_slots)} free slots out of U_max={u_max}"
-            )
-        assigned_slots_tensor = torch.tensor(assigned_slots, dtype=torch.long)
-        slot_to_global[assigned_slots_tensor] = next_new_ids
-        global_to_slot[next_new_ids] = assigned_slots_tensor
-        return next_new_ids, assigned_slots_tensor, next_leaving_ids, leaving_slots
-
     def preview_next_transition(next_active_ids: torch.Tensor):
         next_active_ids = next_active_ids.detach().to(device="cpu", dtype=torch.long)
         current_active_slot_ids = torch.nonzero(slot_to_global >= 0, as_tuple=False).flatten()
@@ -568,31 +459,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         if active_slot_ids.numel() > 0:
             global_to_slot[slot_to_global[active_slot_ids]] = active_slot_ids
 
-    def replace_active_ids(desired_active_ids: torch.Tensor):
-        if desired_active_ids.numel() > u_max:
-            raise ValueError(
-                f"Sparse manifest override exceeds U_max: {desired_active_ids.numel()} > {u_max}"
-            )
-        current_active_ids = slot_to_global[slot_to_global >= 0].clone()
-        leaving_ids = current_active_ids[~torch.isin(current_active_ids, desired_active_ids)]
-        if leaving_ids.numel() > 0:
-            leaving_slots = global_to_slot[leaving_ids].clone()
-        else:
-            leaving_slots = torch.empty(0, dtype=torch.long)
-        slot_to_global.fill_(-1)
-        global_to_slot.fill_(-1)
-        if desired_active_ids.numel() == 0:
-            return (
-                torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long),
-                leaving_ids,
-                leaving_slots,
-            )
-        new_slots = torch.arange(desired_active_ids.numel(), dtype=torch.long)
-        slot_to_global[new_slots] = desired_active_ids
-        global_to_slot[desired_active_ids] = new_slots
-        return desired_active_ids.clone(), new_slots, leaving_ids, leaving_slots
-
     manifest_iter = stream_sparse_manifest_steps(manifest_path)
 
     def get_microsteps(step_entry):
@@ -603,31 +469,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             return microsteps
         return [step_entry]
 
-    def resolve_step_entry(step_index: int, default_step_entry: dict):
-        if step_override_provider is None:
-            return default_step_entry, False
-        override_entry = step_override_provider(step_index)
-        if override_entry is None:
-            return default_step_entry, False
-        if not use_dual_manifest and manifest_version >= 2:
-            default_microsteps = get_microsteps(default_step_entry)
-            override_microsteps = get_microsteps(override_entry)
-            if len(default_microsteps) != len(override_microsteps):
-                raise ValueError(
-                    "Runtime sparse overrides without sequence-base manifest loading must preserve the baseline microstep count"
-                )
-            for micro_idx, (default_microstep, override_microstep) in enumerate(zip(default_microsteps, override_microsteps)):
-                default_sequence_ids = get_microstep_sequence_ids(default_microstep, ddp_world_size=ddp_world_size)
-                override_sequence_ids = get_microstep_sequence_ids(override_microstep, ddp_world_size=ddp_world_size)
-                if default_sequence_ids != override_sequence_ids:
-                    raise ValueError(
-                        "Runtime sparse overrides that change sequence_id require sequence-base manifest loading "
-                        f"(step={step_index}, micro={micro_idx})"
-                    )
-        return override_entry, True
-
     try:
-        current_step_entry, current_step_is_override = resolve_step_entry(0, next(manifest_iter))
+        current_step_entry = next(manifest_iter)
     except StopIteration as exc:
         raise ValueError("Sparse manifest contains no step entries") from exc
 
@@ -635,38 +478,24 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     current_micro_idx = 0
     current_micro_entry = current_microsteps[current_micro_idx]
     buffered_next_step_entry = None
-    buffered_next_step_is_override = False
-    state_matches_current_entry = False
 
     first_active_ids = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
     if first_active_ids.numel() > u_max:
         raise ValueError(
             f"Sparse manifest first step exceeds U_max: {first_active_ids.numel()} > {u_max}"
         )
-    if current_step_is_override:
-        current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = replace_active_ids(first_active_ids)
-        state_matches_current_entry = True
-    else:
-        first_slots = torch.arange(first_active_ids.numel(), dtype=torch.long)
-        slot_to_global[first_slots] = first_active_ids
-        global_to_slot[first_active_ids] = first_slots
-        current_new_ids = first_active_ids.clone()
-        current_new_slots = first_slots.clone()
-        state_matches_current_entry = True
-        current_leaving_ids = torch.empty(0, dtype=torch.long)
-        current_leaving_slots = torch.empty(0, dtype=torch.long)
+    first_slots = torch.arange(first_active_ids.numel(), dtype=torch.long)
+    slot_to_global[first_slots] = first_active_ids
+    global_to_slot[first_active_ids] = first_slots
+    current_new_ids = first_active_ids.clone()
+    current_new_slots = first_slots.clone()
+    current_leaving_ids = torch.empty(0, dtype=torch.long)
+    current_leaving_slots = torch.empty(0, dtype=torch.long)
     for replay_step in range(manifest_step):
         for replay_micro_entry in current_microsteps:
-            if not current_step_is_override:
-                current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = apply_manifest_transition(replay_micro_entry)
-                state_matches_current_entry = True
-            else:
-                replay_active_ids = torch.tensor(replay_micro_entry["active_ids"], dtype=torch.long)
-                current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = replace_active_ids(replay_active_ids)
-                state_matches_current_entry = True
-        previous_step_is_override = current_step_is_override
+            current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = apply_manifest_transition(replay_micro_entry)
         try:
-            current_step_entry, current_step_is_override = resolve_step_entry(replay_step + 1, next(manifest_iter))
+            current_step_entry = next(manifest_iter)
         except StopIteration as exc:
             raise ValueError(
                 f"Sparse manifest ended before requested resume step {manifest_step}"
@@ -674,122 +503,15 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         current_microsteps = get_microsteps(current_step_entry)
         current_micro_idx = 0
         current_micro_entry = current_microsteps[current_micro_idx]
-        state_matches_current_entry = (not previous_step_is_override) and (not current_step_is_override)
 
     while True:
         if manifest_step >= num_manifest_steps:
             raise StopIteration
-        if current_step_is_override or not state_matches_current_entry:
-            desired_active_ids = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
-            if current_step_is_override:
-                current_new_ids, current_new_slots, current_leaving_ids, current_leaving_slots = replace_active_ids(desired_active_ids)
-            else:
-                current_new_ids, current_new_slots, _, _ = reconcile_active_ids(desired_active_ids)
-            state_matches_current_entry = True
-        loaded_sequence_unique_ids = None
         active_sequence_id = -1
-        if use_dual_manifest:
-            assert resolve_sequence_unit is not None
-            assert resolved_cache_dir is not None
-            sequence_ids = get_microstep_sequence_ids(
-                current_micro_entry,
-                ddp_world_size=ddp_world_size,
-                require_all_ranks=ddp_world_size > 1,
-            )
-            if len(sequence_ids) == 0:
-                raise ValueError("Dual-manifest microsteps must define a non-negative sequence_id")
-            active_sequence_id = int(sequence_ids[ddp_rank if len(sequence_ids) > 1 else 0])
-            sequence_unit = resolve_sequence_unit(active_sequence_id)
-            if "inputs" in sequence_unit and "targets" in sequence_unit:
-                base_inputs = torch.as_tensor(sequence_unit["inputs"], dtype=torch.long)
-                base_targets = torch.as_tensor(sequence_unit["targets"], dtype=torch.long)
-                if tuple(base_inputs.shape) != (B, T) or tuple(base_targets.shape) != (B, T):
-                    raise ValueError(
-                        f"Sequence manifest batch shape mismatch for sequence_id={active_sequence_id}: "
-                        f"expected {(B, T)}, found inputs={tuple(base_inputs.shape)} targets={tuple(base_targets.shape)}"
-                    )
-            else:
-                sequence_recipe = sequence_unit.get("sequence_recipe")
-                if not isinstance(sequence_recipe, dict):
-                    raise ValueError("Sequence manifest units must define either inputs/targets or a sequence_recipe")
-                row_capacity = int(sequence_recipe.get("row_capacity", T + 1))
-                if row_capacity != T + 1:
-                    raise ValueError(
-                        f"Sequence manifest row_capacity mismatch for sequence_id={active_sequence_id}: expected {T + 1}, found {row_capacity}"
-                    )
-                recipe_rows = sequence_recipe.get("rows")
-                if not isinstance(recipe_rows, list) or len(recipe_rows) != B:
-                    raise ValueError(
-                        f"Sequence manifest rows mismatch for sequence_id={active_sequence_id}: expected {B}, found {0 if recipe_rows is None else len(recipe_rows)}"
-                    )
-                row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-                for row_idx, row_entry in enumerate(recipe_rows):
-                    segments = row_entry.get("segments") if isinstance(row_entry, dict) else None
-                    if not isinstance(segments, list) or len(segments) == 0:
-                        raise ValueError(f"Sequence manifest row {row_idx} is missing segments for sequence_id={active_sequence_id}")
-                    pos = 0
-                    for segment in segments:
-                        if not isinstance(segment, dict):
-                            raise ValueError("Sequence manifest segment entries must be dicts")
-                        source_state = segment.get("source_state")
-                        if not isinstance(source_state, dict):
-                            raise ValueError("Sequence manifest segments must define source_state")
-                        batch_key = (
-                            int(source_state.get("pq_idx", -1)),
-                            int(source_state.get("rg_idx", -1)),
-                            int(source_state.get("text_batch_index", -1)),
-                        )
-                        token_lists = token_batch_cache.get(batch_key)
-                        if token_lists is None:
-                            token_lists = load_cached_token_batch_by_state(
-                                resolved_cache_dir,
-                                split,
-                                pq_idx=batch_key[0],
-                                rg_idx=batch_key[1],
-                                text_batch_index=batch_key[2],
-                            )
-                            token_batch_cache[batch_key] = token_lists
-                            if len(token_batch_cache) > DUAL_MANIFEST_TOKEN_BATCH_CACHE_LIMIT:
-                                token_batch_cache.popitem(last=False)
-                        else:
-                            token_batch_cache.move_to_end(batch_key)
-                        doc_index_in_batch = int(segment.get("doc_index_in_batch", -1))
-                        if doc_index_in_batch < 0 or doc_index_in_batch >= len(token_lists):
-                            raise ValueError(
-                                f"Sequence manifest segment doc_index_in_batch={doc_index_in_batch} is invalid for sequence_id={active_sequence_id}"
-                            )
-                        source_tokens = token_lists[doc_index_in_batch]
-                        start_offset = int(segment.get("start_offset", 0))
-                        end_offset = int(segment.get("end_offset", -1))
-                        if start_offset < 0 or end_offset < start_offset or end_offset > source_tokens.numel():
-                            raise ValueError(
-                                f"Sequence manifest segment offsets are invalid for sequence_id={active_sequence_id}: [{start_offset}, {end_offset})"
-                            )
-                        segment_tokens = source_tokens[start_offset:end_offset]
-                        next_pos = pos + int(segment_tokens.numel())
-                        if next_pos > row_capacity:
-                            raise ValueError(
-                                f"Sequence manifest row overflow for sequence_id={active_sequence_id}: row {row_idx} exceeds row_capacity={row_capacity}"
-                            )
-                        row_buffer[row_idx, pos:next_pos] = segment_tokens
-                        pos = next_pos
-                    if pos != row_capacity:
-                        raise ValueError(
-                            f"Sequence manifest row underfill for sequence_id={active_sequence_id}: row {row_idx} filled {pos} tokens, expected {row_capacity}"
-                        )
-                base_inputs = row_buffer[:, :-1]
-                base_targets = row_buffer[:, 1:]
-            base_state_dict = sequence_unit.get("state_dict", {})
-            if not isinstance(base_state_dict, dict):
-                raise ValueError("Sequence manifest state_dict payload must be a dict")
-            loaded_sequence_unique_ids = torch.tensor(sequence_unit.get("unique_token_ids", []), dtype=torch.long)
-            cpu_inputs.copy_(base_inputs)
-            cpu_targets.copy_(base_targets)
-        else:
-            assert base_loader is not None
-            base_inputs, base_targets, base_state_dict = next(base_loader)
-            cpu_inputs.copy_(base_inputs)
-            cpu_targets.copy_(base_targets)
+        assert base_loader is not None
+        base_inputs, base_targets, base_state_dict = next(base_loader)
+        cpu_inputs.copy_(base_inputs)
+        cpu_targets.copy_(base_targets)
         rebuild_global_to_slot_from_slot_map()
         remapped_inputs = global_to_slot[cpu_inputs]
         remapped_targets = global_to_slot[cpu_targets]
@@ -799,26 +521,12 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             missing_ids = torch.unique(torch.cat((missing_input_ids, missing_target_ids)))
             desired_active_ids_debug = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
             desired_missing_ids = desired_active_ids_debug[global_to_slot[desired_active_ids_debug] < 0]
-            loaded_batch_unique_ids = torch.unique(torch.cat((cpu_inputs.reshape(-1), cpu_targets.reshape(-1))))
-            sequence_unique_missing_ids = torch.empty(0, dtype=torch.long)
-            sequence_unique_missing_from_active_ids = torch.empty(0, dtype=torch.long)
-            if loaded_sequence_unique_ids is not None and loaded_sequence_unique_ids.numel() > 0:
-                loaded_sequence_unique_ids = loaded_sequence_unique_ids.to(dtype=torch.long)
-                sequence_unique_missing_ids = loaded_batch_unique_ids[~torch.isin(loaded_batch_unique_ids, loaded_sequence_unique_ids)]
-                sequence_unique_missing_from_active_ids = loaded_sequence_unique_ids[
-                    ~torch.isin(loaded_sequence_unique_ids, desired_active_ids_debug)
-                ]
             raise ValueError(
-                f"Sparse manifest mismatch at step {manifest_step} micro={current_micro_idx} sequence_id={active_sequence_id}: "
+                f"Sparse manifest mismatch at step {manifest_step} micro={current_micro_idx}: "
                 f"live batch contains {missing_ids.numel()} tokens missing from manifest active_ids; "
                 f"sample_missing_ids={missing_ids[:16].tolist()} | "
-                f"override_step={current_step_is_override} state_matches={state_matches_current_entry} "
                 f"resident_active={int((slot_to_global >= 0).sum().item())} desired_active={desired_active_ids_debug.numel()} "
-                f"desired_missing={desired_missing_ids.numel()} desired_missing_sample={desired_missing_ids[:16].tolist()} | "
-                f"batch_unique={loaded_batch_unique_ids.numel()} sequence_unique_missing={sequence_unique_missing_ids.numel()} "
-                f"sequence_unique_missing_sample={sequence_unique_missing_ids[:16].tolist()} | "
-                f"sequence_unique_missing_from_active={sequence_unique_missing_from_active_ids.numel()} "
-                f"sequence_unique_missing_from_active_sample={sequence_unique_missing_from_active_ids[:16].tolist()}"
+                f"desired_missing={desired_missing_ids.numel()} desired_missing_sample={desired_missing_ids[:16].tolist()}"
             )
         cpu_inputs.copy_(remapped_inputs)
         cpu_targets.copy_(remapped_targets)
@@ -852,27 +560,20 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
 
         is_last_microstep = current_micro_idx == len(current_microsteps) - 1
         next_micro_entry = None
-        next_step_is_override = False
         if not is_last_microstep:
             next_micro_entry = current_microsteps[current_micro_idx + 1]
-            next_step_is_override = current_step_is_override
         elif manifest_step < num_manifest_steps - 1:
             if buffered_next_step_entry is None:
                 try:
-                    buffered_next_step_entry, buffered_next_step_is_override = resolve_step_entry(manifest_step + 1, next(manifest_iter))
+                    buffered_next_step_entry = next(manifest_iter)
                 except StopIteration as exc:
                     raise ValueError(
                         f"Sparse manifest ended early after step {manifest_step}; expected {num_manifest_steps} total steps"
                     ) from exc
             next_microsteps = get_microsteps(buffered_next_step_entry)
             next_micro_entry = next_microsteps[0]
-            next_step_is_override = buffered_next_step_is_override
 
-        can_use_manifest_transition = (
-            not current_step_is_override
-            and next_micro_entry is not None
-            and not next_step_is_override
-        )
+        can_use_manifest_transition = next_micro_entry is not None
 
         if can_use_manifest_transition:
             current_leaving_ids = torch.tensor(current_micro_entry["next_leaving_ids"], dtype=torch.long)
@@ -907,9 +608,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             "is_grad_accum_boundary": micro_step_index == accum_steps - 1,
             "sequence_id": int(active_sequence_id),
         }
-        if include_local_batch:
-            step_meta["inputs_cpu_local"] = cpu_inputs.clone()
-            step_meta["targets_cpu_local"] = cpu_targets.clone()
         if inputs_union_cpu_local is not None:
             step_meta["inputs_union_cpu_local"] = inputs_union_cpu_local.clone()
         if targets_union_cpu_local is not None:
@@ -936,12 +634,10 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         manifest_step += 1
         if buffered_next_step_entry is not None:
             current_step_entry = buffered_next_step_entry
-            current_step_is_override = buffered_next_step_is_override
             buffered_next_step_entry = None
-            buffered_next_step_is_override = False
         else:
             try:
-                current_step_entry, current_step_is_override = resolve_step_entry(manifest_step, next(manifest_iter))
+                current_step_entry = next(manifest_iter)
             except StopIteration as exc:
                 raise ValueError(
                     f"Sparse manifest ended early after step {manifest_step - 1}; expected {num_manifest_steps} total steps"
@@ -949,4 +645,3 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         current_microsteps = get_microsteps(current_step_entry)
         current_micro_idx = 0
         current_micro_entry = current_microsteps[current_micro_idx]
-        state_matches_current_entry = can_use_manifest_transition

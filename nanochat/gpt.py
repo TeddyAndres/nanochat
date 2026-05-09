@@ -455,11 +455,6 @@ class GPT(nn.Module):
         if force_float:
             logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
-        if active_vocab is not None and "cold_logit_bias" in active_vocab:
-            sparse_logit_bias = active_vocab["cold_logit_bias"]
-            if sparse_logit_bias.device != logits.device or sparse_logit_bias.dtype != logits.dtype:
-                sparse_logit_bias = sparse_logit_bias.to(device=logits.device, dtype=logits.dtype)
-            logits = logits + sparse_logit_bias.view(1, 1, -1)
         if logit_bias is not None:
             logit_bias = logit_bias.to(device=logits.device, dtype=logits.dtype)
             logits = logits + logit_bias.view(1, 1, -1)
@@ -500,10 +495,7 @@ class GPT(nn.Module):
                 return
 
         softcap = 20
-        cold_logit_bias = None
         logit_mask = None
-        if active_vocab is not None and "cold_logit_bias" in active_vocab:
-            cold_logit_bias = active_vocab["cold_logit_bias"]
         if active_vocab is not None and "logit_mask" in active_vocab:
             logit_mask = active_vocab["logit_mask"]
         if logit_bias is not None:
@@ -519,9 +511,6 @@ class GPT(nn.Module):
             if force_float:
                 logits = logits.float()
             logits = softcap * torch.tanh(logits / softcap)
-            if cold_logit_bias is not None:
-                bias_chunk = cold_logit_bias[start:end].to(device=logits.device, dtype=logits.dtype)
-                logits = logits + bias_chunk.view(*expand_shape, -1)
             if logit_bias is not None:
                 bias_chunk = logit_bias[start:end].to(dtype=logits.dtype)
                 logits = logits + bias_chunk.view(*expand_shape, -1)

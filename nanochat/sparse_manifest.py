@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -9,11 +8,7 @@ import torch
 
 
 SPARSE_MANIFEST_VERSION = 3
-DUAL_SPARSE_MANIFEST_VERSION = 4
 SUPPORTED_SPARSE_MANIFEST_VERSIONS = {1, 2, 3, 4}
-SPARSE_GROUPING_MANIFEST_KIND = "grouping"
-SPARSE_SEQUENCE_BASE_MANIFEST_KIND = "sequence-base"
-SEQUENCE_SHARD_SQLITE_FORMAT = "sqlite-v1"
 
 
 def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
@@ -23,16 +18,6 @@ def _validate_manifest_version(payload: dict[str, Any]) -> dict[str, Any]:
             f"Unsupported sparse manifest version {version}; expected one of {sorted(SUPPORTED_SPARSE_MANIFEST_VERSIONS)}"
         )
     return payload
-
-
-def get_sparse_manifest_kind(payload: dict[str, Any]) -> str:
-    version = int(payload.get("version", 1))
-    if version < DUAL_SPARSE_MANIFEST_VERSION:
-        return SPARSE_GROUPING_MANIFEST_KIND
-    manifest_kind = payload.get("manifest_kind", SPARSE_GROUPING_MANIFEST_KIND)
-    if not isinstance(manifest_kind, str) or manifest_kind == "":
-        raise ValueError("Sparse manifest kind must be a non-empty string")
-    return manifest_kind
 
 
 def tensor_ids_to_list(ids: torch.Tensor) -> list[int]:
@@ -193,260 +178,11 @@ def build_sharded_manifest_payload(
     }
 
 
-def build_sequence_manifest_shard_payload(
-    *,
-    shard_index: int,
-    start_sequence_id: int,
-    sequence_units: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "version": DUAL_SPARSE_MANIFEST_VERSION,
-        "manifest_kind": SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
-        "store_format": SEQUENCE_SHARD_SQLITE_FORMAT,
-        "shard_index": int(shard_index),
-        "start_sequence_id": int(start_sequence_id),
-        "num_sequence_units": len(sequence_units),
-        "sequence_units": sequence_units,
-    }
-
-
-def build_sequence_manifest_payload(
-    *,
-    split: str,
-    vocab_size: int,
-    device_batch_size: int,
-    max_seq_len: int,
-    total_batch_size: int,
-    grad_accum_steps: int,
-    ddp_world_size: int,
-    num_iterations: int,
-    buffer_size: int,
-    num_sequence_units: int,
-    shard_sequence_count: int,
-    shards: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "version": DUAL_SPARSE_MANIFEST_VERSION,
-        "manifest_kind": SPARSE_SEQUENCE_BASE_MANIFEST_KIND,
-        "split": split,
-        "vocab_size": int(vocab_size),
-        "device_batch_size": int(device_batch_size),
-        "max_seq_len": int(max_seq_len),
-        "total_batch_size": int(total_batch_size),
-        "grad_accum_steps": int(grad_accum_steps),
-        "ddp_world_size": int(ddp_world_size),
-        "num_steps": int(num_iterations),
-        "buffer_size": int(buffer_size),
-        "num_sequence_units": int(num_sequence_units),
-        "shard_sequence_count": int(shard_sequence_count),
-        "num_shards": len(shards),
-        "shards": shards,
-    }
-
-
-def build_grouping_manifest_payload(
-    *,
-    split: str,
-    vocab_size: int,
-    device_batch_size: int,
-    max_seq_len: int,
-    total_batch_size: int,
-    grad_accum_steps: int,
-    ddp_world_size: int,
-    num_iterations: int,
-    buffer_size: int,
-    u_max: int,
-    grad_accum_u_max: int,
-    shard_step_count: int,
-    shards: list[dict[str, Any]],
-    base_manifest_path: str,
-) -> dict[str, Any]:
-    return {
-        "version": DUAL_SPARSE_MANIFEST_VERSION,
-        "manifest_kind": SPARSE_GROUPING_MANIFEST_KIND,
-        "base_manifest_path": base_manifest_path,
-        "split": split,
-        "vocab_size": int(vocab_size),
-        "device_batch_size": int(device_batch_size),
-        "max_seq_len": int(max_seq_len),
-        "total_batch_size": int(total_batch_size),
-        "grad_accum_steps": int(grad_accum_steps),
-        "ddp_world_size": int(ddp_world_size),
-        "num_steps": int(num_iterations),
-        "buffer_size": int(buffer_size),
-        "u_max": int(u_max),
-        "grad_accum_u_max": int(grad_accum_u_max),
-        "shard_step_count": int(shard_step_count),
-        "num_shards": len(shards),
-        "shards": shards,
-    }
-
-
 def save_sparse_manifest(path: str | Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f)
-
-
-def save_sequence_manifest_shard(path: str | Path, payload: dict[str, Any]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.suffix == ".sqlite":
-        _save_sequence_manifest_shard_sqlite(path, payload)
-        return
-    torch.save(payload, path)
-
-
-def _save_sequence_manifest_shard_sqlite(path: Path, payload: dict[str, Any]) -> None:
-    payload = dict(payload)
-    sequence_units = payload.pop("sequence_units", None)
-    if not isinstance(sequence_units, list):
-        raise ValueError("Sequence manifest shard payload must define a sequence_units list")
-    if path.exists():
-        path.unlink()
-    connection = sqlite3.connect(path)
-    try:
-        connection.execute("PRAGMA journal_mode=OFF")
-        connection.execute("PRAGMA synchronous=OFF")
-        connection.execute("PRAGMA temp_store=MEMORY")
-        connection.execute(
-            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        connection.execute(
-            """
-            CREATE TABLE sequence_units (
-                sequence_id INTEGER PRIMARY KEY,
-                state_dict_json TEXT NOT NULL,
-                sequence_recipe_json TEXT NOT NULL,
-                num_unique_tokens INTEGER NOT NULL,
-                unique_token_ids_json TEXT NOT NULL,
-                sequence_geometry_json TEXT
-            )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX idx_sequence_units_sequence_id ON sequence_units(sequence_id)"
-        )
-        connection.executemany(
-            "INSERT INTO metadata(key, value) VALUES(?, ?)",
-            [(str(key), json.dumps(value, separators=(",", ":"))) for key, value in payload.items()],
-        )
-        connection.executemany(
-            """
-            INSERT INTO sequence_units(
-                sequence_id,
-                state_dict_json,
-                sequence_recipe_json,
-                num_unique_tokens,
-                unique_token_ids_json,
-                sequence_geometry_json
-            ) VALUES(?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    int(unit["sequence_id"]),
-                    json.dumps(unit.get("state_dict", {}), separators=(",", ":")),
-                    json.dumps(unit.get("sequence_recipe", {}), separators=(",", ":")),
-                    int(unit.get("num_unique_tokens", len(unit.get("unique_token_ids", [])))),
-                    json.dumps(unit.get("unique_token_ids", []), separators=(",", ":")),
-                    None if "sequence_geometry" not in unit else json.dumps(unit.get("sequence_geometry"), separators=(",", ":")),
-                )
-                for unit in sequence_units
-            ],
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def load_sequence_manifest_shard(path: str | Path) -> dict[str, Any]:
-    path = Path(path)
-    if path.suffix == ".sqlite":
-        return _load_sequence_manifest_shard_sqlite(path)
-    payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError("Sequence manifest shard must deserialize to a dict payload")
-    _validate_manifest_version(payload)
-    if get_sparse_manifest_kind(payload) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
-        raise ValueError("Sequence manifest shard payload must have kind 'sequence-base'")
-    return payload
-
-
-def _load_sequence_manifest_shard_sqlite(path: Path) -> dict[str, Any]:
-    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        metadata_rows = connection.execute("SELECT key, value FROM metadata").fetchall()
-        payload = {key: json.loads(value) for key, value in metadata_rows}
-        payload["sequence_units"] = [
-            _decode_sequence_unit_row(row)
-            for row in connection.execute(
-                "SELECT sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json FROM sequence_units ORDER BY sequence_id"
-            )
-        ]
-    finally:
-        connection.close()
-    if not isinstance(payload, dict):
-        raise ValueError("Sequence manifest shard must deserialize to a dict payload")
-    _validate_manifest_version(payload)
-    if get_sparse_manifest_kind(payload) != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
-        raise ValueError("Sequence manifest shard payload must have kind 'sequence-base'")
-    return payload
-
-
-def _decode_sequence_unit_row(row: tuple[Any, ...]) -> dict[str, Any]:
-    sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json = row
-    unit = {
-        "sequence_id": int(sequence_id),
-        "state_dict": json.loads(state_dict_json),
-        "sequence_recipe": json.loads(sequence_recipe_json),
-        "num_unique_tokens": int(num_unique_tokens),
-        "unique_token_ids": json.loads(unique_token_ids_json),
-    }
-    if sequence_geometry_json is not None:
-        unit["sequence_geometry"] = json.loads(sequence_geometry_json)
-    return unit
-
-
-class SequenceManifestShardAccessor:
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self._payload = None
-        self._connection = None
-        if self.path.suffix == ".sqlite":
-            self._connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
-        else:
-            self._payload = load_sequence_manifest_shard(self.path)
-
-    def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
-
-    def get_sequence_unit(self, sequence_id: int) -> dict[str, Any] | None:
-        if self._connection is None:
-            assert self._payload is not None
-            for unit in self._payload.get("sequence_units", []):
-                if int(unit.get("sequence_id", -1)) == int(sequence_id):
-                    return unit
-            return None
-        row = self._connection.execute(
-            "SELECT sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json FROM sequence_units WHERE sequence_id = ?",
-            (int(sequence_id),),
-        ).fetchone()
-        return None if row is None else _decode_sequence_unit_row(row)
-
-    def iter_sequence_units(self) -> Iterator[dict[str, Any]]:
-        if self._connection is None:
-            assert self._payload is not None
-            yield from self._payload.get("sequence_units", [])
-            return
-        cursor = self._connection.execute(
-            "SELECT sequence_id, state_dict_json, sequence_recipe_json, num_unique_tokens, unique_token_ids_json, sequence_geometry_json FROM sequence_units ORDER BY sequence_id"
-        )
-        for row in cursor:
-            yield _decode_sequence_unit_row(row)
-
 
 def _resolve_shard_path(manifest_path: str | Path, shard_entry: dict[str, Any]) -> Path:
     shard_rel_path = shard_entry.get("path")
@@ -484,9 +220,6 @@ def resolve_sparse_manifest_grad_accum_u_max(path: str | Path, header: dict[str,
     path = Path(path)
     if header is None:
         header = load_sparse_manifest_header(path)
-
-    if get_sparse_manifest_kind(header) != SPARSE_GROUPING_MANIFEST_KIND:
-        raise ValueError("grad_accum_u_max is only defined for grouping sparse manifests")
 
     u_max = int(header.get("u_max", 0))
     if u_max <= 0:
@@ -608,8 +341,6 @@ def stream_sparse_manifest_steps(path: str | Path, start_step: int = 0) -> Itera
         raise ValueError(f"Sparse manifest start_step must be non-negative, got {start_step}")
 
     header = load_sparse_manifest_header(path)
-    if get_sparse_manifest_kind(header) != SPARSE_GROUPING_MANIFEST_KIND:
-        raise ValueError("Only grouping sparse manifests contain sparse runtime step entries")
     shards = header.get("shards")
     if not isinstance(shards, list) or len(shards) == 0:
         yield from _stream_sparse_manifest_file_steps(path, start_step=start_step)
@@ -646,9 +377,6 @@ def validate_sparse_manifest(
     ddp_world_size: int,
     num_iterations: int | None = None,
 ) -> None:
-    manifest_kind = get_sparse_manifest_kind(payload)
-    if manifest_kind != SPARSE_GROUPING_MANIFEST_KIND:
-        raise ValueError("validate_sparse_manifest only accepts grouping sparse manifests")
     expected = {
         "split": split,
         "vocab_size": int(vocab_size),
@@ -752,67 +480,3 @@ def validate_sparse_manifest(
                 )
 
 
-def validate_sequence_manifest(
-    payload: dict[str, Any],
-    *,
-    split: str,
-    vocab_size: int,
-    device_batch_size: int,
-    max_seq_len: int,
-    ddp_world_size: int,
-    num_iterations: int | None = None,
-) -> None:
-    manifest_kind = get_sparse_manifest_kind(payload)
-    if manifest_kind != SPARSE_SEQUENCE_BASE_MANIFEST_KIND:
-        raise ValueError("validate_sequence_manifest only accepts base sequence manifests")
-    expected = {
-        "split": split,
-        "vocab_size": int(vocab_size),
-        "device_batch_size": int(device_batch_size),
-        "max_seq_len": int(max_seq_len),
-        "ddp_world_size": int(ddp_world_size),
-    }
-    if num_iterations is not None:
-        expected["num_steps"] = int(num_iterations)
-    for key, value in expected.items():
-        found = payload.get(key)
-        if isinstance(value, int):
-            matches = found is not None and int(found) == value
-        else:
-            matches = found == value
-        if not matches:
-            raise ValueError(
-                f"Sequence manifest mismatch for {key}: expected {value}, found {found}"
-            )
-    num_sequence_units = int(payload.get("num_sequence_units", -1))
-    if num_sequence_units <= 0:
-        raise ValueError("Sequence manifest must define a positive num_sequence_units")
-    num_steps = int(payload.get("num_steps", -1))
-    if num_steps <= 0:
-        raise ValueError("Sequence manifest must define a positive num_steps")
-    shards = payload.get("shards")
-    if not isinstance(shards, list) or len(shards) == 0:
-        raise ValueError("Sequence manifest shards must be a non-empty list")
-    shard_total_units = 0
-    for shard_idx, shard_entry in enumerate(shards):
-        shard_num_units = int(shard_entry.get("num_sequence_units", 0))
-        if shard_num_units <= 0:
-            raise ValueError(f"Sequence manifest shard {shard_idx} must define a positive num_sequence_units")
-        shard_total_units += shard_num_units
-        shard_path = shard_entry.get("path")
-        if not isinstance(shard_path, str) or shard_path == "":
-            raise ValueError(f"Sequence manifest shard {shard_idx} must define a non-empty path")
-    if shard_total_units != num_sequence_units:
-        raise ValueError("Sequence manifest num_sequence_units does not match summed shard num_sequence_units")
-
-
-def resolve_grouping_base_manifest_path(path: str | Path, header: dict[str, Any] | None = None) -> Path:
-    path = Path(path)
-    if header is None:
-        header = load_sparse_manifest_header(path)
-    if get_sparse_manifest_kind(header) != SPARSE_GROUPING_MANIFEST_KIND:
-        raise ValueError("Only grouping manifests define a base_manifest_path")
-    base_manifest_path = header.get("base_manifest_path")
-    if not isinstance(base_manifest_path, str) or base_manifest_path == "":
-        raise ValueError("Grouping manifest must define a non-empty base_manifest_path")
-    return path.parent / base_manifest_path

@@ -9,11 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-COLD_LOGIT_BIAS_CLAMP_MIN = -3.0
-COLD_LOGIT_BIAS_CLAMP_MAX = 3.0
-
-
 def round_capacity_up(value: int | None, multiple: int) -> int | None:
     if value is None:
         return None
@@ -136,12 +131,7 @@ class DynamicVocabRuntime:
         lm_head_u_max=None,
         grad_accum_u_max=None,
         capacity_round_multiple=1,
-        cold_bias_reference_tokens=2**19,
         value_embedding_lr=None,
-        unembedding_warm_lr=None,
-        unembedding_cold_lr=None,
-        random_cloud_fill=False,
-        random_cloud_fill_seed=0,
         adam_betas=(0.8, 0.95),
         eps=1e-10,
         weight_decay=0.0,
@@ -152,12 +142,9 @@ class DynamicVocabRuntime:
         self.beta1, self.beta2 = adam_betas
         self.eps = eps
         self.weight_decay = weight_decay
-        self.cold_bias_reference_tokens = float(cold_bias_reference_tokens)
         self.first_hot_unembedding_lr = None if first_hot_unembedding_lr is None or first_hot_unembedding_lr <= 0.0 else float(first_hot_unembedding_lr)
         self.hot_unembedding_ramp_activations = max(0, int(hot_unembedding_ramp_activations))
         self.hot_unembedding_ramp_start_lr = None if hot_unembedding_ramp_start_lr is None or hot_unembedding_ramp_start_lr <= 0.0 else float(hot_unembedding_ramp_start_lr)
-        self.random_cloud_fill = bool(random_cloud_fill)
-        self.random_cloud_fill_seed = int(random_cloud_fill_seed)
         self.capacity_round_multiple = max(1, int(capacity_round_multiple))
         self.disable_fixed_overlap_reuse = os.getenv("NANOCHAT_DISABLE_FIXED_OVERLAP_REUSE", "0") == "1"
         fixed_u_max_value = 0 if fixed_u_max is None else round_capacity_up(int(fixed_u_max), self.capacity_round_multiple)
@@ -192,8 +179,6 @@ class DynamicVocabRuntime:
             "lm_head": {
                 "param": model.lm_head.weight,
                 "lr": unembedding_lr,
-                "warm_lr": unembedding_lr if unembedding_warm_lr is None else float(unembedding_warm_lr),
-                "cold_lr": unembedding_lr if unembedding_cold_lr is None else float(unembedding_cold_lr),
             },
         }
         for layer_name, embed in model.value_embeds.items():
