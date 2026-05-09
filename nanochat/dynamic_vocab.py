@@ -2880,7 +2880,7 @@ class DynamicVocabRuntime:
                     self.fixed_optimizer_state[name],
                     warm_step_values_cpu,
                     slot_ids_cpu=live_lm_head_warm_slot_ids_cpu,
-                    lr_override=float(self.table_specs["lm_head"]["warm_lr"]),
+                    lr_override=float(self.table_specs["lm_head"]["lr"]),
                 )
             if has_live_cold_grad:
                 cold_step_values_cpu = self._get_token_event_step_values_cpu(live_lm_head_cold_global_ids_cpu)
@@ -2890,7 +2890,7 @@ class DynamicVocabRuntime:
                     self.fixed_optimizer_state[name],
                     cold_step_values_cpu,
                     slot_ids_cpu=live_lm_head_cold_slot_ids_cpu,
-                    lr_override=float(self.table_specs["lm_head"]["cold_lr"]),
+                    lr_override=float(self.table_specs["lm_head"]["lr"]),
                 )
             if has_cached_non_live_grad:
                 for chunk in self._grad_accum_non_live_chunks:
@@ -3154,7 +3154,7 @@ class DynamicVocabRuntime:
                     self.fixed_optimizer_state["lm_head"],
                     warm_step_values_cpu,
                     slot_ids_cpu=step_ctx.warm_slot_ids_cpu,
-                    lr_override=float(self.table_specs["lm_head"]["warm_lr"]),
+                    lr_override=float(self.table_specs["lm_head"]["lr"]),
                 ):
                     self._mark_table_updated_("lm_head", updated_tables)
             if step_ctx.cold_slot_ids_cpu is not None and step_ctx.cold_slot_ids_cpu.numel() > 0:
@@ -3166,7 +3166,7 @@ class DynamicVocabRuntime:
                     self.fixed_optimizer_state["lm_head"],
                     cold_step_values_cpu,
                     slot_ids_cpu=step_ctx.cold_slot_ids_cpu,
-                    lr_override=float(self.table_specs["lm_head"]["cold_lr"]),
+                    lr_override=float(self.table_specs["lm_head"]["lr"]),
                 ):
                     self._mark_table_updated_("lm_head", updated_tables)
             for layer_name in step_ctx.active_vocab["value_embeds"]:

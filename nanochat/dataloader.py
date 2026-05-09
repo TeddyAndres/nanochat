@@ -39,9 +39,6 @@ from nanochat.token_cache import (
 )
 
 
-DUAL_MANIFEST_TOKEN_BATCH_CACHE_LIMIT = 64
-
-
 def _tokenize_document_batch(tokenizer, text_batch, state, bos_token, tokenizer_threads):
     token_lists = [
         torch.tensor(tokens, dtype=torch.long)

@@ -927,7 +927,7 @@ while True:
     sparse_accum_flush_ms = 0.0
     sparse_accum_queue_ms = 0.0
     sparse_accum_rows_queued = 0
-        sparse_apply_call_ms = 0.0
+    sparse_apply_call_ms = 0.0
     next_x = None
     next_y = None
     next_sparse_batch_meta = None
@@ -1049,10 +1049,6 @@ while True:
             warmup_scale = min(1.0, (step + 1) / args.sparse_unembed_warmup_steps)
             scheduled_unembedding_lr *= warmup_scale
         dynamic_vocab.table_specs["lm_head"]["lr"] = scheduled_unembedding_lr
-        warm_unembedding_lr = sparse_unembedding_lr if args.sparse_unembedding_warm_lr < 0.0 else args.sparse_unembedding_warm_lr * batch_lr_scale
-        cold_unembedding_lr = sparse_unembedding_lr if args.sparse_unembedding_cold_lr < 0.0 else args.sparse_unembedding_cold_lr * batch_lr_scale
-        dynamic_vocab.table_specs["lm_head"]["warm_lr"] = warm_unembedding_lr * lrm
-        dynamic_vocab.table_specs["lm_head"]["cold_lr"] = cold_unembedding_lr * lrm
     should_log_grad_norm = args.grad_norm_every > 0 and (step == 0 or step == num_iterations - 1 or step % args.grad_norm_every == 0)
     grad_norm = None
     sparse_grad_params = None if not args.sparse_mode else dynamic_vocab.fixed_params.values()

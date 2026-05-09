@@ -222,7 +222,6 @@ def main() -> None:
         active_ids_list = []
         for micro_idx in range(grad_accum_steps):
             rank_active_ids: list[torch.Tensor] = []
-            rank_sequence_ids: list[int] = []
             for loader in loaders:
                 batch = next(loader)
                 inputs_cpu = cast(torch.Tensor, batch[0]).to(device="cpu")
