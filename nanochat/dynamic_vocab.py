@@ -230,6 +230,7 @@ class DynamicVocabRuntime:
         self.fixed_active_mask_cpu = None
         self._fixed_input_global_to_slot_cpu = None
         self._fixed_input_slot_survived_buf_cpu = None
+        self._grad_accum_wte_local_to_slot_cpu = None
         self._fixed_live_state = False
         self._grad_accum_ids_cpu = None
         self._grad_accum_global_to_local_cpu = None
@@ -1036,6 +1037,7 @@ class DynamicVocabRuntime:
             self.fixed_input_slot_to_global_cpu.fill_(-1)
         if self._fixed_input_global_to_slot_cpu is not None:
             self._fixed_input_global_to_slot_cpu.fill_(-1)
+        self._grad_accum_wte_local_to_slot_cpu = None
         if self.fixed_active_mask_cpu is not None:
             self.fixed_active_mask_cpu.zero_()
         if self.fixed_logit_mask is not None:
@@ -2153,6 +2155,12 @@ class DynamicVocabRuntime:
             input_stage_ids_cpu = _arriving_input_ids
             input_stage_slot_ids_cpu = _arriving_input_slot_ids
             _used_persistent_input_slots = True
+            # Cache local-position → wte-slot mapping so union_inputs can be remapped on every
+            # microstep in this window (including preserve_resident_grads ones).  Index i in this
+            # tensor gives the GPU slot that holds grad_accum_ids_cpu[i]'s embedding row.
+            self._grad_accum_wte_local_to_slot_cpu = self._fixed_input_global_to_slot_cpu.index_select(
+                0, grad_accum_ids_cpu
+            )
             # --- lm_head deferred writeback detection (one torch.full; lm_head fix is a follow-up) ---
             prev_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
             if prev_lm_head_slot_ids_cpu.numel() > 0:
@@ -2324,7 +2332,9 @@ class DynamicVocabRuntime:
         assert self.fixed_input_slot_to_global_cpu is not None
         if not _used_persistent_input_slots and not (grad_accum_steps > 1 and not self.disable_fixed_overlap_reuse and preserve_resident_grads):
             # Non-persistent path (first step, disabled, or grad_accum_steps==1):
-            # reset forward map to contiguous slot assignment.
+            # reset forward map to contiguous slot assignment. Slots are sequential (slot i = position i),
+            # so no union_inputs remapping is needed — clear the cache.
+            self._grad_accum_wte_local_to_slot_cpu = None
             self.fixed_input_slot_to_global_cpu.fill_(-1)
             if grad_accum_steps > 1:
                 if grad_accum_ids_cpu.numel() > 0:
@@ -2382,7 +2392,13 @@ class DynamicVocabRuntime:
         _t0_union_io = time.perf_counter()
         union_inputs = None
         if union_inputs_cpu_local is not None and grad_accum_steps > 1:
-            union_inputs = union_inputs_cpu_local.detach().to(self.device, non_blocking=self.use_cuda)
+            _inputs_local = union_inputs_cpu_local
+            if self._grad_accum_wte_local_to_slot_cpu is not None:
+                # Persistent stable slots: remap local-position indices to actual GPU slot indices.
+                # union_inputs_cpu_local contains positions (0..N-1) in grad_accum_ids_cpu;
+                # with stable slots, slot(token) != position(token), so we must translate.
+                _inputs_local = self._grad_accum_wte_local_to_slot_cpu[_inputs_local]
+            union_inputs = _inputs_local.detach().to(self.device, non_blocking=self.use_cuda)
         union_targets = None
         if union_targets_cpu_local is not None and grad_accum_steps > 1:
             union_targets = union_targets_cpu_local.detach().to(self.device, non_blocking=self.use_cuda)
