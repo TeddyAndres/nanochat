@@ -58,6 +58,12 @@ class DynamicVocabStep:
     prep_h2d_tensor_count: int = 0
     prep_h2d_bytes: int = 0
     prep_prefetch_hit: int = 0
+    prep_cpu_reuse_map_ms: float = 0.0
+    prep_gpu_reuse_input_ms: float = 0.0
+    prep_gpu_reuse_lm_head_ms: float = 0.0
+    prep_clear_grads_ms: float = 0.0
+    prep_logit_mask_ms: float = 0.0
+    prep_union_io_h2d_ms: float = 0.0
     d2h_segment_count: int = 0
     d2h_row_count: int = 0
     d2h_bytes: int = 0
@@ -2068,6 +2074,12 @@ class DynamicVocabRuntime:
         prep_h2d_enqueue_ms = 0.0
         prep_h2d_tensor_count = 0
         prep_h2d_bytes = 0
+        prep_cpu_reuse_map_ms = 0.0
+        prep_gpu_reuse_input_ms = 0.0
+        prep_gpu_reuse_lm_head_ms = 0.0
+        prep_clear_grads_ms = 0.0
+        prep_logit_mask_ms = 0.0
+        prep_union_io_h2d_ms = 0.0
         deferred_writeback_ids_cpu = self._empty_long_cpu()
         deferred_writeback_slot_ids_cpu = self._empty_long_cpu()
         deferred_lm_head_writeback_ids_cpu = self._empty_long_cpu()
@@ -2077,6 +2089,7 @@ class DynamicVocabRuntime:
         if union_input_tables:
             input_stage_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else grad_accum_ids_cpu
             input_stage_slot_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        _t0_cpu_map = time.perf_counter()
         if self.use_cuda and grad_accum_steps > 1 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             assert self.fixed_input_slot_to_global_cpu is not None
             prev_input_slot_ids_cpu = torch.nonzero(self.fixed_input_slot_to_global_cpu >= 0, as_tuple=False).flatten()
@@ -2103,6 +2116,8 @@ class DynamicVocabRuntime:
                     kept_prev_lm_head_mask_cpu[kept_prev_lm_head_rows_cpu[valid_prev_lm_head_mask_cpu]] = True
                 deferred_lm_head_writeback_ids_cpu = prev_lm_head_ids_cpu[~kept_prev_lm_head_mask_cpu]
                 deferred_lm_head_writeback_slot_ids_cpu = prev_lm_head_slot_ids_cpu[~kept_prev_lm_head_mask_cpu]
+        prep_cpu_reuse_map_ms = (time.perf_counter() - _t0_cpu_map) * 1000.0
+        _t0_gpu_input = time.perf_counter()
         if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             assert self.fixed_input_slot_to_global_cpu is not None
             prev_input_slot_mask_cpu = self.fixed_input_slot_to_global_cpu >= 0
@@ -2139,6 +2154,8 @@ class DynamicVocabRuntime:
                 else:
                     input_stage_ids_cpu = grad_accum_ids_cpu
                     input_stage_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        prep_gpu_reuse_input_ms = (time.perf_counter() - _t0_gpu_input) * 1000.0
+        _t0_gpu_lm_head = time.perf_counter()
         if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
             prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
@@ -2173,6 +2190,7 @@ class DynamicVocabRuntime:
                     grad_accum_stage_ids_cpu = grad_accum_ids_cpu[missing_mask_cpu]
                     grad_accum_stage_slot_ids_cpu = torch.nonzero(missing_mask_cpu, as_tuple=False).flatten()
 
+        prep_gpu_reuse_lm_head_ms = (time.perf_counter() - _t0_gpu_lm_head) * 1000.0
         required_cpu_ids = []
         if stage_ids_cpu.numel() > 0:
             required_cpu_ids.append(stage_ids_cpu)
@@ -2199,6 +2217,7 @@ class DynamicVocabRuntime:
         prep_writeback_wait_ms += (time.perf_counter() - flush_t0) * 1000.0
         if cloud_writeback_ids_cpu.numel() > 0:
             self._queue_fixed_lm_head_writeback_(cloud_writeback_ids_cpu, cloud_writeback_slot_ids_cpu)
+        _t0_clear_grads = time.perf_counter()
         if preserve_resident_grads:
             if not union_input_tables:
                 self._zero_fixed_grad_slots_(
@@ -2207,6 +2226,7 @@ class DynamicVocabRuntime:
                 )
         else:
             self._clear_fixed_grads()
+        prep_clear_grads_ms = (time.perf_counter() - _t0_clear_grads) * 1000.0
         for name, spec in self.table_specs.items():
             param = spec["param"]
             state = self.state[param]
@@ -2305,6 +2325,7 @@ class DynamicVocabRuntime:
         if cloud_ids_cpu.numel() > 0 and (grad_accum_steps == 1 or not preserve_resident_grads):
             self.fixed_lm_head_slot_to_global_cpu.index_copy_(0, cloud_slot_ids_cpu, cloud_ids_cpu)
         self.fixed_active_mask_cpu.copy_(active_mask_cpu)
+        _t0_logit_mask = time.perf_counter()
         use_logit_mask = (grad_accum_steps > 1) or (lm_head_active_ids_cpu.numel() < self.lm_head_u_max)
         if use_logit_mask:
             if grad_accum_steps > 1:
@@ -2332,13 +2353,16 @@ class DynamicVocabRuntime:
                     bias_slot_ids_device = active_slot_ids_cpu.to(self.device)
                     self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
         self._fixed_live_state = True
+        prep_logit_mask_ms = (time.perf_counter() - _t0_logit_mask) * 1000.0
 
+        _t0_union_io = time.perf_counter()
         union_inputs = None
         if union_inputs_cpu_local is not None and grad_accum_steps > 1:
             union_inputs = union_inputs_cpu_local.detach().to(self.device, non_blocking=self.use_cuda)
         union_targets = None
         if union_targets_cpu_local is not None and grad_accum_steps > 1:
             union_targets = union_targets_cpu_local.detach().to(self.device, non_blocking=self.use_cuda)
+        prep_union_io_h2d_ms = (time.perf_counter() - _t0_union_io) * 1000.0
 
         step_active_vocab = {
             **self.fixed_active_vocab,
@@ -2431,6 +2455,12 @@ class DynamicVocabRuntime:
             prep_h2d_tensor_count=prep_h2d_tensor_count,
             prep_h2d_bytes=prep_h2d_bytes,
             prep_prefetch_hit=prefetched_hit,
+            prep_cpu_reuse_map_ms=prep_cpu_reuse_map_ms,
+            prep_gpu_reuse_input_ms=prep_gpu_reuse_input_ms,
+            prep_gpu_reuse_lm_head_ms=prep_gpu_reuse_lm_head_ms,
+            prep_clear_grads_ms=prep_clear_grads_ms,
+            prep_logit_mask_ms=prep_logit_mask_ms,
+            prep_union_io_h2d_ms=prep_union_io_h2d_ms,
         )
 
     def prepare_step(

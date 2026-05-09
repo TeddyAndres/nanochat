@@ -1293,6 +1293,12 @@ while True:
     sparse_prep_h2d_tensor_count = 0
     sparse_prep_h2d_bytes = 0
     sparse_prep_prefetch_hits = 0
+    sparse_prep_cpu_reuse_map_ms = 0.0
+    sparse_prep_gpu_reuse_input_ms = 0.0
+    sparse_prep_gpu_reuse_lm_head_ms = 0.0
+    sparse_prep_clear_grads_ms = 0.0
+    sparse_prep_logit_mask_ms = 0.0
+    sparse_prep_union_io_h2d_ms = 0.0
     sparse_fwdbwd_ms = 0.0
     sparse_input_clone_ms = 0.0
     sparse_forward_call_ms = 0.0
@@ -1338,6 +1344,12 @@ while True:
             sparse_prep_h2d_tensor_count += sparse_step_ctx.prep_h2d_tensor_count
             sparse_prep_h2d_bytes += sparse_step_ctx.prep_h2d_bytes
             sparse_prep_prefetch_hits += sparse_step_ctx.prep_prefetch_hit
+            sparse_prep_cpu_reuse_map_ms += sparse_step_ctx.prep_cpu_reuse_map_ms
+            sparse_prep_gpu_reuse_input_ms += sparse_step_ctx.prep_gpu_reuse_input_ms
+            sparse_prep_gpu_reuse_lm_head_ms += sparse_step_ctx.prep_gpu_reuse_lm_head_ms
+            sparse_prep_clear_grads_ms += sparse_step_ctx.prep_clear_grads_ms
+            sparse_prep_logit_mask_ms += sparse_step_ctx.prep_logit_mask_ms
+            sparse_prep_union_io_h2d_ms += sparse_step_ctx.prep_union_io_h2d_ms
             if sparse_step_ctx.grad_accum_steps > 1 and sparse_step_ctx.is_grad_accum_boundary:
                 dynamic_vocab.prefetch_apply_accumulated_gradients()
             sparse_metrics = sparse_step_ctx
@@ -1656,6 +1668,15 @@ while True:
                     f" | prefetch_hit: {sparse_prep_prefetch_hits:,}"
                     f" | h2d_tensors: {sparse_prep_h2d_tensor_count:,}"
                     f" h2d_mb: {sparse_prep_h2d_bytes / (1024 * 1024):.2f}"
+                )
+            if sparse_prep_cpu_reuse_map_ms > 0.0 or sparse_prep_gpu_reuse_input_ms > 0.0 or sparse_prep_clear_grads_ms > 0.0:
+                sparse_str += (
+                    f" | prep_reuse_ms map: {sparse_prep_cpu_reuse_map_ms:.2f}"
+                    f" gpu_in: {sparse_prep_gpu_reuse_input_ms:.2f}"
+                    f" gpu_lm: {sparse_prep_gpu_reuse_lm_head_ms:.2f}"
+                    f" | prep_stage_ms clear: {sparse_prep_clear_grads_ms:.2f}"
+                    f" mask: {sparse_prep_logit_mask_ms:.2f}"
+                    f" union_io: {sparse_prep_union_io_h2d_ms:.2f}"
                 )
             if sparse_next_fetch_ms > 0.0:
                 sparse_str += (
