@@ -2297,6 +2297,7 @@ def test_fixed_u_sparse_grad_accumulation_preserves_live_overlap_state():
         assert param.grad is not None
         param.grad[union_step1_slot_ids] += 2
     runtime.accumulate_gradients(step1_ctx)
+    runtime.prefetch_apply_accumulated_gradients()
     metrics = runtime.apply_accumulated_gradients()
 
     assert runtime._fixed_live_state

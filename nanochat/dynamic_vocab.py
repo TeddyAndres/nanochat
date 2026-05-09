@@ -248,6 +248,9 @@ class DynamicVocabRuntime:
         self._stage_prefetch_executor = ThreadPoolExecutor(max_workers=1)
         self._pending_stage_prefetch_future = None
         self._pending_stage_prefetch_key = None
+        self._apply_stage_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_apply_stage_future = None
+        self._pending_apply_stage_ids_cpu = None
         self._gpu_stage_buffers = {}
         self._last_hidden_query_ms = 0.0
         self.global_token_count_cpu = torch.zeros((model.config.vocab_size,), dtype=torch.long)
@@ -1040,6 +1043,91 @@ class DynamicVocabRuntime:
         self._grad_accum_window_cold_logit_bias_cpu = None
         self._grad_accum_window_cold_bias_clamped_count = 0
         self._grad_accum_window_cold_bias_abs_max = 0.0
+        self._pending_apply_stage_future = None
+        self._pending_apply_stage_ids_cpu = None
+
+    def _resolve_grad_accum_staged_non_live_ids(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._grad_accum_live or self._grad_accum_ids_cpu is None:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+
+        grad_accum_ids_cpu = self._grad_accum_ids_cpu
+        grad_accum_count = self._grad_accum_count
+        live_union_mask_cpu = torch.zeros(grad_accum_count, dtype=torch.bool)
+        if self.fixed_u_mode and self._fixed_live_state:
+            assert self._grad_accum_global_to_local_cpu is not None
+            assert self.fixed_input_slot_to_global_cpu is not None
+            assert self.fixed_lm_head_slot_to_global_cpu is not None
+            live_slot_ids_cpu = torch.nonzero(self.fixed_input_slot_to_global_cpu >= 0, as_tuple=False).flatten()
+            if live_slot_ids_cpu.numel() > 0:
+                live_global_ids_cpu = self.fixed_input_slot_to_global_cpu.index_select(0, live_slot_ids_cpu)
+                live_union_row_ids_cpu = self._grad_accum_global_to_local_cpu.index_select(0, live_global_ids_cpu)
+                valid_live_mask_cpu = live_union_row_ids_cpu >= 0
+                if valid_live_mask_cpu.any():
+                    live_union_mask_cpu[live_union_row_ids_cpu[valid_live_mask_cpu]] = True
+            live_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
+            if live_lm_head_slot_ids_cpu.numel() > 0:
+                live_lm_head_global_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, live_lm_head_slot_ids_cpu)
+                live_lm_head_union_row_ids_cpu = self._grad_accum_global_to_local_cpu.index_select(0, live_lm_head_global_ids_cpu)
+                valid_lm_head_mask_cpu = live_lm_head_union_row_ids_cpu >= 0
+                if valid_lm_head_mask_cpu.any():
+                    live_union_mask_cpu[live_lm_head_union_row_ids_cpu[valid_lm_head_mask_cpu]] = True
+
+        non_live_union_row_ids_cpu = torch.nonzero(~live_union_mask_cpu, as_tuple=False).flatten()
+        if non_live_union_row_ids_cpu.numel() == 0:
+            return non_live_union_row_ids_cpu, torch.empty(0, dtype=torch.long)
+        cached_non_live_mask_cpu = torch.zeros(non_live_union_row_ids_cpu.numel(), dtype=torch.bool)
+        if self._grad_accum_cached_union_mask_cpu is not None:
+            cached_non_live_mask_cpu = self._grad_accum_cached_union_mask_cpu[non_live_union_row_ids_cpu]
+        staged_non_live_union_row_ids_cpu = non_live_union_row_ids_cpu[~cached_non_live_mask_cpu]
+        if staged_non_live_union_row_ids_cpu.numel() == 0:
+            return staged_non_live_union_row_ids_cpu, torch.empty(0, dtype=torch.long)
+        staged_non_live_grad_accum_ids_cpu = grad_accum_ids_cpu.index_select(0, staged_non_live_union_row_ids_cpu)
+        return staged_non_live_union_row_ids_cpu, staged_non_live_grad_accum_ids_cpu
+
+    def _prefetch_apply_stage_cpu_rows(self, ids_cpu: torch.Tensor) -> dict[str, dict]:
+        ids_cpu = ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        payload = {
+            "ids_cpu": ids_cpu,
+        }
+        if ids_cpu.numel() == 0:
+            return payload
+        for name, spec in self.table_specs.items():
+            param = spec["param"].detach()
+            state = self.state[spec["param"]]
+            exp_avg_src = state["exp_avg"].detach()
+            exp_avg_sq_src = state["exp_avg_sq"].detach()
+            rows = torch.empty((ids_cpu.numel(),) + tuple(param.shape[1:]), dtype=param.dtype, pin_memory=self.use_cuda)
+            exp_avg = torch.empty((ids_cpu.numel(),) + tuple(param.shape[1:]), dtype=param.dtype, pin_memory=self.use_cuda)
+            exp_avg_sq = torch.empty((ids_cpu.numel(),) + tuple(param.shape[1:]), dtype=param.dtype, pin_memory=self.use_cuda)
+            torch.index_select(param, 0, ids_cpu, out=rows)
+            torch.index_select(exp_avg_src, 0, ids_cpu, out=exp_avg)
+            torch.index_select(exp_avg_sq_src, 0, ids_cpu, out=exp_avg_sq)
+            payload[name] = {
+                "param": rows,
+                "exp_avg": exp_avg,
+                "exp_avg_sq": exp_avg_sq,
+            }
+        return payload
+
+    def prefetch_apply_accumulated_gradients(self) -> None:
+        if not self.use_cuda or not self._grad_accum_live or self._grad_accum_ids_cpu is None:
+            return
+        _, staged_non_live_grad_accum_ids_cpu = self._resolve_grad_accum_staged_non_live_ids()
+        if staged_non_live_grad_accum_ids_cpu.numel() == 0:
+            self._pending_apply_stage_future = None
+            self._pending_apply_stage_ids_cpu = None
+            return
+        if (
+            self._pending_apply_stage_future is not None and
+            self._pending_apply_stage_ids_cpu is not None and
+            torch.equal(self._pending_apply_stage_ids_cpu, staged_non_live_grad_accum_ids_cpu)
+        ):
+            return
+        self._pending_apply_stage_ids_cpu = staged_non_live_grad_accum_ids_cpu.clone()
+        self._pending_apply_stage_future = self._apply_stage_executor.submit(
+            self._prefetch_apply_stage_cpu_rows,
+            staged_non_live_grad_accum_ids_cpu,
+        )
 
     def _ensure_grad_accum_buffers(self, capacity: int) -> None:
         needs_new = self._grad_accum_buffers is None
@@ -2632,6 +2720,16 @@ class DynamicVocabRuntime:
         staged_non_live_union_row_ids_cpu = non_live_union_row_ids_cpu[~cached_non_live_mask_cpu]
         staged_non_live_grad_accum_ids_cpu = grad_accum_ids_cpu.index_select(0, staged_non_live_union_row_ids_cpu) if staged_non_live_union_row_ids_cpu.numel() > 0 else torch.empty(0, dtype=torch.long)
 
+        prefetched_apply_stage = None
+        if (
+            self._pending_apply_stage_future is not None and
+            self._pending_apply_stage_ids_cpu is not None and
+            torch.equal(self._pending_apply_stage_ids_cpu, staged_non_live_grad_accum_ids_cpu)
+        ):
+            prefetched_apply_stage = self._pending_apply_stage_future.result()
+        self._pending_apply_stage_future = None
+        self._pending_apply_stage_ids_cpu = None
+
         t_stage_start = time.perf_counter()
         non_live_params = {}
         non_live_optimizer_state = {}
@@ -2641,12 +2739,27 @@ class DynamicVocabRuntime:
             param = spec["param"]
             state = self.state[param]
             if staged_non_live_grad_accum_ids_cpu.numel() > 0 and staged_non_live_union_row_ids_device is not None:
-                rows = param.index_select(0, staged_non_live_grad_accum_ids_cpu)
-                exp_avg = state["exp_avg"].index_select(0, staged_non_live_grad_accum_ids_cpu)
-                exp_avg_sq = state["exp_avg_sq"].index_select(0, staged_non_live_grad_accum_ids_cpu)
-                rows_gpu = rows.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else rows.to(self.device)
-                exp_avg_gpu = exp_avg.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg.to(self.device)
-                exp_avg_sq_gpu = exp_avg_sq.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg_sq.to(self.device)
+                if prefetched_apply_stage is not None:
+                    prefetched_entry = prefetched_apply_stage[name]
+                    rows_gpu, _, _ = self._stage_prefetched_cpu_tensor_to_device(
+                        f"apply:{name}:param",
+                        prefetched_entry["param"],
+                    )
+                    exp_avg_gpu, _, _ = self._stage_prefetched_cpu_tensor_to_device(
+                        f"apply:{name}:exp_avg",
+                        prefetched_entry["exp_avg"],
+                    )
+                    exp_avg_sq_gpu, _, _ = self._stage_prefetched_cpu_tensor_to_device(
+                        f"apply:{name}:exp_avg_sq",
+                        prefetched_entry["exp_avg_sq"],
+                    )
+                else:
+                    rows = param.index_select(0, staged_non_live_grad_accum_ids_cpu)
+                    exp_avg = state["exp_avg"].index_select(0, staged_non_live_grad_accum_ids_cpu)
+                    exp_avg_sq = state["exp_avg_sq"].index_select(0, staged_non_live_grad_accum_ids_cpu)
+                    rows_gpu = rows.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else rows.to(self.device)
+                    exp_avg_gpu = exp_avg.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg.to(self.device)
+                    exp_avg_sq_gpu = exp_avg_sq.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else exp_avg_sq.to(self.device)
                 non_live_params[name] = nn.Parameter(rows_gpu, requires_grad=True)
                 non_live_optimizer_state[name] = {
                     "exp_avg": exp_avg_gpu,

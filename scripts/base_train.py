@@ -1338,6 +1338,8 @@ while True:
             sparse_prep_h2d_tensor_count += sparse_step_ctx.prep_h2d_tensor_count
             sparse_prep_h2d_bytes += sparse_step_ctx.prep_h2d_bytes
             sparse_prep_prefetch_hits += sparse_step_ctx.prep_prefetch_hit
+            if sparse_step_ctx.grad_accum_steps > 1 and sparse_step_ctx.is_grad_accum_boundary:
+                dynamic_vocab.prefetch_apply_accumulated_gradients()
             sparse_metrics = sparse_step_ctx
             x_for_model = sparse_step_ctx.union_inputs if sparse_step_ctx.union_inputs is not None else current_x
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
