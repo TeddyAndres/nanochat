@@ -378,10 +378,18 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 if args.sparse_mode:
-    print0("Sparse mode enabled: compiling model with dynamic=True for varying active vocab shapes")
-    model = torch.compile(model, dynamic=True)
+    print0("Sparse mode enabled: we don't have dynamic shapes")
+    model = torch.compile(
+        model,
+        dynamic=False,           # keep this 
+    )
 else:
-    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+    model = torch.compile(
+        model,
+        dynamic=False,
+        mode="max-autotune",     # ← add this
+        fullgraph=True,
+    )
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.

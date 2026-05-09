@@ -490,6 +490,29 @@ def test_cpu_receive_buffer_allocates_fresh_storage_while_writeback_is_pending()
     assert second_buffer.data_ptr() != first_buffer.data_ptr()
 
 
+def test_gpu_stage_buffer_keys_collapse_fixed_micro_steps():
+    model = build_tiny_model(vocab_size=10)
+    runtime = DynamicVocabRuntime(
+        model,
+        device="cpu",
+        embedding_lr=0.05,
+        value_embedding_lr=0.04,
+        unembedding_lr=0.03,
+        fixed_u_max=6,
+    )
+
+    first = runtime._get_gpu_stage_buffer("stage:fixed:0:wte:param", (2, model.config.n_embd), torch.float32)
+    second = runtime._get_gpu_stage_buffer("stage:fixed:1:wte:param", (2, model.config.n_embd), torch.float32)
+    third = runtime._get_gpu_stage_buffer("stage:fixed:2:wte:exp_avg", (2, model.config.n_embd), torch.float32)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert set(runtime._gpu_stage_buffers) == {
+        "stage:fixed:wte:param",
+        "stage:fixed:wte:exp_avg",
+    }
+    assert third.data_ptr() == runtime._gpu_stage_buffers["stage:fixed:wte:exp_avg"].data_ptr()
+
+
 def test_fixed_u_masked_logits_hide_inactive_slots():
     torch.manual_seed(0)
     model = build_tiny_model(vocab_size=8)

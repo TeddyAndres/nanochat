@@ -1441,7 +1441,12 @@ class DynamicVocabRuntime:
         return gpu_tensor_map
 
     def _get_gpu_stage_buffer(self, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        buffer = self._gpu_stage_buffers.get(name)
+        buffer_key = name
+        if name.startswith("stage:fixed:"):
+            parts = name.split(":", 3)
+            if len(parts) == 4:
+                buffer_key = f"{parts[0]}:{parts[1]}:{parts[3]}"
+        buffer = self._gpu_stage_buffers.get(buffer_key)
         needs_new = (
             buffer is None or
             buffer.dtype != dtype or
@@ -1450,7 +1455,7 @@ class DynamicVocabRuntime:
         )
         if needs_new:
             buffer = torch.empty(shape, dtype=dtype, device=self.device)
-            self._gpu_stage_buffers[name] = buffer
+            self._gpu_stage_buffers[buffer_key] = buffer
         assert buffer is not None
         slices = tuple(slice(0, dim) for dim in shape)
         return buffer[slices]
