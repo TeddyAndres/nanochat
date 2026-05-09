@@ -228,6 +228,8 @@ class DynamicVocabRuntime:
         self.fixed_input_slot_to_global_cpu = None
         self.fixed_lm_head_slot_to_global_cpu = None
         self.fixed_active_mask_cpu = None
+        self._fixed_input_global_to_slot_cpu = None
+        self._fixed_input_slot_survived_buf_cpu = None
         self._fixed_live_state = False
         self._grad_accum_ids_cpu = None
         self._grad_accum_global_to_local_cpu = None
@@ -265,6 +267,11 @@ class DynamicVocabRuntime:
             self.fixed_input_slot_to_global_cpu = torch.full((self.fixed_input_u_max,), -1, dtype=torch.long)
             self.fixed_lm_head_slot_to_global_cpu = torch.full((self.lm_head_u_max,), -1, dtype=torch.long)
             self.fixed_active_mask_cpu = torch.zeros(self.fixed_u_max, dtype=torch.bool)
+            # Persistent inverse map: global_id → slot_id, maintained incrementally across windows
+            # to avoid per-step torch.full((vocab_size,), -1) scatter-map rebuilds in the hot path.
+            self._fixed_input_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+            # Working buffer for set-difference in slot space (fixed_input_u_max, not vocab_size)
+            self._fixed_input_slot_survived_buf_cpu = torch.zeros(self.fixed_input_u_max, dtype=torch.bool)
             for name, spec in self.table_specs.items():
                 param = spec["param"]
                 row_count = self.lm_head_u_max if name == "lm_head" else self.fixed_input_u_max
@@ -1027,6 +1034,8 @@ class DynamicVocabRuntime:
             self.fixed_slot_to_global_cpu.fill_(-1)
         if self.fixed_input_slot_to_global_cpu is not None:
             self.fixed_input_slot_to_global_cpu.fill_(-1)
+        if self._fixed_input_global_to_slot_cpu is not None:
+            self._fixed_input_global_to_slot_cpu.fill_(-1)
         if self.fixed_active_mask_cpu is not None:
             self.fixed_active_mask_cpu.zero_()
         if self.fixed_logit_mask is not None:
@@ -1651,15 +1660,12 @@ class DynamicVocabRuntime:
         cloud_ids_cpu = torch.cat((warm_ids_cpu, cold_ids_cpu)) if warm_ids_cpu.numel() > 0 or cold_ids_cpu.numel() > 0 else self._empty_long_cpu()
         if grad_accum_steps > 1:
             if self._fixed_live_state and self.fixed_input_slot_to_global_cpu is not None and grad_accum_ids_cpu.numel() > 0:
-                prev_input_slot_ids_cpu = torch.nonzero(self.fixed_input_slot_to_global_cpu >= 0, as_tuple=False).flatten()
-                if prev_input_slot_ids_cpu.numel() > 0:
-                    prev_input_ids_cpu = self.fixed_input_slot_to_global_cpu.index_select(0, prev_input_slot_ids_cpu)
-                    prev_input_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-                    prev_input_global_to_slot_cpu[prev_input_ids_cpu] = prev_input_slot_ids_cpu
-                    reused_old_slot_ids_cpu = prev_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
-                    non_lm_head_ids_cpu = grad_accum_ids_cpu if self.disable_fixed_overlap_reuse else grad_accum_ids_cpu[reused_old_slot_ids_cpu < 0]
-                else:
+                if self.disable_fixed_overlap_reuse:
                     non_lm_head_ids_cpu = grad_accum_ids_cpu
+                else:
+                    # Use persistent inverse map: O(n_new) lookup, no torch.full scatter-map alloc.
+                    _prefetch_reused = self._fixed_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
+                    non_lm_head_ids_cpu = grad_accum_ids_cpu[_prefetch_reused < 0]
             else:
                 non_lm_head_ids_cpu = grad_accum_ids_cpu
         else:
@@ -2080,6 +2086,7 @@ class DynamicVocabRuntime:
         prep_clear_grads_ms = 0.0
         prep_logit_mask_ms = 0.0
         prep_union_io_h2d_ms = 0.0
+        _used_persistent_input_slots = False
         deferred_writeback_ids_cpu = self._empty_long_cpu()
         deferred_writeback_slot_ids_cpu = self._empty_long_cpu()
         deferred_lm_head_writeback_ids_cpu = self._empty_long_cpu()
@@ -2090,20 +2097,63 @@ class DynamicVocabRuntime:
             input_stage_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else grad_accum_ids_cpu
             input_stage_slot_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
         _t0_cpu_map = time.perf_counter()
-        if self.use_cuda and grad_accum_steps > 1 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
+        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
+            # New-window boundary only (preserve_resident_grads microsteps 1-31 are skipped:
+            # the window is unchanged so no tokens leave, deferred_writeback stays empty,
+            # and no GPU-GPU copies are needed — a pure win on all 31 microsteps).
             assert self.fixed_input_slot_to_global_cpu is not None
-            prev_input_slot_ids_cpu = torch.nonzero(self.fixed_input_slot_to_global_cpu >= 0, as_tuple=False).flatten()
-            if prev_input_slot_ids_cpu.numel() > 0:
-                prev_input_ids_cpu = self.fixed_input_slot_to_global_cpu.index_select(0, prev_input_slot_ids_cpu)
-                prev_input_global_to_row_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-                prev_input_global_to_row_cpu[prev_input_ids_cpu] = torch.arange(prev_input_ids_cpu.numel(), dtype=torch.long)
-                kept_prev_input_rows_cpu = prev_input_global_to_row_cpu.index_select(0, grad_accum_ids_cpu)
-                kept_prev_input_mask_cpu = torch.zeros(prev_input_slot_ids_cpu.numel(), dtype=torch.bool)
-                valid_prev_input_mask_cpu = kept_prev_input_rows_cpu >= 0
-                if valid_prev_input_mask_cpu.any():
-                    kept_prev_input_mask_cpu[kept_prev_input_rows_cpu[valid_prev_input_mask_cpu]] = True
-                deferred_writeback_ids_cpu = prev_input_ids_cpu[~kept_prev_input_mask_cpu]
-                deferred_writeback_slot_ids_cpu = prev_input_slot_ids_cpu[~kept_prev_input_mask_cpu]
+            # --- Persistent stable input-table slot assignment (replaces Block B entirely) ---
+            # Step 1: which new tokens already have a slot? O(n_new) lookup, no vocab_size alloc.
+            _existing_input_slots = self._fixed_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
+            _arriving_input_mask = _existing_input_slots < 0
+            _surviving_input_slots = _existing_input_slots[~_arriving_input_mask]
+            # Step 2: find leaving slots via set-difference in slot space (O(fixed_input_u_max)).
+            _all_input_occupied = self.fixed_input_slot_to_global_cpu >= 0
+            if _surviving_input_slots.numel() > 0:
+                self._fixed_input_slot_survived_buf_cpu.zero_()
+                self._fixed_input_slot_survived_buf_cpu.scatter_(0, _surviving_input_slots, True)
+                _leaving_input_mask = _all_input_occupied & ~self._fixed_input_slot_survived_buf_cpu
+            else:
+                _leaving_input_mask = _all_input_occupied
+            _leaving_input_slot_ids = torch.nonzero(_leaving_input_mask, as_tuple=False).flatten()
+            _leaving_input_ids = (
+                self.fixed_input_slot_to_global_cpu[_leaving_input_slot_ids]
+                if _leaving_input_slot_ids.numel() > 0 else self._empty_long_cpu()
+            )
+            # Step 3: assign slots to arriving tokens (recycle from leaving pool first).
+            _arriving_input_ids = grad_accum_ids_cpu[_arriving_input_mask]
+            _n_arriving = _arriving_input_ids.numel()
+            _n_leaving = _leaving_input_slot_ids.numel()
+            if _n_arriving > 0:
+                if _n_arriving <= _n_leaving:
+                    _arriving_input_slot_ids = _leaving_input_slot_ids[:_n_arriving]
+                    _freed_input_slot_ids = _leaving_input_slot_ids[_n_arriving:]
+                else:
+                    # Window grew past old occupancy: pull extras from unoccupied range.
+                    _extra_slots = torch.nonzero(~_all_input_occupied, as_tuple=False).flatten()[:_n_arriving - _n_leaving]
+                    _arriving_input_slot_ids = (
+                        torch.cat((_leaving_input_slot_ids, _extra_slots)) if _n_leaving > 0 else _extra_slots
+                    )
+                    _freed_input_slot_ids = self._empty_long_cpu()
+            else:
+                _arriving_input_slot_ids = self._empty_long_cpu()
+                _freed_input_slot_ids = _leaving_input_slot_ids
+            # Step 4: update persistent forward and inverse maps.
+            if _leaving_input_ids.numel() > 0:
+                self._fixed_input_global_to_slot_cpu[_leaving_input_ids] = -1
+            if _freed_input_slot_ids.numel() > 0:
+                self.fixed_input_slot_to_global_cpu[_freed_input_slot_ids] = -1
+            if _arriving_input_ids.numel() > 0:
+                self._fixed_input_global_to_slot_cpu[_arriving_input_ids] = _arriving_input_slot_ids
+                self.fixed_input_slot_to_global_cpu[_arriving_input_slot_ids] = _arriving_input_ids
+            # Deferred writeback: leaving tokens may have uncommitted GPU→CPU write jobs.
+            deferred_writeback_ids_cpu = _leaving_input_ids
+            deferred_writeback_slot_ids_cpu = _leaving_input_slot_ids[:_leaving_input_ids.numel()]
+            # Only arriving tokens need CPU→GPU staging; surviving tokens stay in their correct slot.
+            input_stage_ids_cpu = _arriving_input_ids
+            input_stage_slot_ids_cpu = _arriving_input_slot_ids
+            _used_persistent_input_slots = True
+            # --- lm_head deferred writeback detection (one torch.full; lm_head fix is a follow-up) ---
             prev_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
             if prev_lm_head_slot_ids_cpu.numel() > 0:
                 prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
@@ -2117,44 +2167,7 @@ class DynamicVocabRuntime:
                 deferred_lm_head_writeback_ids_cpu = prev_lm_head_ids_cpu[~kept_prev_lm_head_mask_cpu]
                 deferred_lm_head_writeback_slot_ids_cpu = prev_lm_head_slot_ids_cpu[~kept_prev_lm_head_mask_cpu]
         prep_cpu_reuse_map_ms = (time.perf_counter() - _t0_cpu_map) * 1000.0
-        _t0_gpu_input = time.perf_counter()
-        if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
-            assert self.fixed_input_slot_to_global_cpu is not None
-            prev_input_slot_mask_cpu = self.fixed_input_slot_to_global_cpu >= 0
-            prev_input_slot_ids_cpu = torch.nonzero(prev_input_slot_mask_cpu, as_tuple=False).flatten()
-            if prev_input_slot_ids_cpu.numel() > 0:
-                prev_input_ids_cpu = self.fixed_input_slot_to_global_cpu.index_select(0, prev_input_slot_ids_cpu)
-                prev_input_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-                prev_input_global_to_slot_cpu[prev_input_ids_cpu] = prev_input_slot_ids_cpu
-                reused_old_input_slot_ids_cpu = prev_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
-                reuse_input_mask_cpu = reused_old_input_slot_ids_cpu >= 0
-                if deferred_writeback_ids_cpu.numel() > 0:
-                    self._queue_fixed_rows_writeback_(
-                        deferred_writeback_ids_cpu,
-                        deferred_writeback_slot_ids_cpu,
-                    )
-                    deferred_writeback_ids_cpu = self._empty_long_cpu()
-                    deferred_writeback_slot_ids_cpu = self._empty_long_cpu()
-                if reuse_input_mask_cpu.any():
-                    reused_old_input_slot_ids_cpu = reused_old_input_slot_ids_cpu[reuse_input_mask_cpu]
-                    reused_new_input_slot_ids_cpu = torch.nonzero(reuse_input_mask_cpu, as_tuple=False).flatten()
-                    reused_old_input_slot_ids_device = reused_old_input_slot_ids_cpu.to(self.device)
-                    reused_new_input_slot_ids_device = reused_new_input_slot_ids_cpu.to(self.device)
-                    for name in self._union_input_table_names():
-                        for source in (
-                            self.fixed_params[name].data,
-                            self.fixed_optimizer_state[name]["exp_avg"],
-                            self.fixed_optimizer_state[name]["exp_avg_sq"],
-                        ):
-                            source_rows = source.index_select(0, reused_old_input_slot_ids_device)
-                            source.index_copy_(0, reused_new_input_slot_ids_device, source_rows)
-                    missing_input_mask_cpu = ~reuse_input_mask_cpu
-                    input_stage_ids_cpu = grad_accum_ids_cpu[missing_input_mask_cpu]
-                    input_stage_slot_ids_cpu = torch.nonzero(missing_input_mask_cpu, as_tuple=False).flatten()
-                else:
-                    input_stage_ids_cpu = grad_accum_ids_cpu
-                    input_stage_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
-        prep_gpu_reuse_input_ms = (time.perf_counter() - _t0_gpu_input) * 1000.0
+        prep_gpu_reuse_input_ms = 0.0
         _t0_gpu_lm_head = time.perf_counter()
         if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             prev_lm_head_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
@@ -2309,12 +2322,23 @@ class DynamicVocabRuntime:
 
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         assert self.fixed_input_slot_to_global_cpu is not None
-        self.fixed_input_slot_to_global_cpu.fill_(-1)
-        if grad_accum_steps > 1:
-            if grad_accum_ids_cpu.numel() > 0:
-                self.fixed_input_slot_to_global_cpu[:grad_accum_ids_cpu.numel()].copy_(grad_accum_ids_cpu)
-        else:
-            self.fixed_input_slot_to_global_cpu[:self.fixed_u_max].copy_(slot_to_global_cpu)
+        if not _used_persistent_input_slots and not (grad_accum_steps > 1 and not self.disable_fixed_overlap_reuse and preserve_resident_grads):
+            # Non-persistent path (first step, disabled, or grad_accum_steps==1):
+            # reset forward map to contiguous slot assignment.
+            self.fixed_input_slot_to_global_cpu.fill_(-1)
+            if grad_accum_steps > 1:
+                if grad_accum_ids_cpu.numel() > 0:
+                    self.fixed_input_slot_to_global_cpu[:grad_accum_ids_cpu.numel()].copy_(grad_accum_ids_cpu)
+                    if not self.disable_fixed_overlap_reuse:
+                        # Initialize persistent inverse map so the next step can use stable slots.
+                        self._fixed_input_global_to_slot_cpu.fill_(-1)
+                        self._fixed_input_global_to_slot_cpu[grad_accum_ids_cpu] = torch.arange(
+                            grad_accum_ids_cpu.numel(), dtype=torch.long
+                        )
+            else:
+                self.fixed_input_slot_to_global_cpu[:self.fixed_u_max].copy_(slot_to_global_cpu)
+        # else: persistent slots (forward map already updated incrementally in the block above),
+        #       or preserve_resident_grads (forward map is correct from microstep 0, no reset needed).
         if grad_accum_steps > 1:
             if not preserve_resident_grads:
                 self.fixed_lm_head_slot_to_global_cpu.fill_(-1)
