@@ -472,6 +472,7 @@ class GPT(nn.Module):
             logits = logits * logit_scale
         return logits
 
+    @torch.compiler.disable()  # generator function (yield) + data-dependent chunking loop cannot be traced
     def iter_logits(self, x, active_vocab=None, logit_scale=1.0, logit_bias=None, force_float=True, vocab_chunk_size=None):
         if active_vocab is None:
             total_vocab = self.config.vocab_size
@@ -615,6 +616,7 @@ class GPT(nn.Module):
             # inference: just return the logits directly
             return logits
 
+    @torch.compiler.disable()  # generator function (yield) + dynamic seq growth cannot be traced
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """

@@ -376,20 +376,24 @@ def disable_fp8(model):
 # -----------------------------------------------------------------------------
 # Compile the model
 
+# Enable coordinate-descent Triton tuning: instead of sampling from a fixed candidate list,
+# inductor hill-climbs tile sizes and pipeline depths for each kernel. Costs a few extra
+# warmup steps but finds strictly better GEMMs on H100 — worth it for a long speedrun.
+import torch._inductor.config as _inductor_config
+_inductor_config.coordinate_descent_tuning = True
+
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-if args.sparse_mode:
-    print0("Sparse mode enabled: we don't have dynamic shapes")
-    model = torch.compile(
-        model,
-        dynamic=False,           # keep this 
-    )
-else:
-    model = torch.compile(
-        model,
-        dynamic=False,
-        mode="max-autotune",     # ← add this
-        fullgraph=True,
-    )
+# max-autotune: enables CUTLASS/Triton autotuning for all GEMMs (best kernels for H100).
+# fullgraph=True: requires the entire forward to be a single graph — enables CUDA-graph capture
+#   in inductor, eliminating per-step CPU dispatch overhead. Raises at compile time if FA3 is
+#   not registered as a torch.ops custom op; the fix is to drop fullgraph=True in that case.
+# dynamic=False: shapes are constant in fixed-U manifest mode (B, T, u_max all fixed).
+model = torch.compile(
+    model,
+    dynamic=False,
+    mode="max-autotune",
+    fullgraph=True,
+)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
