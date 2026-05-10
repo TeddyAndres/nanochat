@@ -320,28 +320,6 @@ def disable_fp8(model):
             setattr(parent, attr_name, fp8_module)
 
 # -----------------------------------------------------------------------------
-# Compile the model
-
-# Enable coordinate-descent Triton tuning: instead of sampling from a fixed candidate list,
-# inductor hill-climbs tile sizes and pipeline depths for each kernel. Costs a few extra
-# warmup steps but finds strictly better GEMMs on H100 — worth it for a long speedrun.
-import torch._inductor.config as _inductor_config
-_inductor_config.coordinate_descent_tuning = True
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# max-autotune: enables CUTLASS/Triton autotuning for all GEMMs (best kernels for H100).
-# fullgraph=True: requires the entire forward to be a single graph — enables CUDA-graph capture
-#   in inductor, eliminating per-step CPU dispatch overhead. Raises at compile time if FA3 is
-#   not registered as a torch.ops custom op; the fix is to drop fullgraph=True in that case.
-# dynamic=False: shapes are constant in fixed-U manifest mode (B, T, u_max all fixed).
-model = torch.compile(
-    model,
-    dynamic=False,
-    mode="max-autotune",
-    fullgraph=True,
-)
-
-# -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
 # Get the parameter counts of our model
@@ -382,6 +360,37 @@ elif total_batch_size == -1:
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+
+# -----------------------------------------------------------------------------
+# Compile the model (after total_batch_size is known for divisibility assert below)
+
+_world_tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len * ddp_world_size
+assert total_batch_size % _world_tokens_per_fwdbwd == 0, (
+    f"total_batch_size ({total_batch_size}) must be divisible by tokens per micro-batch ({_world_tokens_per_fwdbwd})"
+)
+_compile_grad_accum_steps = total_batch_size // _world_tokens_per_fwdbwd
+
+import torch._inductor.config as _inductor_config
+_inductor_config.coordinate_descent_tuning = True
+if device_type == "cuda" and _compile_grad_accum_steps > 1:
+    # CUDA graph *trees* record/replay Inductor regions; multiple forwards per optimizer.step()
+    # (grad accumulation) does not match PyTorch's one-generation-per-iteration model and can
+    # clobber activations before backward (F.embedding, etc.). Disabling **trees** only keeps
+    # fullgraph=True + max-autotune; peak VRAM can increase vs. tree pooling — the robust alternative
+    # is grad_accum_steps==1 (larger per-step micro-batch + matching manifest) if memory allows.
+    _inductor_config.triton.cudagraph_trees = False
+    print0(
+        f"Inductor: triton.cudagraph_trees=False (grad_accum_steps={_compile_grad_accum_steps}) — "
+        "required for multi-micro-step torch.compile; disable if you use only one forward per step."
+    )
+
+orig_model = model  # uncompiled; eval/sample paths use this to avoid compile overhead
+model = torch.compile(
+    model,
+    dynamic=False,
+    mode="max-autotune",
+    fullgraph=True,
+)
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
@@ -935,8 +944,14 @@ while True:
     for micro_step in range(grad_accum_steps):
         micro_t0 = time.perf_counter()
         clone_t0 = time.perf_counter()
-        current_x = x.clone()
-        current_y = y.clone()
+        # Dense path clones defensively; sparse hybrid uses staged x/y read-only (union tensors come from
+        # prepare_step). Cloning here every micro-step multiplied VRAM by ~grad_accum_steps (fatal at 32×).
+        if args.sparse_mode:
+            current_x = x
+            current_y = y
+        else:
+            current_x = x.clone()
+            current_y = y.clone()
         sparse_input_clone_ms += (time.perf_counter() - clone_t0) * 1000.0
         if args.sparse_mode:
             prepare_t0 = time.perf_counter()
@@ -974,6 +989,10 @@ while True:
             forward_t0 = time.perf_counter()
             loss = model(current_x, current_y)
             sparse_forward_call_ms += (time.perf_counter() - forward_t0) * 1000.0
+        # Compiled fullgraph forwards reuse CUDAGraph output buffers; grad-accum keeps multiple
+        # micro-loss tensors alive across forwards — clone so retained scalars are not aliased.
+        if grad_accum_steps > 1:
+            loss = loss.clone()
         micro_loss = loss.detach()
         train_loss_accum = micro_loss if train_loss_accum is None else (train_loss_accum + micro_loss)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
@@ -983,6 +1002,12 @@ while True:
         else:
             loss.backward()
         sparse_backward_call_ms += (time.perf_counter() - backward_t0) * 1000.0
+        # Ensure each backward finishes before the next compiled forward; otherwise CUDA graph tree
+        # buffers can alias across micro-steps (raises VRAM if we instead disable Inductor graphs).
+        if grad_accum_steps > 1 and device_type == "cuda":
+            backward_sync_t0 = time.perf_counter()
+            synchronize()
+            sparse_backward_sync_ms += (time.perf_counter() - backward_sync_t0) * 1000.0
         if not final_train_step:
             fetch_t0 = time.perf_counter()
             if args.sparse_mode:
@@ -1003,7 +1028,12 @@ while True:
                 next_x, next_y, next_dataloader_state_dict = next(train_loader)
                 sparse_loader_fetch_ms += (time.perf_counter() - loader_fetch_t0) * 1000.0
             sparse_next_fetch_ms += (time.perf_counter() - fetch_t0) * 1000.0
-        if args.sparse_mode and args.sparse_debug_sync_after_backward and device_type == "cuda":
+        if (
+            args.sparse_mode
+            and args.sparse_debug_sync_after_backward
+            and device_type == "cuda"
+            and grad_accum_steps <= 1
+        ):
             backward_sync_t0 = time.perf_counter()
             synchronize()
             sparse_backward_sync_ms += (time.perf_counter() - backward_sync_t0) * 1000.0
