@@ -20,6 +20,7 @@ if os.environ.get("NANOCHAT_ENABLE_EXPANDABLE_SEGMENTS", "0") == "1":
         os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
 import gc
 import json
+import sys
 import time
 import math
 import argparse
@@ -1114,7 +1115,22 @@ while True:
         else:
             assert sparse_step_ctx is not None
             sparse_apply_t0 = time.perf_counter()
-            sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
+            try:
+                sparse_metrics = dynamic_vocab.step(sparse_step_ctx)
+            except Exception:
+                rk = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
+                ctx = sparse_step_ctx
+                nslots = int(ctx.active_slot_ids_cpu.numel()) if ctx.active_slot_ids_cpu is not None else -1
+                nids = int(ctx.active_ids_cpu.numel()) if ctx.active_ids_cpu is not None else -1
+                rt = int(getattr(dynamic_vocab, "runtime_step", -1))
+                print(
+                    f"[base_train] sparse_vocab.step FAILED training_step={step} rank={rk} "
+                    f"dynamic_vocab.runtime_step={rt} fixed_u_mode={getattr(ctx, 'fixed_u_mode', '?')} "
+                    f"active_ids={nids} active_slots={nslots}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
             sparse_apply_call_ms += (time.perf_counter() - sparse_apply_t0) * 1000.0
             sparse_step_ctx = None
     model.zero_grad(set_to_none=True)

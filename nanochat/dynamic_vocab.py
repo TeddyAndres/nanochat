@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -8,6 +9,15 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+def _sparse_adamw_row_chunk_size() -> int:
+    """Chunk sparse table AdamW row updates to shorten individual GPU kernels (helps display-GPU TDR)."""
+    try:
+        v = int(os.environ.get("NANOCHAT_SPARSE_ADAMW_CHUNK", "2048"))
+    except ValueError:
+        v = 2048
+    return max(256, v)
+
 
 def round_capacity_up(value: int | None, multiple: int) -> int | None:
     if value is None:
@@ -2572,65 +2582,97 @@ class DynamicVocabRuntime:
         row_lr = None
         if param_name == "lm_head":
             row_lr = self._get_lm_head_row_lr(base_lr, hot_activation_counts_cpu, active_param.device, active_param.dtype)
-        slot_ids = None
+
+        def _apply_adamw_rows(
+            param_rows: torch.Tensor,
+            grad_rows: torch.Tensor,
+            exp_avg_rows: torch.Tensor,
+            exp_avg_sq_rows: torch.Tensor,
+            row_lr_arg: Optional[torch.Tensor],
+            step_val: int | torch.Tensor,
+        ) -> None:
+            if self.weight_decay != 0.0:
+                param_rows.mul_(1 - base_lr * self.weight_decay)
+            exp_avg_rows.lerp_(grad_rows, 1 - self.beta1)
+            exp_avg_sq_rows.lerp_(grad_rows.square(), 1 - self.beta2)
+
+            if isinstance(step_val, torch.Tensor):
+                step_values = step_val.detach().to(device=param_rows.device, dtype=torch.float32)
+                if step_values.dim() != 1 or step_values.numel() != param_rows.size(0):
+                    raise ValueError(
+                        f"Sparse AdamW step values must be a 1D tensor with one entry per row, got shape {tuple(step_values.shape)} for {param_rows.size(0)} rows"
+                    )
+                if step_values.numel() > 0 and torch.equal(step_values, step_values[:1].expand_as(step_values)):
+                    scalar_step_value = int(step_values[0].item())
+                    bias1 = 1 - self.beta1 ** scalar_step_value
+                    bias2 = 1 - self.beta2 ** scalar_step_value
+                    denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
+                    if row_lr_arg is not None:
+                        row_lr_view = row_lr_arg.view((-1,) + (1,) * (param_rows.dim() - 1))
+                        param_rows.add_((exp_avg_rows / denom) * row_lr_view, alpha=-1.0 / bias1)
+                    else:
+                        step_size = base_lr / bias1
+                        param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
+                else:
+                    bias1 = 1 - torch.pow(torch.full_like(step_values, self.beta1), step_values)
+                    bias2 = 1 - torch.pow(torch.full_like(step_values, self.beta2), step_values)
+                    view_shape = (-1,) + (1,) * (param_rows.dim() - 1)
+                    denom = (exp_avg_sq_rows / bias2.view(view_shape)).sqrt().add_(self.eps)
+                    if row_lr_arg is not None:
+                        scale = row_lr_arg / bias1.to(dtype=row_lr_arg.dtype)
+                    else:
+                        scale = torch.full_like(bias1, base_lr, dtype=torch.float32) / bias1
+                    param_rows.add_((exp_avg_rows / denom) * scale.to(dtype=param_rows.dtype).view(view_shape), alpha=-1.0)
+            else:
+                bias1 = 1 - self.beta1 ** step_val
+                bias2 = 1 - self.beta2 ** step_val
+                denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
+                if row_lr_arg is not None:
+                    row_lr_view = row_lr_arg.view((-1,) + (1,) * (param_rows.dim() - 1))
+                    param_rows.add_((exp_avg_rows / denom) * row_lr_view, alpha=-1.0 / bias1)
+                else:
+                    step_size = base_lr / bias1
+                    param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
+
         if slot_ids_cpu is None:
-            param_rows = active_param
-            grad_rows = grad
-            exp_avg_rows = exp_avg
-            exp_avg_sq_rows = exp_avg_sq
-        else:
-            slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-            if slot_ids_cpu.numel() == 0:
-                return
-            slot_ids = slot_ids_cpu.to(active_param.device)
+            _apply_adamw_rows(active_param, grad, exp_avg, exp_avg_sq, row_lr, step_value)
+            return
+
+        slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        n = int(slot_ids_cpu.numel())
+        if n == 0:
+            return
+
+        trace = os.environ.get("NANOCHAT_SPARSE_ADAMW_TRACE", "").strip() not in ("", "0", "false", "False")
+        if trace:
+            print(
+                f"[sparse_adamw] runtime_step={int(self.runtime_step)} param={param_name} "
+                f"rows={n} device={active_param.device} chunk={_sparse_adamw_row_chunk_size()}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        chunk = _sparse_adamw_row_chunk_size()
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            ids_cpu = slot_ids_cpu[start:end]
+            if trace and start == 0:
+                print(
+                    f"[sparse_adamw]   -> chunk [{start}:{end}) ids_cpu_numel={ids_cpu.numel()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            slot_ids = ids_cpu.to(active_param.device, non_blocking=True)
             param_rows = active_param.index_select(0, slot_ids)
             grad_rows = grad.index_select(0, slot_ids)
             exp_avg_rows = exp_avg.index_select(0, slot_ids)
             exp_avg_sq_rows = exp_avg_sq.index_select(0, slot_ids)
-        if self.weight_decay != 0.0:
-            param_rows.mul_(1 - base_lr * self.weight_decay)
-        exp_avg_rows.lerp_(grad_rows, 1 - self.beta1)
-        exp_avg_sq_rows.lerp_(grad_rows.square(), 1 - self.beta2)
-
-        if isinstance(step_value, torch.Tensor):
-            step_values = step_value.detach().to(device=param_rows.device, dtype=torch.float32)
-            if step_values.dim() != 1 or step_values.numel() != param_rows.size(0):
-                raise ValueError(
-                    f"Sparse AdamW step values must be a 1D tensor with one entry per row, got shape {tuple(step_values.shape)} for {param_rows.size(0)} rows"
-                )
-            if step_values.numel() > 0 and torch.equal(step_values, step_values[:1].expand_as(step_values)):
-                scalar_step_value = int(step_values[0].item())
-                bias1 = 1 - self.beta1 ** scalar_step_value
-                bias2 = 1 - self.beta2 ** scalar_step_value
-                denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
-                if row_lr is not None:
-                    row_lr = row_lr.view((-1,) + (1,) * (param_rows.dim() - 1))
-                    param_rows.add_((exp_avg_rows / denom) * row_lr, alpha=-1.0 / bias1)
-                else:
-                    step_size = base_lr / bias1
-                    param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
+            row_chunk = row_lr[start:end] if row_lr is not None else None
+            if isinstance(step_value, torch.Tensor):
+                step_chunk = step_value[start:end]
             else:
-                bias1 = 1 - torch.pow(torch.full_like(step_values, self.beta1), step_values)
-                bias2 = 1 - torch.pow(torch.full_like(step_values, self.beta2), step_values)
-                view_shape = (-1,) + (1,) * (param_rows.dim() - 1)
-                denom = (exp_avg_sq_rows / bias2.view(view_shape)).sqrt().add_(self.eps)
-                if row_lr is not None:
-                    scale = row_lr / bias1.to(dtype=row_lr.dtype)
-                else:
-                    scale = torch.full_like(bias1, base_lr, dtype=torch.float32) / bias1
-                param_rows.add_((exp_avg_rows / denom) * scale.to(dtype=param_rows.dtype).view(view_shape), alpha=-1.0)
-        else:
-            bias1 = 1 - self.beta1 ** step_value
-            bias2 = 1 - self.beta2 ** step_value
-            denom = (exp_avg_sq_rows / bias2).sqrt().add_(self.eps)
-            if row_lr is not None:
-                row_lr = row_lr.view((-1,) + (1,) * (param_rows.dim() - 1))
-                param_rows.add_((exp_avg_rows / denom) * row_lr, alpha=-1.0 / bias1)
-            else:
-                step_size = base_lr / bias1
-                param_rows.addcdiv_(exp_avg_rows, denom, value=-step_size)
-
-        if slot_ids is not None:
+                step_chunk = step_value
+            _apply_adamw_rows(param_rows, grad_rows, exp_avg_rows, exp_avg_sq_rows, row_chunk, step_chunk)
             active_param.index_copy_(0, slot_ids, param_rows)
             exp_avg.index_copy_(0, slot_ids, exp_avg_rows)
             exp_avg_sq.index_copy_(0, slot_ids, exp_avg_sq_rows)
