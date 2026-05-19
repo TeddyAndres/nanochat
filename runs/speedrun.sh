@@ -39,6 +39,37 @@ tokenizer_ready() {
     [[ -f "$tokenizer_dir/tokenizer.model" || -f "$tokenizer_dir/tokenizer.json" || -f "$tokenizer_dir/tokenizer.pkl" ]]
 }
 
+prepare_dataset_placeholders_from_token_cache() {
+    local data_dir="$1"
+    local token_cache_dir="$2"
+    python - "$token_cache_dir" "$data_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+token_cache_dir = Path(sys.argv[1])
+data_dir = Path(sys.argv[2])
+parquet_files = set()
+
+for split in ("train", "val"):
+    metadata_path = token_cache_dir / split / "metadata.json"
+    if not metadata_path.is_file():
+        continue
+    with metadata_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    parquet_files.update(payload.get("parquet_files", []))
+
+if not parquet_files:
+    raise SystemExit(f"Token cache metadata under {token_cache_dir} does not list any parquet files")
+
+data_dir.mkdir(parents=True, exist_ok=True)
+for filename in sorted(parquet_files):
+    (data_dir / filename).touch(exist_ok=True)
+
+print(f"Prepared {len(parquet_files)} placeholder parquet filenames in {data_dir}")
+PY
+}
+
 export OMP_NUM_THREADS=1
 
 # Preserve user-provided storage roots and keep large runtime caches off /tmp.
@@ -184,6 +215,10 @@ if [[ "$SPEEDRUN_SKIP_DATASET_DOWNLOAD" != "1" ]]; then
     python -m nanochat.dataset -n 170 &
     DATASET_DOWNLOAD_PID=$!
 else
+    if [[ ! -d "$DATA_DIR" && "$SPEEDRUN_SPARSE_MODE" == "1" && -n "$SPEEDRUN_TOKEN_CACHE_DIR" ]]; then
+        require_dir "$SPEEDRUN_TOKEN_CACHE_DIR" "Sparse token cache directory is missing"
+        prepare_dataset_placeholders_from_token_cache "$DATA_DIR" "$SPEEDRUN_TOKEN_CACHE_DIR"
+    fi
     require_dir "$DATA_DIR" "Dataset download skipped but dataset directory is missing"
 fi
 
@@ -229,7 +264,14 @@ fi
 torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_train -- "${base_train_args[@]}" ${SPEEDRUN_BASE_TRAIN_EXTRA_ARGS}
 
 if [[ "$SPEEDRUN_SKIP_BASE_EVAL" != "1" ]]; then
-    torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_eval -- --eval=core,bpb,sample --device-batch-size="$SPEEDRUN_EVAL_DEVICE_BATCH_SIZE" ${SPEEDRUN_BASE_EVAL_EXTRA_ARGS}
+    base_eval_args=(
+        "--eval=core,bpb,sample"
+        "--device-batch-size=$SPEEDRUN_EVAL_DEVICE_BATCH_SIZE"
+    )
+    if [[ -n "$SPEEDRUN_TOKEN_CACHE_DIR" ]]; then
+        base_eval_args+=("--token-cache-dir=$SPEEDRUN_TOKEN_CACHE_DIR")
+    fi
+    torchrun --standalone --nproc_per_node="$SPEEDRUN_NPROC_PER_NODE" -m scripts.base_eval -- "${base_eval_args[@]}" ${SPEEDRUN_BASE_EVAL_EXTRA_ARGS}
 fi
 
 # -----------------------------------------------------------------------------

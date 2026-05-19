@@ -45,6 +45,7 @@ from nanochat.flash_attention import HAS_FA3
 from nanochat.sparse_manifest import (
     load_sparse_manifest_header,
     resolve_sparse_manifest_grad_accum_u_max,
+    resolve_grouping_base_manifest_path,
     validate_sparse_manifest,
 )
 from scripts.base_eval import evaluate_core
@@ -85,6 +86,13 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
+parser.add_argument(
+    "--compile-mode",
+    type=str,
+    default="default",
+    choices=["none", "default", "legacy-sparse", "max-autotune", "max-autotune-no-cudagraphs"],
+    help="torch.compile mode. max-autotune can add ~4GB VRAM for sparse U~17k (materializes full logits); default already enables coordinate_descent_tuning.",
+)
 parser.add_argument("--sparse-mode", action="store_true", help="enable first-pass dynamic vocab training (single GPU, grad_accum_steps=1)")
 parser.add_argument("--sparse-manifest", type=str, default="", help="path to a precomputed sparse manifest JSON for fixed-U hybrid sparse mode")
 parser.add_argument("--sparse-logit-scale", type=float, default=1.0, help="multiply sparse training and validation logits by this factor before CE (1.0 disables)")
@@ -373,25 +381,51 @@ _compile_grad_accum_steps = total_batch_size // _world_tokens_per_fwdbwd
 
 import torch._inductor.config as _inductor_config
 _inductor_config.coordinate_descent_tuning = True
-if device_type == "cuda" and _compile_grad_accum_steps > 1:
-    # CUDA graph *trees* record/replay Inductor regions; multiple forwards per optimizer.step()
-    # (grad accumulation) does not match PyTorch's one-generation-per-iteration model and can
-    # clobber activations before backward (F.embedding, etc.). Disabling **trees** only keeps
-    # fullgraph=True + max-autotune; peak VRAM can increase vs. tree pooling — the robust alternative
-    # is grad_accum_steps==1 (larger per-step micro-batch + matching manifest) if memory allows.
-    _inductor_config.triton.cudagraph_trees = False
-    print0(
-        f"Inductor: triton.cudagraph_trees=False (grad_accum_steps={_compile_grad_accum_steps}) — "
-        "required for multi-micro-step torch.compile; disable if you use only one forward per step."
-    )
-
+_compile_enabled = args.compile_mode != "none"
+_needs_grad_accum_backward_sync = False
 orig_model = model  # uncompiled; eval/sample paths use this to avoid compile overhead
-model = torch.compile(
-    model,
-    dynamic=False,
-    mode="max-autotune",
-    fullgraph=True,
-)
+if _compile_enabled:
+    if args.compile_mode == "legacy-sparse":
+        if args.sparse_mode:
+            print0("Sparse mode enabled: compiling model with dynamic=True for varying active vocab shapes")
+            model = torch.compile(model, dynamic=True)
+        else:
+            model = torch.compile(model, dynamic=False)
+    elif args.compile_mode == "default":
+        if args.sparse_mode:
+            print0("Sparse mode enabled: compiling model with dynamic=False for fixed-U manifest shapes")
+        model = torch.compile(model, dynamic=False)
+    else:
+        _use_max_autotune = args.compile_mode in ("max-autotune", "max-autotune-no-cudagraphs")
+        if device_type == "cuda" and _use_max_autotune:
+            # max-autotune benchmarks Triton GEMM tiles at compile time. On Blackwell (e.g. RTX 5090)
+            # some tiles for large sparse lm_head matmuls (B*S x D @ D x U_max) hit cudaErrorIllegalAddress
+            # and poison the parent CUDA context before Dynamo can finish compiling. cuBLAS (ATEN) wins
+            # those shapes anyway; skip Triton GEMM candidates so autotune cannot fault the device.
+            _inductor_config.max_autotune_gemm_backends = "ATEN"
+            print0("Inductor: max_autotune_gemm_backends=ATEN (skip Triton GEMM autotune on CUDA; avoids illegal-access during sparse lm_head compile)")
+        if device_type == "cuda" and _compile_grad_accum_steps > 1:
+            # CUDA graph *trees* record/replay Inductor regions; multiple forwards per optimizer.step()
+            # (grad accumulation) does not match PyTorch's one-generation-per-iteration model and can
+            # clobber activations before backward (F.embedding, etc.). Disabling **trees** only keeps
+            # fullgraph=True + max-autotune; peak VRAM can increase vs. tree pooling — the robust alternative
+            # is grad_accum_steps==1 (larger per-step micro-batch + matching manifest) if memory allows.
+            _inductor_config.triton.cudagraph_trees = False
+            print0(
+                f"Inductor: triton.cudagraph_trees=False (grad_accum_steps={_compile_grad_accum_steps}) — "
+                "required for multi-micro-step torch.compile; disable if you use only one forward per step."
+            )
+        _needs_grad_accum_backward_sync = (
+            device_type == "cuda"
+            and _compile_grad_accum_steps > 1
+            and bool(getattr(_inductor_config.triton, "cudagraph_trees", True))
+        )
+
+        _compile_kwargs = {"dynamic": False, "fullgraph": True}
+        _compile_kwargs["mode"] = args.compile_mode
+        model = torch.compile(model, **_compile_kwargs)
+else:
+    print0("torch.compile disabled (--compile-mode none)")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
@@ -740,6 +774,13 @@ if hybrid_sparse:
         f"manifest_grad_accum_U_max={resolved_grad_accum_u_max:,} | "
         f"model_grad_accum_U_max={dynamic_vocab.grad_accum_u_max:,}"
     )
+    if "base_manifest_path" in sparse_manifest:
+        base_manifest_path = resolve_grouping_base_manifest_path(args.sparse_manifest, sparse_manifest)
+        base_manifest_header = load_sparse_manifest_header(base_manifest_path)
+        print0(
+            f"Sparse base sequence manifest: {base_manifest_path} | "
+            f"sequence_units={int(base_manifest_header.get('num_sequence_units', 0)):,}"
+        )
 
 if args.sparse_mode:
     startup_fetch_t0 = time.perf_counter()
@@ -1005,7 +1046,7 @@ while True:
         sparse_backward_call_ms += (time.perf_counter() - backward_t0) * 1000.0
         # Ensure each backward finishes before the next compiled forward; otherwise CUDA graph tree
         # buffers can alias across micro-steps (raises VRAM if we instead disable Inductor graphs).
-        if grad_accum_steps > 1 and device_type == "cuda":
+        if _needs_grad_accum_backward_sync:
             backward_sync_t0 = time.perf_counter()
             synchronize()
             sparse_backward_sync_ms += (time.perf_counter() - backward_sync_t0) * 1000.0

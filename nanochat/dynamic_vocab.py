@@ -1389,18 +1389,26 @@ class DynamicVocabRuntime:
         state["exp_avg"].index_copy_(0, global_ids_cpu, exp_avg_buffer)
         state["exp_avg_sq"].index_copy_(0, global_ids_cpu, exp_avg_sq_buffer)
 
-    def _queue_fixed_rows_writeback_(self, global_ids_cpu: torch.Tensor, slot_ids_cpu: torch.Tensor) -> None:
+    def _queue_fixed_rows_writeback_(
+        self,
+        global_ids_cpu: torch.Tensor,
+        slot_ids_cpu: torch.Tensor,
+        table_names: Optional[tuple[str, ...]] = None,
+    ) -> None:
         global_ids_cpu = global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         slot_ids_cpu = slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         if global_ids_cpu.numel() == 0:
             return
         if not self.use_cuda:
-            self._writeback_fixed_rows_(global_ids_cpu, slot_ids_cpu)
+            self._writeback_fixed_rows_(global_ids_cpu, slot_ids_cpu, table_names=table_names)
             return
         self._flush_pending_cpu_writeback(global_ids_cpu)
         slot_ids_device = slot_ids_cpu.to(self.device)
         writeback_segments = []
-        for name, spec in self.table_specs.items():
+        if table_names is None:
+            table_names = tuple(self.table_specs.keys())
+        for name in table_names:
+            spec = self.table_specs[name]
             active_param = self.fixed_params[name]
             active_state = self.fixed_optimizer_state[name]
             rows = active_param.detach().index_select(0, slot_ids_device)
@@ -2220,6 +2228,7 @@ class DynamicVocabRuntime:
             self._queue_fixed_rows_writeback_(
                 deferred_writeback_ids_cpu,
                 deferred_writeback_slot_ids_cpu,
+                table_names=self._union_input_table_names(),
             )
         if deferred_lm_head_writeback_ids_cpu.numel() > 0:
             self._queue_fixed_lm_head_writeback_(
