@@ -963,6 +963,8 @@ while True:
     sparse_prep_clear_grads_ms = 0.0
     sparse_prep_logit_mask_ms = 0.0
     sparse_prep_union_io_h2d_ms = 0.0
+    sparse_prep_active_vocab_build_ms = 0.0  # cost of building dict passed to compiled model (Phase 0)
+    sparse_prep_persistent_slot_ms = 0.0     # NEW: time in the persistent slot remapping (big on grad accum window boundaries)
     sparse_fwdbwd_ms = 0.0
     sparse_input_clone_ms = 0.0
     sparse_forward_call_ms = 0.0
@@ -979,6 +981,14 @@ while True:
     sparse_accum_queue_ms = 0.0
     sparse_accum_rows_queued = 0
     sparse_apply_call_ms = 0.0
+
+    # === Phase 0 Compile Graph Instrumentation ===
+    # These measure the cost of crossing from eager Python (prepare_step + setup)
+    # into the compiled model forward. Goal: quantify boundary tax + VRAM deltas
+    # before making structural changes to what gets compiled.
+    sparse_boundary_overhead_ms = 0.0          # clean post-prepare Python work before model()
+    sparse_peak_mem_before_prepare = 0.0
+    sparse_peak_mem_after_forward = 0.0
     next_x = None
     next_y = None
     next_sparse_batch_meta = None
@@ -996,6 +1006,9 @@ while True:
             current_y = y.clone()
         sparse_input_clone_ms += (time.perf_counter() - clone_t0) * 1000.0
         if args.sparse_mode:
+            # Memory snapshot right before prepare_step (for clean "before crossing into Python prep" baseline)
+            if device_type == "cuda" and micro_step == 0:
+                sparse_peak_mem_before_prepare = max(sparse_peak_mem_before_prepare, get_max_memory() / (1024**2))
             prepare_t0 = time.perf_counter()
             sparse_step_ctx = dynamic_vocab.prepare_step(
                 sparse_batch_meta,
@@ -1014,11 +1027,23 @@ while True:
             sparse_prep_clear_grads_ms += sparse_step_ctx.prep_clear_grads_ms
             sparse_prep_logit_mask_ms += sparse_step_ctx.prep_logit_mask_ms
             sparse_prep_union_io_h2d_ms += sparse_step_ctx.prep_union_io_h2d_ms
+            sparse_prep_active_vocab_build_ms += getattr(sparse_step_ctx, 'prep_active_vocab_build_ms', 0.0)
+            sparse_prep_persistent_slot_ms += getattr(sparse_step_ctx, 'prep_persistent_slot_ms', 0.0)
             if sparse_step_ctx.grad_accum_steps > 1 and sparse_step_ctx.is_grad_accum_boundary:
                 dynamic_vocab.prefetch_apply_accumulated_gradients()
+
+            # === Clean boundary measurement starts here ===
+            # We want the time strictly between end of prepare_step() and the start of the compiled model() call.
+            post_prepare_t0 = time.perf_counter()
+
             sparse_metrics = sparse_step_ctx
             x_for_model = sparse_step_ctx.union_inputs if sparse_step_ctx.union_inputs is not None else current_x
             y_for_loss = sparse_step_ctx.union_targets if sparse_step_ctx.union_targets is not None else y
+
+            # This is the key "Python overhead before entering compiled graph" metric
+            boundary_work_ms = (time.perf_counter() - post_prepare_t0) * 1000.0
+            sparse_boundary_overhead_ms += boundary_work_ms
+
             forward_t0 = time.perf_counter()
             loss = model(
                 x_for_model,
@@ -1027,6 +1052,8 @@ while True:
                 logit_scale=args.sparse_logit_scale,
             )
             sparse_forward_call_ms += (time.perf_counter() - forward_t0) * 1000.0
+            if device_type == "cuda" and micro_step == 0:
+                sparse_peak_mem_after_forward = max(sparse_peak_mem_after_forward, get_max_memory() / (1024**2))
         else:
             forward_t0 = time.perf_counter()
             loss = model(current_x, current_y)
@@ -1259,6 +1286,10 @@ while True:
                 f" cpu: {sparse_metrics.cpu_writeback_ms:.2f})"
                 f" | union_rows buffered: {sparse_metrics.grad_accum_queue_count:,}"
                 f" resident: {sparse_metrics.grad_accum_resident_count:,}"
+                f" | post_prep_python: {sparse_boundary_overhead_ms:.2f}"   # clean time between prepare_step() return and model() call
+                f" active_vocab_build: {sparse_prep_active_vocab_build_ms:.2f}"
+                f" persistent_slot: {sparse_prep_persistent_slot_ms:.2f}"
+                f" | mem_before_boundary: {sparse_peak_mem_before_prepare:.0f}MB after_fwd: {sparse_peak_mem_after_forward:.0f}MB"
                 f" | accum_rows queued: {sparse_accum_rows_queued:,}"
             )
             if sparse_prep_cpu_gather_ms > 0.0 or sparse_prep_h2d_enqueue_ms > 0.0 or sparse_prep_writeback_wait_ms > 0.0 or sparse_prep_prefetch_wait_ms > 0.0 or sparse_prep_prefetch_hits > 0:
@@ -1330,6 +1361,10 @@ while True:
                 "train/step_prepare_ms": sparse_prepare_ms,
                 "train/step_fwdbwd_ms": sparse_fwdbwd_ms,
                 "train/step_apply_call_ms": sparse_apply_call_ms,
+                "train/step_post_prep_python_ms": sparse_boundary_overhead_ms,  # clean Python work between prepare_step() and compiled model()
+                "train/step_persistent_slot_ms": sparse_prep_persistent_slot_ms,
+                "train/peak_mem_before_boundary_mib": sparse_peak_mem_before_prepare,
+                "train/peak_mem_after_forward_mib": sparse_peak_mem_after_forward,
             })
         if grad_norm is not None:
             log_data["train/grad_norm"] = grad_norm
