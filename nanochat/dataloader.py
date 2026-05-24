@@ -549,6 +549,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
     current_micro_idx = 0
     current_micro_entry = current_microsteps[current_micro_idx]
     buffered_next_step_entry = None
+    step_grad_accum_ids_cpu = None
 
     first_active_ids = torch.tensor(current_micro_entry["active_ids"], dtype=torch.long)
     if first_active_ids.numel() > u_max:
@@ -703,13 +704,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         active_slot_ids_cpu = torch.nonzero(active_mask_cpu, as_tuple=False).flatten()
         active_ids_cpu = slot_to_global[active_slot_ids_cpu]
 
-        grad_accum_ids_cpu = active_ids_cpu.clone()
+        grad_accum_ids_cpu = active_ids_cpu
         accum_steps = 1
         micro_step_index = 0
         targets_union_cpu_local = None
         inputs_union_cpu_local = None
         if manifest_version >= 2:
-            grad_accum_ids_cpu = torch.tensor(current_step_entry["grad_accum_active_ids"], dtype=torch.long)
+            if step_grad_accum_ids_cpu is None:
+                step_grad_accum_ids_cpu = torch.tensor(
+                    current_step_entry["grad_accum_active_ids"], dtype=torch.long
+                )
+            grad_accum_ids_cpu = step_grad_accum_ids_cpu
             accum_steps = len(current_microsteps)
             micro_step_index = current_micro_idx
             grad_accum_global_to_slot = torch.full((vocab_size,), -1, dtype=torch.long)
@@ -770,7 +775,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
             "writeback_ids_cpu": current_leaving_ids.clone(),
             "writeback_slot_ids_cpu": current_leaving_slots.clone(),
             "is_last_step": manifest_step == num_manifest_steps - 1,
-            "grad_accum_ids_cpu": grad_accum_ids_cpu.clone(),
+            "grad_accum_ids_cpu": grad_accum_ids_cpu,
             "grad_accum_steps": accum_steps,
             "grad_accum_micro_step": micro_step_index,
             "is_grad_accum_boundary": micro_step_index == accum_steps - 1,
@@ -791,6 +796,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest(
         if manifest_step == num_manifest_steps - 1 and is_last_microstep:
             manifest_step += 1
             continue
+        if is_last_microstep:
+            step_grad_accum_ids_cpu = None
         if can_use_manifest_transition:
             current_new_ids, current_new_slots, _, _ = apply_manifest_transition(current_micro_entry)
         if not is_last_microstep:
