@@ -388,57 +388,6 @@ class DynamicVocabRuntime:
                 return row_lr
         return None
 
-    def _get_dense_cold_steps_cpu(self) -> torch.Tensor:
-        cold_steps_cpu = (self.runtime_step - self.last_seen_step_cpu - 1).clamp_min(0)
-        return cold_steps_cpu.masked_fill(self.last_seen_step_cpu < 0, 0)
-
-    def _compute_cold_logit_bias_cpu(
-        self,
-        cold_steps_cpu: torch.Tensor,
-        cold_bias_scale: float = 0.0,
-        cold_bias_tokens_per_step: Optional[int] = None,
-    ) -> torch.Tensor:
-        cold_bias, _, _ = self._compute_cold_logit_bias_with_stats_cpu(
-            cold_steps_cpu,
-            cold_bias_scale=cold_bias_scale,
-            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-        )
-        return cold_bias
-
-    def _compute_cold_logit_bias_with_stats_cpu(
-        self,
-        cold_steps_cpu: torch.Tensor,
-        cold_bias_scale: float = 0.0,
-        cold_bias_tokens_per_step: Optional[int] = None,
-    ) -> tuple[torch.Tensor, int, float]:
-        cold_steps_cpu = cold_steps_cpu.detach().to(device="cpu", dtype=torch.float32)
-        if cold_steps_cpu.numel() == 0:
-            return torch.empty(0, dtype=torch.float32), 0, 0.0
-        if cold_bias_scale <= 0.0 or cold_bias_tokens_per_step is None or cold_bias_tokens_per_step <= 0:
-            return torch.zeros_like(cold_steps_cpu), 0, 0.0
-        reference_tokens = max(self.cold_bias_reference_tokens, 1.0)
-        cold_tokens = cold_steps_cpu * float(cold_bias_tokens_per_step)
-        cold_bias = float(cold_bias_scale) * torch.log1p(cold_tokens / reference_tokens)
-        clamped_mask = (cold_bias < COLD_LOGIT_BIAS_CLAMP_MIN) | (cold_bias > COLD_LOGIT_BIAS_CLAMP_MAX)
-        cold_bias.clamp_(min=COLD_LOGIT_BIAS_CLAMP_MIN, max=COLD_LOGIT_BIAS_CLAMP_MAX)
-        cold_bias_abs_max = float(cold_bias.abs().max().item()) if cold_bias.numel() > 0 else 0.0
-        return cold_bias, int(clamped_mask.sum().item()), cold_bias_abs_max
-
-    def get_dense_cold_logit_bias(
-        self,
-        cold_bias_scale: float = 0.0,
-        cold_bias_tokens_per_step: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        if cold_bias_scale <= 0.0 or cold_bias_tokens_per_step is None or cold_bias_tokens_per_step <= 0:
-            return None
-        cold_steps_cpu = self._get_dense_cold_steps_cpu()
-        cold_bias_cpu = self._compute_cold_logit_bias_cpu(
-            cold_steps_cpu,
-            cold_bias_scale=cold_bias_scale,
-            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-        )
-        return cold_bias_cpu.to(self.device, non_blocking=self.use_cuda)
-
     def _empty_long_cpu(self) -> torch.Tensor:
         return torch.empty(0, dtype=torch.long)
 
@@ -1298,34 +1247,6 @@ class DynamicVocabRuntime:
         self._pending_stage_prefetch_key = id(active_ids_cpu)
         self._pending_stage_prefetch_future = self._stage_prefetch_executor.submit(self._prefetch_fixed_step_cpu_rows, requests)
 
-    @torch.no_grad()
-    def _apply_fixed_lm_head_cold_row_decay_(
-        self,
-        exempt_global_ids_cpu: torch.Tensor,
-        cold_row_decay: float,
-    ) -> None:
-        if cold_row_decay == 0.0:
-            return
-        vocab_size = int(self.model.config.vocab_size)
-        if vocab_size <= 0:
-            return
-        exempt_global_ids_cpu = exempt_global_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        if exempt_global_ids_cpu.numel() > 0:
-            valid_mask = (exempt_global_ids_cpu >= 0) & (exempt_global_ids_cpu < vocab_size)
-            exempt_global_ids_cpu = exempt_global_ids_cpu[valid_mask]
-            if exempt_global_ids_cpu.numel() > 1:
-                exempt_global_ids_cpu = torch.unique(exempt_global_ids_cpu)
-        if exempt_global_ids_cpu.numel() >= vocab_size:
-            return
-        self._flush_pending_cpu_writeback()
-        lm_head_param = self.table_specs["lm_head"]["param"]
-        restore_rows = None
-        if exempt_global_ids_cpu.numel() > 0:
-            restore_rows = lm_head_param.index_select(0, exempt_global_ids_cpu).clone()
-        lm_head_param.narrow(0, 0, vocab_size).mul_(1.0 - float(cold_row_decay))
-        if restore_rows is not None:
-            lm_head_param.index_copy_(0, exempt_global_ids_cpu, restore_rows)
-
     def _get_cpu_receive_buffer(
         self,
         name: str,
@@ -1354,20 +1275,10 @@ class DynamicVocabRuntime:
     def _prepare_dynamic_step(
         self,
         active_ids_cpu: torch.Tensor,
-        cold_bias_scale: float = 0.0,
-        cold_row_decay: float = 0.0,
-        cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
-        if cold_row_decay != 0.0:
-            raise ValueError("sparse cold-row adjustment currently requires fixed-U sparse mode")
         self._flush_pending_cpu_writeback()
         active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
         cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
-        cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
-            cold_steps_cpu,
-            cold_bias_scale=cold_bias_scale,
-            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-        )
         cpu_rows = {}
         cpu_exp_avg = {}
         cpu_exp_avg_sq = {}
@@ -1403,8 +1314,6 @@ class DynamicVocabRuntime:
                 if name.startswith("value_embeds.")
             },
         }
-        if cold_bias_scale > 0.0:
-            active_vocab["cold_logit_bias"] = cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda)
         optimizer_state = {
             name: {
                 "exp_avg": gpu_exp_avg[name],
@@ -1420,17 +1329,12 @@ class DynamicVocabRuntime:
             live_count=active_ids_cpu.numel(),
             u_capacity=active_ids_cpu.numel(),
             stage_count=active_ids_cpu.numel(),
-            cold_bias_clamped_count=cold_bias_clamped_count,
-            cold_bias_abs_max=cold_bias_abs_max,
             hot_activation_counts_cpu=hot_activation_counts_cpu,
         )
 
     def _prepare_fixed_step(
         self,
         step_meta: dict,
-        cold_bias_scale: float = 0.0,
-        cold_row_decay: float = 0.0,
-        cold_bias_tokens_per_step: Optional[int] = None,
         prefetched_stage: Optional[dict[str, dict]] = None,
         prefetched_wait_ms: float = 0.0,
         prefetched_hit: int = 0,
@@ -1444,18 +1348,12 @@ class DynamicVocabRuntime:
         active_slot_ids_cpu = step_meta["active_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
         union_inputs_cpu_local = step_meta.get("inputs_union_cpu_local")
         union_targets_cpu_local = step_meta.get("targets_union_cpu_local")
-        warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
-        cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
-        random_fill_ids_cpu = step_meta.get("random_fill_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
-
-        # SAFETY ASSERTION (Phase 0 of cloud/cold removal):
-        # In the supported manifest-driven fixed-U path the dataloader never emits cloud ids.
-        # Non-empty values here would indicate stale code or incorrect step_meta construction.
-        if warm_ids_cpu.numel() > 0 or cold_ids_cpu.numel() > 0:
-            raise AssertionError(
-                f"Non-empty cloud ids reached _prepare_fixed_step: warm={warm_ids_cpu.numel()}, cold={cold_ids_cpu.numel()}. "
-                "This path should be dead after cloud removal."
-            )
+        # Cloud/warm/cold ids from step_meta are no longer supported (dead experimental code).
+        # The dataloader and manifest path never produce them.
+        warm_ids_cpu = self._empty_long_cpu()
+        cold_ids_cpu = self._empty_long_cpu()
+        random_fill_ids_cpu = self._empty_long_cpu()
+        cloud_ids_cpu = self._empty_long_cpu()
 
         union_input_tables = grad_accum_steps > 1
         preserve_resident_grads = (
@@ -1507,31 +1405,10 @@ class DynamicVocabRuntime:
                 cold_steps_cpu = union_cold_steps_cpu.index_select(0, active_union_row_ids_cpu)
         else:
             cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
+        # Cold logit bias computation removed (dead experimental feature).
         current_cold_logit_bias_cpu = self._empty_long_cpu().to(dtype=torch.float32)
         cold_bias_clamped_count = 0
         cold_bias_abs_max = 0.0
-        if grad_accum_steps > 1:
-            if not preserve_resident_grads:
-                current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
-                    union_cold_steps_cpu,
-                    cold_bias_scale=cold_bias_scale,
-                    cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-                )
-                self._grad_accum_window_cold_logit_bias_cpu = current_cold_logit_bias_cpu.clone()
-                self._grad_accum_window_cold_bias_clamped_count = cold_bias_clamped_count
-                self._grad_accum_window_cold_bias_abs_max = cold_bias_abs_max
-            else:
-                if self._grad_accum_window_cold_logit_bias_cpu is None:
-                    raise RuntimeError("Sparse grad accumulation cold-bias cache is missing for resident window")
-                current_cold_logit_bias_cpu = self._grad_accum_window_cold_logit_bias_cpu
-                cold_bias_clamped_count = self._grad_accum_window_cold_bias_clamped_count
-                cold_bias_abs_max = self._grad_accum_window_cold_bias_abs_max
-        else:
-            current_cold_logit_bias_cpu, cold_bias_clamped_count, cold_bias_abs_max = self._compute_cold_logit_bias_with_stats_cpu(
-                cold_steps_cpu,
-                cold_bias_scale=cold_bias_scale,
-                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
-            )
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
         manifest_fixed_u_max = int(slot_to_global_cpu.numel())
@@ -1886,9 +1763,6 @@ class DynamicVocabRuntime:
             self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
             self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
 
-        if cold_row_decay != 0.0 and (grad_accum_steps == 1 or not preserve_resident_grads):
-            self._apply_fixed_lm_head_cold_row_decay_(next_step_lm_head_ids_cpu, cold_row_decay)
-
         self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         assert self.fixed_input_slot_to_global_cpu is not None
         if not _used_persistent_input_slots and not (grad_accum_steps > 1 and not self.disable_fixed_overlap_reuse and preserve_resident_grads):
@@ -1934,19 +1808,7 @@ class DynamicVocabRuntime:
             if cloud_slot_ids_cpu.numel() > 0 and (grad_accum_steps == 1 or not preserve_resident_grads):
                 cloud_slot_ids_device = cloud_slot_ids_cpu.to(self.device)
                 self.fixed_logit_mask.index_fill_(0, cloud_slot_ids_device, True)
-        use_cold_logit_bias = cold_bias_scale > 0.0
-        if use_cold_logit_bias:
-            if grad_accum_steps > 1:
-                self.fixed_cold_logit_bias.zero_()
-                if current_cold_logit_bias_cpu.numel() > 0:
-                    self.fixed_cold_logit_bias[:current_cold_logit_bias_cpu.numel()].copy_(
-                        current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda)
-                    )
-            else:
-                self.fixed_cold_logit_bias.zero_()
-                if active_slot_ids_cpu.numel() > 0:
-                    bias_slot_ids_device = active_slot_ids_cpu.to(self.device)
-                    self.fixed_cold_logit_bias.index_copy_(0, bias_slot_ids_device, current_cold_logit_bias_cpu.to(self.device, non_blocking=self.use_cuda))
+        # Cold logit bias support removed (dead experimental feature).
         self._fixed_live_state = True
         prep_logit_mask_ms = (time.perf_counter() - _t0_logit_mask) * 1000.0
 
@@ -1971,17 +1833,11 @@ class DynamicVocabRuntime:
             "lm_head": self.fixed_active_vocab["lm_head"],
         }
         if grad_accum_steps > 1:
-            if use_cold_logit_bias:
-                step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias
-            else:
-                step_active_vocab.pop("cold_logit_bias", None)
             if use_logit_mask:
                 step_active_vocab["logit_mask"] = self.fixed_logit_mask
         else:
             if use_logit_mask:
                 step_active_vocab["logit_mask"] = self.fixed_logit_mask
-            if use_cold_logit_bias:
-                step_active_vocab["cold_logit_bias"] = self.fixed_cold_logit_bias
         step_optimizer_state = {
             **self.fixed_optimizer_state,
         }
@@ -2035,18 +1891,7 @@ class DynamicVocabRuntime:
     def prepare_step(
         self,
         active_ids_cpu,
-        cold_bias_scale: float = 0.0,
-        cold_row_decay: float = 0.0,
-        cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
-        # Phase 0 guard: cold bias / row decay are dead experimental features.
-        # They are never passed from the current training loop (base_train.py calls with defaults only).
-        if cold_bias_scale != 0.0 or cold_row_decay != 0.0 or (cold_bias_tokens_per_step is not None and cold_bias_tokens_per_step > 0):
-            raise RuntimeError(
-                "Cold bias / cold_row_decay parameters are deprecated dead code and are being removed. "
-                "Do not pass non-zero values."
-            )
-
         if isinstance(active_ids_cpu, dict):
             prefetched_stage = None
             prefetch_wait_ms = 0.0
@@ -2060,18 +1905,12 @@ class DynamicVocabRuntime:
                 self._pending_stage_prefetch_key = None
             return self._prepare_fixed_step(
                 active_ids_cpu,
-                cold_bias_scale=cold_bias_scale,
-                cold_row_decay=cold_row_decay,
-                cold_bias_tokens_per_step=cold_bias_tokens_per_step,
                 prefetched_stage=prefetched_stage,
                 prefetched_wait_ms=prefetch_wait_ms,
                 prefetched_hit=prefetch_hit,
             )
         return self._prepare_dynamic_step(
             active_ids_cpu,
-            cold_bias_scale=cold_bias_scale,
-            cold_row_decay=cold_row_decay,
-            cold_bias_tokens_per_step=cold_bias_tokens_per_step,
         )
 
     def _adamw_update_(
