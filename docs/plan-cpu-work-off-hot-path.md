@@ -216,10 +216,15 @@ Because intermediate runnable states are not required:
 
 ---
 
+**Implementation status** (branch `cursor/cpu-work-phase2-prefetch-58ac`):
+
+- **Phase 1**: Done (merged via `cursor/cpu-work-phase1-58ac`).
+- **Phase 2**: `PersistentSlotUpdate` + `_plan_persistent_slot_update_cpu` / `_apply_persistent_slot_update_cpu` (compute/apply split).
+- **Phase 3**: Persistent-slot prefetch re-enabled in `prefetch_step` for next-window microstep 0.
+
 **Next step decision point** (for the implementer):
 
-- Start with **Phase 0** (instrumentation + baseline capture)?
-- Jump straight to **Phase 1** (cheap per-micro wins)?
-- Begin detailed design + implementation of **Phase 2** (side-effect-free persistent slot refactor) first, since it unblocks the largest remaining gain?
+- **Phase 0** baseline capture on a real manifest run with `--sparse-debug-timing`?
+- **Phase 4** dataloader / manifest hoisting?
 
 This plan is deliberately phased so that valuable progress can be made (and measured) even if later, higher-risk phases are rolled back.
