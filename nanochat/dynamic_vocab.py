@@ -80,8 +80,6 @@ class DynamicVocabStep:
     writeback_count: int = 0
     # Note: cloud/warm/cold/hard_negative/random_fill + associated timing fields removed
     # (dead experimental code from warm/cold cloud and cold logit bias experiments).
-    cold_bias_clamped_count: int = 0
-    cold_bias_abs_max: float = 0.0
     hot_activation_counts_cpu: Optional[torch.Tensor] = None
     active_slot_ids_cpu: Optional[torch.Tensor] = None
     active_mask_cpu: Optional[torch.Tensor] = None
@@ -200,7 +198,6 @@ class DynamicVocabRuntime:
         self.fixed_optimizer_state = {}
         self.fixed_active_vocab = None
         self.fixed_logit_mask = None
-        self.fixed_cold_logit_bias = None
         self.fixed_slot_to_global_cpu = None
         self.fixed_input_slot_to_global_cpu = None
         self.fixed_lm_head_slot_to_global_cpu = None
@@ -256,7 +253,6 @@ class DynamicVocabRuntime:
                     "exp_avg_sq": torch.zeros(shape, device=self.device, dtype=param.dtype),
                 }
             self.fixed_logit_mask = torch.zeros(self.lm_head_u_max, dtype=torch.bool, device=self.device)
-            self.fixed_cold_logit_bias = torch.zeros(self.lm_head_u_max, dtype=torch.float32, device=self.device)
             self.fixed_active_vocab = {
                 "wte": self.fixed_params["wte"],
                 "lm_head": self.fixed_params["lm_head"],
@@ -1372,10 +1368,6 @@ class DynamicVocabRuntime:
                 cold_steps_cpu = union_cold_steps_cpu.index_select(0, active_union_row_ids_cpu)
         else:
             cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
-        # Cold logit bias computation removed (dead experimental feature).
-        current_cold_logit_bias_cpu = self._empty_long_cpu().to(dtype=torch.float32)
-        cold_bias_clamped_count = 0
-        cold_bias_abs_max = 0.0
         active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
         slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
         manifest_fixed_u_max = int(slot_to_global_cpu.numel())
@@ -1415,7 +1407,6 @@ class DynamicVocabRuntime:
         assert self.fixed_active_mask_cpu is not None
         assert self.fixed_logit_mask is not None
         assert self.fixed_active_vocab is not None
-        assert self.fixed_cold_logit_bias is not None
 
         if not self._fixed_live_state:
             stage_ids_cpu = active_ids_cpu
@@ -1762,8 +1753,6 @@ class DynamicVocabRuntime:
             is_grad_accum_boundary=is_grad_accum_boundary,
             is_last_step=is_last_step,
             fixed_u_mode=True,
-            cold_bias_clamped_count=cold_bias_clamped_count,
-            cold_bias_abs_max=cold_bias_abs_max,
             hot_activation_counts_cpu=hot_activation_counts_cpu,
             prep_writeback_wait_ms=prep_writeback_wait_ms,
             prep_prefetch_wait_ms=prep_prefetch_wait_ms,
