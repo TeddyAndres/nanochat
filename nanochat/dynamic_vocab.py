@@ -278,6 +278,17 @@ class DynamicVocabRuntime:
             self._grad_accum_wte_local_to_slot_cpu = torch.full(
                 (self.grad_accum_u_max,), -1, dtype=torch.long
             )
+            self._grad_accum_union_slot_remap_active = False
+            self._grad_accum_slot_positions_cpu = torch.arange(self.grad_accum_u_max, dtype=torch.long)
+            self._prev_lm_head_global_to_row_cpu = torch.full(
+                (self.model.config.vocab_size,), -1, dtype=torch.long
+            )
+            self._prev_lm_head_global_to_slot_cpu = torch.full(
+                (self.model.config.vocab_size,), -1, dtype=torch.long
+            )
+            self._grad_accum_global_to_local_work_cpu = torch.full(
+                (self.model.config.vocab_size,), -1, dtype=torch.long
+            )
             # Persistent inverse map: global_id → slot_id, maintained incrementally across windows
             # to avoid per-step torch.full((vocab_size,), -1) scatter-map rebuilds in the hot path.
             self._fixed_input_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
@@ -304,6 +315,10 @@ class DynamicVocabRuntime:
                     for name in self.fixed_params
                     if name.startswith("value_embeds.")
                 },
+            }
+            self._fixed_active_vocab_with_logit_mask = {
+                **self.fixed_active_vocab,
+                "logit_mask": self.fixed_logit_mask,
             }
 
     def state_dict(self):
@@ -422,6 +437,81 @@ class DynamicVocabRuntime:
 
     def _empty_long_cpu(self) -> torch.Tensor:
         return torch.empty(0, dtype=torch.long)
+
+    def _as_cpu_long(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu" and tensor.dtype == torch.long:
+            return tensor
+        return tensor.detach().to(device="cpu", dtype=torch.long)
+
+    def _as_cpu_bool(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu" and tensor.dtype == torch.bool:
+            return tensor
+        return tensor.detach().to(device="cpu", dtype=torch.bool)
+
+    def _grad_accum_slot_positions_view(self, count: int) -> torch.Tensor:
+        if count <= 0:
+            return self._empty_long_cpu()
+        return self._grad_accum_slot_positions_cpu[:count]
+
+    def _grad_accum_slot_positions_unique(self, count: int) -> torch.Tensor:
+        if count <= 0:
+            return self._empty_long_cpu()
+        return self._grad_accum_slot_positions_cpu[:count].clone()
+
+    def _same_grad_accum_window_ids(self, grad_accum_ids_cpu: torch.Tensor) -> bool:
+        if not self._grad_accum_live or self._grad_accum_ids_cpu is None:
+            return False
+        if grad_accum_ids_cpu is self._grad_accum_ids_cpu:
+            return True
+        return bool(self._grad_accum_ids_cpu.equal(grad_accum_ids_cpu))
+
+    def _align_slot_to_global_cpu(self, slot_to_global_cpu: torch.Tensor) -> torch.Tensor:
+        manifest_u = int(slot_to_global_cpu.numel())
+        if manifest_u > self.fixed_u_max:
+            raise ValueError(
+                f"Manifest fixed-U metadata exceeds runtime capacity: manifest_u_max={manifest_u}, runtime_fixed_u_max={self.fixed_u_max}"
+            )
+        slot_to_global_cpu = self._as_cpu_long(slot_to_global_cpu)
+        assert self.fixed_slot_to_global_cpu is not None
+        if manifest_u == self.fixed_u_max:
+            return slot_to_global_cpu
+        self.fixed_slot_to_global_cpu.fill_(-1)
+        if manifest_u > 0:
+            self.fixed_slot_to_global_cpu[:manifest_u].copy_(slot_to_global_cpu)
+        return self.fixed_slot_to_global_cpu
+
+    def _align_active_mask_cpu(self, active_mask_cpu: torch.Tensor) -> torch.Tensor:
+        manifest_u = int(active_mask_cpu.numel())
+        active_mask_cpu = self._as_cpu_bool(active_mask_cpu)
+        assert self.fixed_active_mask_cpu is not None
+        if manifest_u == self.fixed_u_max:
+            return active_mask_cpu
+        self.fixed_active_mask_cpu.zero_()
+        if manifest_u > 0:
+            self.fixed_active_mask_cpu[:manifest_u].copy_(active_mask_cpu)
+        return self.fixed_active_mask_cpu
+
+    def _fill_prev_lm_head_global_to_row_cpu(
+        self,
+        prev_lm_head_ids_cpu: torch.Tensor,
+        prev_lm_head_slot_ids_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        buf = self._prev_lm_head_global_to_row_cpu
+        buf.fill_(-1)
+        if prev_lm_head_ids_cpu.numel() > 0:
+            buf[prev_lm_head_ids_cpu] = self._grad_accum_slot_positions_view(prev_lm_head_ids_cpu.numel())
+        return buf
+
+    def _fill_prev_lm_head_global_to_slot_cpu(
+        self,
+        prev_lm_head_ids_cpu: torch.Tensor,
+        prev_lm_head_slot_ids_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        buf = self._prev_lm_head_global_to_slot_cpu
+        buf.fill_(-1)
+        if prev_lm_head_ids_cpu.numel() > 0:
+            buf[prev_lm_head_ids_cpu] = prev_lm_head_slot_ids_cpu
+        return buf
 
     def _update_token_counts_from_local_batch(self, step_meta: dict) -> None:
         inputs_cpu_local = step_meta.get("inputs_cpu_local")
@@ -560,7 +650,9 @@ class DynamicVocabRuntime:
             self.fixed_input_slot_to_global_cpu.fill_(-1)
         if self._fixed_input_global_to_slot_cpu is not None:
             self._fixed_input_global_to_slot_cpu.fill_(-1)
-        self._grad_accum_wte_local_to_slot_cpu = None
+        if self._grad_accum_wte_local_to_slot_cpu is not None:
+            self._grad_accum_wte_local_to_slot_cpu.fill_(-1)
+        self._grad_accum_union_slot_remap_active = False
         if self.fixed_active_mask_cpu is not None:
             self.fixed_active_mask_cpu.zero_()
         if self.fixed_logit_mask is not None:
@@ -751,7 +843,7 @@ class DynamicVocabRuntime:
         self._grad_accum_pending_transfers.append(pending)
 
     def _start_grad_accum_window(self, grad_accum_ids_cpu: torch.Tensor):
-        grad_accum_ids_cpu = grad_accum_ids_cpu.detach().to(device="cpu", dtype=torch.long)
+        grad_accum_ids_cpu = self._as_cpu_long(grad_accum_ids_cpu)
         grad_accum_count = int(grad_accum_ids_cpu.numel())
         capacity = self.grad_accum_u_max if self.grad_accum_u_max > 0 else grad_accum_count
         if grad_accum_count > capacity:
@@ -760,9 +852,10 @@ class DynamicVocabRuntime:
             )
         self._grad_accum_ids_cpu = grad_accum_ids_cpu
         self._grad_accum_count = grad_accum_count
-        global_to_local = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
+        global_to_local = self._grad_accum_global_to_local_work_cpu
+        global_to_local.fill_(-1)
         if grad_accum_count > 0:
-            global_to_local[grad_accum_ids_cpu] = torch.arange(grad_accum_count, dtype=torch.long)
+            global_to_local[grad_accum_ids_cpu] = self._grad_accum_slot_positions_view(grad_accum_count)
         self._grad_accum_global_to_local_cpu = global_to_local
         self._ensure_grad_accum_buffers(capacity)
         assert self._grad_accum_buffers is not None
@@ -1173,10 +1266,10 @@ class DynamicVocabRuntime:
         return gpu_buffer, gather_ms, enqueue_ms, stage_buffer.numel() * stage_buffer.element_size()
 
     def _build_fixed_prefetch_requests(self, step_meta: dict) -> dict[str, torch.Tensor]:
-        active_ids_cpu = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        grad_accum_ids_cpu = step_meta.get("grad_accum_ids_cpu", active_ids_cpu).detach().to(device="cpu", dtype=torch.long)
+        active_ids_cpu = self._as_cpu_long(step_meta["active_ids_cpu"])
+        grad_accum_ids_cpu = self._as_cpu_long(step_meta.get("grad_accum_ids_cpu", active_ids_cpu))
         grad_accum_steps = int(step_meta.get("grad_accum_steps", 1))
-        stage_ids_cpu = step_meta["stage_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        stage_ids_cpu = self._as_cpu_long(step_meta["stage_ids_cpu"])
         warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cloud_ids_cpu = torch.cat((warm_ids_cpu, cold_ids_cpu)) if warm_ids_cpu.numel() > 0 or cold_ids_cpu.numel() > 0 else self._empty_long_cpu()
@@ -1201,8 +1294,9 @@ class DynamicVocabRuntime:
                 prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
                 if prev_lm_head_slot_ids_cpu.numel() > 0:
                     prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
-                    prev_lm_head_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-                    prev_lm_head_global_to_slot_cpu[prev_lm_head_ids_cpu] = prev_lm_head_slot_ids_cpu
+                    prev_lm_head_global_to_slot_cpu = self._fill_prev_lm_head_global_to_slot_cpu(
+                        prev_lm_head_ids_cpu, prev_lm_head_slot_ids_cpu
+                    )
                     reused_old_slot_ids_cpu = prev_lm_head_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
                     lm_head_ids_cpu = grad_accum_ids_cpu[reused_old_slot_ids_cpu < 0]
         else:
@@ -1335,16 +1429,14 @@ class DynamicVocabRuntime:
             result["_used_persistent_input_slots"] = True
 
             # local_to_slot for union remap
-            if self._grad_accum_wte_local_to_slot_cpu is None:
-                self._grad_accum_wte_local_to_slot_cpu = torch.full(
-                    (self.grad_accum_u_max,), -1, dtype=torch.long
-                )
             n = grad_accum_ids_cpu.numel()
+            assert self._grad_accum_wte_local_to_slot_cpu is not None
             self._grad_accum_wte_local_to_slot_cpu[:n] = self._fixed_input_global_to_slot_cpu.index_select(
                 0, grad_accum_ids_cpu
             )
             if n < self.grad_accum_u_max:
                 self._grad_accum_wte_local_to_slot_cpu[n:].fill_(-1)
+            self._grad_accum_union_slot_remap_active = True
 
             # lm_head deferred writeback detection
             prev_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
@@ -1352,8 +1444,9 @@ class DynamicVocabRuntime:
             deferred_lm_head_writeback_slot_ids_cpu = self._empty_long_cpu()
             if prev_lm_head_slot_ids_cpu.numel() > 0:
                 prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
-                prev_lm_head_global_to_row_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-                prev_lm_head_global_to_row_cpu[prev_lm_head_ids_cpu] = torch.arange(prev_lm_head_ids_cpu.numel(), dtype=torch.long)
+                prev_lm_head_global_to_row_cpu = self._fill_prev_lm_head_global_to_row_cpu(
+                    prev_lm_head_ids_cpu, prev_lm_head_slot_ids_cpu
+                )
                 kept_prev_lm_head_rows_cpu = prev_lm_head_global_to_row_cpu.index_select(0, grad_accum_ids_cpu)
                 kept_prev_lm_head_mask_cpu = torch.zeros(prev_lm_head_slot_ids_cpu.numel(), dtype=torch.bool)
                 valid_prev_lm_head_mask_cpu = kept_prev_lm_head_rows_cpu >= 0
@@ -1382,11 +1475,13 @@ class DynamicVocabRuntime:
         the row prefetch already receives. This is the entry point we will
         call from prefetch_step for the *next* window.
         """
-        grad_accum_ids_cpu = step_meta.get("grad_accum_ids_cpu", step_meta["active_ids_cpu"]).detach().to(device="cpu", dtype=torch.long)
+        grad_accum_ids_cpu = self._as_cpu_long(step_meta.get("grad_accum_ids_cpu", step_meta["active_ids_cpu"]))
         preserve_resident_grads = bool(step_meta.get("preserve_resident_grads", False))
         union_input_tables = bool(step_meta.get("union_input_tables", False))
-        stage_ids_cpu = step_meta.get("stage_ids_cpu", grad_accum_ids_cpu).detach().to(device="cpu", dtype=torch.long)
-        stage_slot_ids_cpu = step_meta.get("stage_slot_ids_cpu", torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long))
+        stage_ids_cpu = self._as_cpu_long(step_meta.get("stage_ids_cpu", grad_accum_ids_cpu))
+        stage_slot_ids_cpu = self._as_cpu_long(
+            step_meta.get("stage_slot_ids_cpu", self._grad_accum_slot_positions_unique(grad_accum_ids_cpu.numel()))
+        )
 
         return self._compute_persistent_slot_state_cpu(
             grad_accum_ids_cpu=grad_accum_ids_cpu,
@@ -1512,28 +1607,17 @@ class DynamicVocabRuntime:
         prefetched_persistent_slot_hit: int = 0,
     ) -> DynamicVocabStep:
         assert self.fixed_u_mode, "Fixed-U step requested without fixed_u_max runtime configuration"
-        active_ids_cpu = step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        grad_accum_ids_cpu = step_meta.get("grad_accum_ids_cpu", active_ids_cpu).detach().to(device="cpu", dtype=torch.long)
+        active_ids_cpu = self._as_cpu_long(step_meta["active_ids_cpu"])
+        grad_accum_ids_cpu = self._as_cpu_long(step_meta.get("grad_accum_ids_cpu", active_ids_cpu))
         grad_accum_steps = int(step_meta.get("grad_accum_steps", 1))
         grad_accum_micro_step = int(step_meta.get("grad_accum_micro_step", 0))
         is_grad_accum_boundary = bool(step_meta.get("is_grad_accum_boundary", True))
-        active_slot_ids_cpu = step_meta["active_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        active_slot_ids_cpu = self._as_cpu_long(step_meta["active_slot_ids_cpu"])
         union_inputs_cpu_local = step_meta.get("inputs_union_cpu_local")
         union_targets_cpu_local = step_meta.get("targets_union_cpu_local")
-        # Cloud/warm/cold ids from step_meta are no longer supported (dead experimental code).
-        # The dataloader and manifest path never produce them.
-        warm_ids_cpu = self._empty_long_cpu()
-        cold_ids_cpu = self._empty_long_cpu()
-        random_fill_ids_cpu = self._empty_long_cpu()
-        cloud_ids_cpu = self._empty_long_cpu()
 
         union_input_tables = grad_accum_steps > 1
-        preserve_resident_grads = (
-            grad_accum_steps > 1 and
-            self._grad_accum_live and
-            self._grad_accum_ids_cpu is not None and
-            torch.equal(self._grad_accum_ids_cpu, grad_accum_ids_cpu)
-        )
+        preserve_resident_grads = grad_accum_steps > 1 and self._same_grad_accum_window_ids(grad_accum_ids_cpu)
         if self.disable_fixed_overlap_reuse and grad_accum_steps > 1 and not preserve_resident_grads and self._fixed_live_state:
             self.flush_active_to_cpu()
             self._fixed_live_state = False
@@ -1542,9 +1626,9 @@ class DynamicVocabRuntime:
         # Cloud/warm/cold grad accum caches removed (dead experimental code).
         # We only keep hot activation counts for the still-supported first-hot unembedding LR feature.
         active_union_row_ids_cpu = self._empty_long_cpu()
-        union_cold_steps_cpu = self._empty_long_cpu().to(dtype=torch.long)
-        cold_steps_cpu = self._empty_long_cpu().to(dtype=torch.long)
-        hot_activation_counts_cpu = self._empty_long_cpu().to(dtype=torch.long)
+        union_cold_steps_cpu = self._empty_long_cpu()
+        cold_steps_cpu = self._empty_long_cpu()
+        hot_activation_counts_cpu = self._empty_long_cpu()
         if grad_accum_steps > 1:
             assert self._grad_accum_global_to_local_cpu is not None
             if active_ids_cpu.numel() > 0:
@@ -1565,38 +1649,19 @@ class DynamicVocabRuntime:
                 cold_steps_cpu = union_cold_steps_cpu.index_select(0, active_union_row_ids_cpu)
         else:
             cold_steps_cpu, hot_activation_counts_cpu = self._capture_cold_steps_cpu(active_ids_cpu)
-        active_mask_cpu = step_meta["active_mask_cpu"].detach().to(device="cpu", dtype=torch.bool)
-        slot_to_global_cpu = step_meta["slot_to_global_cpu"].detach().to(device="cpu", dtype=torch.long)
-        manifest_fixed_u_max = int(slot_to_global_cpu.numel())
-        if manifest_fixed_u_max > self.fixed_u_max:
-            raise ValueError(
-                f"Manifest fixed-U metadata exceeds runtime capacity: manifest_u_max={manifest_fixed_u_max}, runtime_fixed_u_max={self.fixed_u_max}"
-            )
-        if manifest_fixed_u_max < self.fixed_u_max:
-            padded_slot_to_global_cpu = torch.full((self.fixed_u_max,), -1, dtype=torch.long)
-            padded_slot_to_global_cpu[:manifest_fixed_u_max].copy_(slot_to_global_cpu)
-            slot_to_global_cpu = padded_slot_to_global_cpu
-
-            padded_active_mask_cpu = torch.zeros(self.fixed_u_max, dtype=torch.bool)
-            padded_active_mask_cpu[:manifest_fixed_u_max].copy_(active_mask_cpu)
-            active_mask_cpu = padded_active_mask_cpu
-        stage_ids_cpu = step_meta["stage_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        stage_slot_ids_cpu = step_meta["stage_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        writeback_ids_cpu = step_meta["writeback_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        writeback_slot_ids_cpu = step_meta["writeback_slot_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
+        active_mask_cpu = self._align_active_mask_cpu(step_meta["active_mask_cpu"])
+        slot_to_global_cpu = self._align_slot_to_global_cpu(step_meta["slot_to_global_cpu"])
+        stage_ids_cpu = self._as_cpu_long(step_meta["stage_ids_cpu"])
+        stage_slot_ids_cpu = self._as_cpu_long(step_meta["stage_slot_ids_cpu"])
+        writeback_ids_cpu = self._as_cpu_long(step_meta["writeback_ids_cpu"])
+        writeback_slot_ids_cpu = self._as_cpu_long(step_meta["writeback_slot_ids_cpu"])
         is_last_step = bool(step_meta["is_last_step"])
-        # Cloud allocation logic removed (dead experimental code - clouds are never used in current manifest fixed-U path).
-        # Since lm_head_u_max == fixed_u_max and no clouds, lm_head active set == regular active set.
-        cloud_ids_cpu = self._empty_long_cpu()
         cloud_slot_ids_cpu = self._empty_long_cpu()
-        cloud_stage_ids_cpu = self._empty_long_cpu()
-        cloud_stage_slot_ids_cpu = self._empty_long_cpu()
-        cloud_writeback_ids_cpu = self._empty_long_cpu()
-        cloud_writeback_slot_ids_cpu = self._empty_long_cpu()
-        warm_slot_ids_cpu = self._empty_long_cpu()
-        cold_slot_ids_cpu = self._empty_long_cpu()
         lm_head_active_ids_cpu = grad_accum_ids_cpu if grad_accum_steps > 1 else active_ids_cpu
-        lm_head_active_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long) if grad_accum_steps > 1 else active_slot_ids_cpu
+        grad_accum_window_slot_positions_cpu = (
+            self._grad_accum_slot_positions_unique(grad_accum_ids_cpu.numel()) if grad_accum_steps > 1 else self._empty_long_cpu()
+        )
+        lm_head_active_slot_ids_cpu = grad_accum_window_slot_positions_cpu if grad_accum_steps > 1 else active_slot_ids_cpu
         next_step_lm_head_ids_cpu = grad_accum_ids_cpu if grad_accum_steps > 1 else lm_head_active_ids_cpu
 
         assert self.fixed_slot_to_global_cpu is not None
@@ -1610,7 +1675,7 @@ class DynamicVocabRuntime:
             stage_slot_ids_cpu = active_slot_ids_cpu
 
         grad_accum_stage_ids_cpu = grad_accum_ids_cpu
-        grad_accum_stage_slot_ids_cpu = torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+        grad_accum_stage_slot_ids_cpu = grad_accum_window_slot_positions_cpu
         prep_writeback_wait_ms = 0.0
         prep_prefetch_wait_ms = float(prefetched_wait_ms)
         prep_cpu_gather_ms = 0.0
@@ -1633,9 +1698,10 @@ class DynamicVocabRuntime:
         input_stage_slot_ids_cpu = stage_slot_ids_cpu
         if union_input_tables:
             input_stage_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else grad_accum_ids_cpu
-            input_stage_slot_ids_cpu = self._empty_long_cpu() if preserve_resident_grads else torch.arange(grad_accum_ids_cpu.numel(), dtype=torch.long)
+            input_stage_slot_ids_cpu = (
+                self._empty_long_cpu() if preserve_resident_grads else grad_accum_window_slot_positions_cpu
+            )
         _t0_cpu_map = time.perf_counter()
-        _t0_persistent_slot = time.perf_counter()  # NEW: for fine-grained prepare profiling
 
         # Prefer precomputed persistent slot state from the prefetch executor
         # (the goal of this work: heavy CPU map logic runs in the background
@@ -1670,8 +1736,9 @@ class DynamicVocabRuntime:
             prev_lm_head_slot_ids_cpu = torch.nonzero(prev_lm_head_slot_mask_cpu, as_tuple=False).flatten()
             if prev_lm_head_slot_ids_cpu.numel() > 0:
                 prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
-                prev_lm_head_global_to_slot_cpu = torch.full((self.model.config.vocab_size,), -1, dtype=torch.long)
-                prev_lm_head_global_to_slot_cpu[prev_lm_head_ids_cpu] = prev_lm_head_slot_ids_cpu
+                prev_lm_head_global_to_slot_cpu = self._fill_prev_lm_head_global_to_slot_cpu(
+                    prev_lm_head_ids_cpu, prev_lm_head_slot_ids_cpu
+                )
                 reused_old_slot_ids_cpu = prev_lm_head_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
                 reuse_mask_cpu = reused_old_slot_ids_cpu >= 0
                 # Writeback leaving lm_head tokens BEFORE the GPU→GPU reuse copy overwrites their slots.
@@ -1753,7 +1820,11 @@ class DynamicVocabRuntime:
             stage_suffix = f"fixed:{grad_accum_micro_step}:{name}"
             prefetched_entry = None if prefetched_stage is None else prefetched_stage.get(name)
             if prefetched_entry is not None:
-                if torch.equal(prefetched_entry["ids_cpu"], stage_ids_for_name):
+                prefetched_ids_cpu = prefetched_entry["ids_cpu"]
+                if (
+                    prefetched_ids_cpu.data_ptr() == stage_ids_for_name.data_ptr()
+                    or prefetched_ids_cpu.equal(stage_ids_for_name)
+                ):
                     rows_gpu, rows_enqueue_ms, rows_bytes = self._stage_prefetched_cpu_tensor_to_device(f"{stage_suffix}:param", prefetched_entry["param"])
                     exp_avg_gpu, exp_avg_enqueue_ms, exp_avg_bytes = self._stage_prefetched_cpu_tensor_to_device(f"{stage_suffix}:exp_avg", prefetched_entry["exp_avg"])
                     exp_avg_sq_gpu, exp_avg_sq_enqueue_ms, exp_avg_sq_bytes = self._stage_prefetched_cpu_tensor_to_device(f"{stage_suffix}:exp_avg_sq", prefetched_entry["exp_avg_sq"])
@@ -1798,13 +1869,16 @@ class DynamicVocabRuntime:
             self.fixed_optimizer_state[name]["exp_avg"].index_copy_(0, stage_slot_ids_device, exp_avg_gpu)
             self.fixed_optimizer_state[name]["exp_avg_sq"].index_copy_(0, stage_slot_ids_device, exp_avg_sq_gpu)
 
-        self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
+        if slot_to_global_cpu is not self.fixed_slot_to_global_cpu:
+            self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         assert self.fixed_input_slot_to_global_cpu is not None
         if not _used_persistent_input_slots and not (grad_accum_steps > 1 and not self.disable_fixed_overlap_reuse and preserve_resident_grads):
             # Non-persistent path (first step, disabled, or grad_accum_steps==1):
             # reset forward map to contiguous slot assignment. Slots are sequential (slot i = position i),
             # so no union_inputs remapping is needed — clear the cache.
-            self._grad_accum_wte_local_to_slot_cpu = None
+            if self._grad_accum_wte_local_to_slot_cpu is not None:
+                self._grad_accum_wte_local_to_slot_cpu.fill_(-1)
+            self._grad_accum_union_slot_remap_active = False
             self.fixed_input_slot_to_global_cpu.fill_(-1)
             if grad_accum_steps > 1:
                 if grad_accum_ids_cpu.numel() > 0:
@@ -1812,8 +1886,8 @@ class DynamicVocabRuntime:
                     if not self.disable_fixed_overlap_reuse:
                         # Initialize persistent inverse map so the next step can use stable slots.
                         self._fixed_input_global_to_slot_cpu.fill_(-1)
-                        self._fixed_input_global_to_slot_cpu[grad_accum_ids_cpu] = torch.arange(
-                            grad_accum_ids_cpu.numel(), dtype=torch.long
+                        self._fixed_input_global_to_slot_cpu[grad_accum_ids_cpu] = self._grad_accum_slot_positions_view(
+                            grad_accum_ids_cpu.numel()
                         )
             else:
                 self.fixed_input_slot_to_global_cpu[:self.fixed_u_max].copy_(slot_to_global_cpu)
@@ -1826,7 +1900,8 @@ class DynamicVocabRuntime:
         else:
             self.fixed_lm_head_slot_to_global_cpu.fill_(-1)
             self.fixed_lm_head_slot_to_global_cpu[:self.fixed_u_max].copy_(slot_to_global_cpu)
-        self.fixed_active_mask_cpu.copy_(active_mask_cpu)
+        if active_mask_cpu is not self.fixed_active_mask_cpu:
+            self.fixed_active_mask_cpu.copy_(active_mask_cpu)
         _t0_logit_mask = time.perf_counter()
         use_logit_mask = (grad_accum_steps > 1) or (lm_head_active_ids_cpu.numel() < self.lm_head_u_max)
         if use_logit_mask:
@@ -1838,9 +1913,6 @@ class DynamicVocabRuntime:
             else:
                 self.fixed_logit_mask.zero_()
                 self.fixed_logit_mask[:self.fixed_u_max].copy_(active_mask_cpu.to(self.device, non_blocking=self.use_cuda))
-            if cloud_slot_ids_cpu.numel() > 0 and (grad_accum_steps == 1 or not preserve_resident_grads):
-                cloud_slot_ids_device = cloud_slot_ids_cpu.to(self.device)
-                self.fixed_logit_mask.index_fill_(0, cloud_slot_ids_device, True)
         # Cold logit bias support removed (dead experimental feature).
         self._fixed_live_state = True
         prep_logit_mask_ms = (time.perf_counter() - _t0_logit_mask) * 1000.0
@@ -1848,34 +1920,24 @@ class DynamicVocabRuntime:
         _t0_union_io = time.perf_counter()
         union_inputs = None
         if union_inputs_cpu_local is not None and grad_accum_steps > 1:
-            _inputs_local = union_inputs_cpu_local
-            if self._grad_accum_wte_local_to_slot_cpu is not None:
+            _inputs_local = self._as_cpu_long(union_inputs_cpu_local)
+            if self._grad_accum_union_slot_remap_active:
                 # Persistent stable slots: remap local-position indices (0..n_local-1 within the
                 # current grad-accum union) to the stable GPU slot indices for the window.
                 # Eager CPU indexing only — see note at top of file (shapes vary; no compile win).
                 _inputs_local = self._grad_accum_wte_local_to_slot_cpu[_inputs_local]
-            union_inputs = _inputs_local.detach().to(self.device, non_blocking=self.use_cuda)
+            union_inputs = _inputs_local.to(self.device, non_blocking=self.use_cuda)
         union_targets = None
         if union_targets_cpu_local is not None and grad_accum_steps > 1:
-            union_targets = union_targets_cpu_local.detach().to(self.device, non_blocking=self.use_cuda)
+            union_targets = self._as_cpu_long(union_targets_cpu_local).to(self.device, non_blocking=self.use_cuda)
         prep_union_io_h2d_ms = (time.perf_counter() - _t0_union_io) * 1000.0
 
         _t0_active_vocab = time.perf_counter()
-        # Phase 1: Build active_vocab more explicitly (preparation for flattening the handoff later)
-        step_active_vocab = {
-            "wte": self.fixed_active_vocab["wte"],
-            "lm_head": self.fixed_active_vocab["lm_head"],
-            "value_embeds": self.fixed_active_vocab["value_embeds"],
-        }
-        if grad_accum_steps > 1:
-            if use_logit_mask:
-                step_active_vocab["logit_mask"] = self.fixed_logit_mask
+        if use_logit_mask:
+            step_active_vocab = self._fixed_active_vocab_with_logit_mask
         else:
-            if use_logit_mask:
-                step_active_vocab["logit_mask"] = self.fixed_logit_mask
-        step_optimizer_state = {
-            **self.fixed_optimizer_state,
-        }
+            step_active_vocab = self.fixed_active_vocab
+        step_optimizer_state = self.fixed_optimizer_state
         # New timer for compile boundary analysis: cost of building the dict passed into the compiled model
         prep_active_vocab_build_ms = (time.perf_counter() - _t0_active_vocab) * 1000.0
 
