@@ -78,16 +78,8 @@ class DynamicVocabStep:
     u_capacity: int = 0
     stage_count: int = 0
     writeback_count: int = 0
-    cloud_residual_capacity: int = 0
-    hard_negative_budget_target: int = 0
-    hard_negative_candidate_count: int = 0
-    warm_budget_target: int = 0
-    cold_budget_target: int = 0
-    warm_candidate_count: int = 0
-    random_fill_count: int = 0
-    cloud_plan_ms: float = 0.0
-    cloud_hidden_query_ms: float = 0.0
-    cloud_selection_ms: float = 0.0
+    # Note: cloud/warm/cold/hard_negative/random_fill + associated timing fields removed
+    # (dead experimental code from warm/cold cloud and cold logit bias experiments).
     cold_bias_clamped_count: int = 0
     cold_bias_abs_max: float = 0.0
     hot_activation_counts_cpu: Optional[torch.Tensor] = None
@@ -101,16 +93,6 @@ class DynamicVocabStep:
     grad_accum_ids_cpu: Optional[torch.Tensor] = None
     lm_head_active_ids_cpu: Optional[torch.Tensor] = None
     lm_head_active_slot_ids_cpu: Optional[torch.Tensor] = None
-    hard_negative_ids_cpu: Optional[torch.Tensor] = None
-    warm_ids_cpu: Optional[torch.Tensor] = None
-    warm_slot_ids_cpu: Optional[torch.Tensor] = None
-    cold_ids_cpu: Optional[torch.Tensor] = None
-    cold_slot_ids_cpu: Optional[torch.Tensor] = None
-    random_fill_ids_cpu: Optional[torch.Tensor] = None
-    cloud_stage_ids_cpu: Optional[torch.Tensor] = None
-    cloud_stage_slot_ids_cpu: Optional[torch.Tensor] = None
-    cloud_writeback_ids_cpu: Optional[torch.Tensor] = None
-    cloud_writeback_slot_ids_cpu: Optional[torch.Tensor] = None
     grad_accum_steps: int = 1
     grad_accum_micro_step: int = 0
     is_grad_accum_boundary: bool = True
@@ -499,441 +481,6 @@ class DynamicVocabRuntime:
         generator.manual_seed(int(seed) & ((1 << 63) - 1))
         sampled_indices_cpu = torch.randperm(candidate_ids_cpu.numel(), generator=generator)[:limit]
         return candidate_ids_cpu.index_select(0, sampled_indices_cpu)
-
-    def _get_resident_cloud_ids_cpu(self) -> torch.Tensor:
-        if not self.fixed_u_mode or not self._fixed_live_state:
-            return self._empty_long_cpu()
-        if self.fixed_lm_head_slot_to_global_cpu is None:
-            return self._empty_long_cpu()
-        cloud_slot_mask_cpu = self.fixed_lm_head_slot_to_global_cpu >= 0
-        if self.fixed_active_mask_cpu is not None:
-            cloud_slot_mask_cpu = cloud_slot_mask_cpu.clone()
-            cloud_slot_mask_cpu[:self.fixed_u_max] &= ~self.fixed_active_mask_cpu
-        cloud_slot_ids_cpu = torch.nonzero(cloud_slot_mask_cpu, as_tuple=False).flatten()
-        if cloud_slot_ids_cpu.numel() == 0:
-            return self._empty_long_cpu()
-        return self.fixed_lm_head_slot_to_global_cpu.index_select(0, cloud_slot_ids_cpu)
-
-    def _select_router_positions(self, query_count: int, max_positions: int) -> torch.Tensor:
-        if query_count <= 0:
-            return self._empty_long_cpu()
-        if max_positions <= 0 or query_count <= max_positions:
-            return torch.arange(query_count, dtype=torch.long)
-        # Evenly subsample positions to keep CPU routing bounded without biasing to the prefix.
-        return torch.linspace(0, query_count - 1, steps=max_positions, dtype=torch.float32).round().to(dtype=torch.long)
-
-    def _select_hidden_query_positions(self, seq_len: int, subsample_strategy: str, num_samples: int) -> torch.Tensor:
-        if seq_len <= 0 or num_samples <= 0:
-            return self._empty_long_cpu()
-        if subsample_strategy == "last":
-            window_start = max(0, seq_len - min(512, seq_len))
-            positions = torch.arange(window_start, seq_len, dtype=torch.long)
-            if positions.numel() <= num_samples:
-                return positions
-            step = max(1, positions.numel() // num_samples)
-            return positions[::step][:num_samples]
-        if subsample_strategy != "uniform":
-            raise ValueError(f"Unsupported hidden query subsample strategy '{subsample_strategy}'")
-        step = max(1, seq_len // num_samples)
-        positions = torch.arange(step // 2, seq_len, step, dtype=torch.long)
-        if positions.numel() == 0:
-            positions = torch.tensor([seq_len - 1], dtype=torch.long)
-        return positions[:num_samples]
-
-    def _build_hidden_query_active_vocab(
-        self,
-        active_ids_cpu: torch.Tensor,
-        active_slot_ids_cpu: torch.Tensor,
-    ) -> dict:
-        active_ids_cpu = active_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        active_slot_ids_cpu = active_slot_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-        active_slot_ids_device = active_slot_ids_cpu.to(self.device)
-        active_vocab = {
-            "wte": torch.zeros_like(self.fixed_params["wte"], device=self.device),
-            "value_embeds": {},
-        }
-        if active_ids_cpu.numel() == 0:
-            for name in self.fixed_params:
-                if name.startswith("value_embeds."):
-                    layer_name = name.split(".", 1)[1]
-                    active_vocab["value_embeds"][layer_name] = torch.zeros_like(self.fixed_params[name], device=self.device)
-            return active_vocab
-
-        for name, spec in self.table_specs.items():
-            if name == "lm_head":
-                continue
-            param = spec["param"]
-            rows = param.index_select(0, active_ids_cpu)
-            rows_gpu = rows.pin_memory().to(self.device, non_blocking=self.use_cuda) if self.use_cuda else rows.to(self.device)
-            if name == "wte":
-                active_vocab["wte"].index_copy_(0, active_slot_ids_device, rows_gpu)
-            else:
-                layer_name = name.split(".", 1)[1]
-                value_rows = torch.zeros_like(self.fixed_params[name], device=self.device)
-                value_rows.index_copy_(0, active_slot_ids_device, rows_gpu)
-                active_vocab["value_embeds"][layer_name] = value_rows
-        return active_vocab
-
-    def get_subsampled_hidden_queries(
-        self,
-        preview_tokens: torch.Tensor,
-        active_ids_cpu: torch.Tensor,
-        active_slot_ids_cpu: torch.Tensor,
-        subsample_strategy: str = "uniform",
-        num_samples: int = 32,
-        max_prefix_len: int = 2048,
-    ) -> torch.Tensor:
-        preview_tokens = preview_tokens.detach().to(device="cpu", dtype=torch.long)
-        hidden_query_t0 = time.perf_counter()
-        if preview_tokens.dim() == 1:
-            preview_tokens = preview_tokens.unsqueeze(0)
-        elif preview_tokens.dim() != 2:
-            raise ValueError(f"preview_tokens must have rank 1 or 2, got shape {tuple(preview_tokens.shape)}")
-        positions = self._select_hidden_query_positions(preview_tokens.shape[1], subsample_strategy, num_samples)
-        if positions.numel() == 0:
-            self._last_hidden_query_ms = (time.perf_counter() - hidden_query_t0) * 1000.0
-            return torch.empty((0, self.model.config.n_embd), dtype=torch.float32)
-
-        active_vocab = self._build_hidden_query_active_vocab(active_ids_cpu, active_slot_ids_cpu)
-        with torch.inference_mode():
-            seq_len = int(preview_tokens.shape[1])
-            use_single_forward = max_prefix_len <= 0 or seq_len <= max_prefix_len
-            if use_single_forward:
-                preview_device = preview_tokens.to(self.device, non_blocking=self.use_cuda)
-                hidden = self.model.forward_features(preview_device, active_vocab=active_vocab)
-                selected_hidden = hidden.index_select(1, positions.to(device=hidden.device))
-                queries = selected_hidden.mean(dim=0).to(device="cpu", dtype=torch.float32)
-                self._last_hidden_query_ms = (time.perf_counter() - hidden_query_t0) * 1000.0
-                return queries
-
-            suffix_start = max(0, seq_len - max_prefix_len)
-            if int(positions.min().item()) >= suffix_start:
-                truncated_preview = preview_tokens[:, suffix_start:]
-                truncated_positions = positions - suffix_start
-                preview_device = truncated_preview.to(self.device, non_blocking=self.use_cuda)
-                hidden = self.model.forward_features(preview_device, active_vocab=active_vocab)
-                selected_hidden = hidden.index_select(1, truncated_positions.to(device=hidden.device))
-                queries = selected_hidden.mean(dim=0).to(device="cpu", dtype=torch.float32)
-                self._last_hidden_query_ms = (time.perf_counter() - hidden_query_t0) * 1000.0
-                return queries
-
-            # Exact fallback for restrictive max_prefix_len settings that would otherwise change causal context.
-            queries = []
-            for pos in positions.tolist():
-                prefix = preview_tokens[:, : pos + 1]
-                if max_prefix_len > 0 and prefix.shape[1] > max_prefix_len:
-                    prefix = prefix[:, -max_prefix_len:]
-                prefix_device = prefix.to(self.device, non_blocking=self.use_cuda)
-                hidden = self.model.forward_features(prefix_device, active_vocab=active_vocab)
-                h_pos = hidden[:, -1, :]
-                h_pos = h_pos.mean(dim=0) if h_pos.shape[0] > 1 else h_pos.squeeze(0)
-                queries.append(h_pos.detach().to(device="cpu", dtype=torch.float32))
-            self._last_hidden_query_ms = (time.perf_counter() - hidden_query_t0) * 1000.0
-            return torch.stack(queries) if queries else torch.empty((0, self.model.config.n_embd), dtype=torch.float32)
-
-    def _build_preview_queries_cpu(
-        self,
-        next_batch_preview: torch.Tensor,
-        hidden_states_next: Optional[torch.Tensor] = None,
-        max_positions: int = 0,
-    ) -> torch.Tensor:
-        if hidden_states_next is not None:
-            hidden_states_next = hidden_states_next.detach().to(device="cpu", dtype=torch.float32)
-            if hidden_states_next.dim() == 2:
-                queries = hidden_states_next
-            elif hidden_states_next.dim() == 3:
-                queries = hidden_states_next.mean(dim=0)
-            else:
-                raise ValueError(f"hidden_states_next must have rank 2 or 3, got shape {tuple(hidden_states_next.shape)}")
-        else:
-            preview_tokens = next_batch_preview.detach().to(device="cpu", dtype=torch.long)
-            if preview_tokens.dim() == 1:
-                preview_tokens = preview_tokens.unsqueeze(0)
-            elif preview_tokens.dim() != 2:
-                raise ValueError(f"next_batch_preview must have rank 1 or 2, got shape {tuple(preview_tokens.shape)}")
-            token_embeds = self.table_specs["wte"]["param"].index_select(0, preview_tokens.reshape(-1)).to(dtype=torch.float32)
-            token_embeds = token_embeds.view(preview_tokens.size(0), preview_tokens.size(1), -1)
-            queries = token_embeds.mean(dim=0)
-            if queries.size(0) > 1:
-                padded = F.pad(queries.transpose(0, 1).unsqueeze(0), (1, 1), mode="replicate")
-                queries = F.avg_pool1d(padded, kernel_size=3, stride=1).squeeze(0).transpose(0, 1)
-
-        selected_positions = self._select_router_positions(int(queries.size(0)), max_positions)
-        if selected_positions.numel() == 0:
-            return torch.empty((0, self.table_specs["wte"]["param"].shape[1]), dtype=torch.float32)
-        return queries.index_select(0, selected_positions)
-
-    def select_warm_cloud(
-        self,
-        next_batch_preview: torch.Tensor,
-        current_step_u_ids: torch.Tensor,
-        *,
-        max_warm: int,
-        topk_per_position: int = 500,
-        freq_boost_power: float = 0.0,
-        hidden_states_next: Optional[torch.Tensor] = None,
-        router_weights: Optional[torch.Tensor] = None,
-        shortlist_limit: int = 20000,
-        max_positions: int = 0,
-        preview_active_ids_cpu: Optional[torch.Tensor] = None,
-        preview_active_slot_ids_cpu: Optional[torch.Tensor] = None,
-        hidden_query_strategy: str = "uniform",
-        hidden_query_max_prefix_len: int = 2048,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        current_step_u_ids = current_step_u_ids.detach().to(device="cpu", dtype=torch.long)
-        if max_warm <= 0:
-            empty = self._empty_long_cpu()
-            return empty, empty
-
-        excluded_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        excluded_mask_cpu[current_step_u_ids] = True
-
-        if shortlist_limit > 0:
-            effective_shortlist_limit = max(int(shortlist_limit), int(max_warm))
-            candidate_ids = self._rank_tokens_by_frequency(excluded_mask_cpu, limit=effective_shortlist_limit)
-        else:
-            candidate_ids = torch.nonzero(~excluded_mask_cpu, as_tuple=False).flatten()
-        if candidate_ids.numel() == 0:
-            empty = self._empty_long_cpu()
-            return empty, empty
-
-        queries = self._build_preview_queries_cpu(
-            next_batch_preview,
-            hidden_states_next=hidden_states_next,
-            max_positions=max_positions,
-        )
-        if queries.numel() == 0:
-            empty = self._empty_long_cpu()
-            return empty, empty
-
-        if router_weights is not None:
-            router_weights = router_weights.detach().to(device="cpu", dtype=torch.float32)
-            candidate_matrix = router_weights.index_select(1, candidate_ids).transpose(0, 1).contiguous()
-        else:
-            candidate_matrix = self.table_specs["lm_head"]["param"].index_select(0, candidate_ids).to(dtype=torch.float32)
-
-        queries = F.normalize(queries, dim=-1)
-        candidate_matrix = F.normalize(candidate_matrix, dim=-1)
-        warm_scores = torch.zeros(candidate_ids.numel(), dtype=torch.float32)
-        topk = min(int(topk_per_position), int(candidate_ids.numel()))
-        if topk <= 0:
-            empty = self._empty_long_cpu()
-            return empty, empty
-
-        logits = queries @ candidate_matrix.transpose(0, 1)
-        top_values, top_indices = torch.topk(logits, k=topk, dim=1)
-        position_scores = torch.softmax(top_values, dim=1)
-        warm_scores.scatter_add_(0, top_indices.reshape(-1), position_scores.reshape(-1))
-
-        if freq_boost_power > 0.0:
-            freq = self.global_token_count_cpu.index_select(0, candidate_ids).to(dtype=torch.float32)
-            freq = freq.pow(float(freq_boost_power))
-            warm_scores += torch.log1p(freq) * 0.1
-
-        warm_scores[excluded_mask_cpu.index_select(0, candidate_ids)] = -float("inf")
-        ranked_indices = torch.argsort(warm_scores, descending=True)
-        valid_ranked = ranked_indices[warm_scores.index_select(0, ranked_indices) > -float("inf")]
-        ranked_candidate_ids = candidate_ids.index_select(0, valid_ranked)
-        warm_ids = ranked_candidate_ids[: min(max_warm, ranked_candidate_ids.numel())]
-        return warm_ids, ranked_candidate_ids
-
-    def plan_next_lm_head_cloud(
-        self,
-        step_meta: dict,
-        *,
-        warm_proportion: float,
-        router_candidate_pool_size: int,
-        router_topk: int,
-        source_token_limit: int,
-        hidden_query_strategy: str = "uniform",
-        hidden_query_max_prefix_len: int = 2048,
-        hard_negative_ids_cpu: Optional[torch.Tensor] = None,
-        hard_negative_budget: int = 0,
-    ) -> dict:
-        plan_t0 = time.perf_counter()
-        planned_step_meta = dict(step_meta)
-        planned_step_meta["warm_ids_cpu"] = self._empty_long_cpu()
-        planned_step_meta["cold_ids_cpu"] = self._empty_long_cpu()
-        planned_step_meta["hard_negative_ids_cpu"] = self._empty_long_cpu()
-        planned_step_meta["warm_candidate_ids_cpu"] = self._empty_long_cpu()
-        planned_step_meta["lm_head_u_max"] = int(self.lm_head_u_max)
-        planned_step_meta["cloud_residual_capacity"] = 0
-        planned_step_meta["hard_negative_budget_target"] = 0
-        planned_step_meta["hard_negative_candidate_count"] = int(step_meta.get("hard_negative_candidate_count", 0))
-        planned_step_meta["warm_budget_target"] = 0
-        planned_step_meta["cold_budget_target"] = 0
-        planned_step_meta["warm_candidate_count"] = 0
-        planned_step_meta["random_fill_count"] = 0
-        planned_step_meta["random_fill_ids_cpu"] = self._empty_long_cpu()
-        planned_step_meta["cloud_plan_ms"] = 0.0
-        planned_step_meta["cloud_hidden_query_ms"] = 0.0
-        planned_step_meta["cloud_selection_ms"] = 0.0
-
-        self._update_token_counts_from_local_batch(planned_step_meta)
-
-        if not self.fixed_u_mode or self.lm_head_u_max <= self.fixed_u_max:
-            planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
-            return planned_step_meta
-
-        step_ids_cpu = planned_step_meta["active_ids_cpu"].detach().to(device="cpu", dtype=torch.long)
-        lm_head_base_ids_cpu = step_ids_cpu
-        grad_accum_ids_cpu = planned_step_meta.get("grad_accum_ids_cpu")
-        if grad_accum_ids_cpu is not None:
-            grad_accum_ids_cpu = grad_accum_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-            if grad_accum_ids_cpu.numel() > 0:
-                lm_head_base_ids_cpu = grad_accum_ids_cpu
-        residual_capacity = max(self.lm_head_u_max - int(lm_head_base_ids_cpu.numel()), 0)
-        planned_step_meta["cloud_residual_capacity"] = int(residual_capacity)
-        if residual_capacity <= 0:
-            planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
-            return planned_step_meta
-
-        excluded_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        excluded_mask_cpu[lm_head_base_ids_cpu] = True
-        selected_hard_negative_ids_cpu = self._empty_long_cpu()
-        hard_negative_budget = max(int(hard_negative_budget), 0)
-        hard_negative_budget_target = min(residual_capacity, hard_negative_budget)
-        if hard_negative_ids_cpu is not None and hard_negative_budget_target > 0:
-            hard_negative_ids_cpu = hard_negative_ids_cpu.detach().to(device="cpu", dtype=torch.long)
-            selected_hard_negative_ids: list[int] = []
-            seen_hard_negative_ids: set[int] = set()
-            for token_id in hard_negative_ids_cpu.tolist():
-                token_id = int(token_id)
-                if token_id < 0 or token_id in seen_hard_negative_ids:
-                    continue
-                if bool(excluded_mask_cpu[token_id]):
-                    continue
-                seen_hard_negative_ids.add(token_id)
-                selected_hard_negative_ids.append(token_id)
-            planned_step_meta["hard_negative_candidate_count"] = len(selected_hard_negative_ids)
-            if selected_hard_negative_ids:
-                selected_hard_negative_ids_cpu = torch.tensor(
-                    selected_hard_negative_ids[:hard_negative_budget_target],
-                    dtype=torch.long,
-                )
-            if selected_hard_negative_ids_cpu.numel() > 0:
-                excluded_mask_cpu[selected_hard_negative_ids_cpu] = True
-        planned_step_meta["hard_negative_budget_target"] = int(hard_negative_budget_target)
-        planned_step_meta["hard_negative_ids_cpu"] = selected_hard_negative_ids_cpu
-
-        residual_capacity_after_hard_negative = max(residual_capacity - int(selected_hard_negative_ids_cpu.numel()), 0)
-        warm_budget = min(
-            residual_capacity_after_hard_negative,
-            max(int(round(residual_capacity_after_hard_negative * float(warm_proportion))), 0),
-        )
-        cold_budget = residual_capacity_after_hard_negative - warm_budget
-        planned_step_meta["warm_budget_target"] = int(warm_budget)
-        planned_step_meta["cold_budget_target"] = int(cold_budget)
-
-        prev_cloud_ids_cpu = self._get_resident_cloud_ids_cpu()
-        prev_cloud_mask_cpu = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
-        if prev_cloud_ids_cpu.numel() > 0:
-            prev_cloud_mask_cpu[prev_cloud_ids_cpu] = True
-
-        warm_candidate_ids_cpu = self._empty_long_cpu()
-        warm_selection_t0 = time.perf_counter()
-        self._last_hidden_query_ms = 0.0
-        if warm_budget > 0 and router_candidate_pool_size > 0 and router_topk > 0:
-            inputs_cpu_local = planned_step_meta.get("inputs_cpu_local")
-            if inputs_cpu_local is not None:
-                warm_ids_cpu, warm_candidate_ids_cpu = self.select_warm_cloud(
-                    inputs_cpu_local.detach().to(device="cpu", dtype=torch.long),
-                    lm_head_base_ids_cpu,
-                    max_warm=warm_budget,
-                    topk_per_position=router_topk,
-                    shortlist_limit=router_candidate_pool_size,
-                    max_positions=source_token_limit,
-                    preview_active_ids_cpu=step_ids_cpu,
-                    preview_active_slot_ids_cpu=planned_step_meta["active_slot_ids_cpu"],
-                    hidden_query_strategy=hidden_query_strategy,
-                    hidden_query_max_prefix_len=hidden_query_max_prefix_len,
-                )
-            else:
-                warm_ids_cpu = self._empty_long_cpu()
-        else:
-            warm_ids_cpu = self._empty_long_cpu()
-        if warm_candidate_ids_cpu.numel() > 0:
-            ranked_prev_warm_mask_cpu = prev_cloud_mask_cpu.index_select(0, warm_candidate_ids_cpu)
-            retained_warm_ids_cpu = warm_candidate_ids_cpu[ranked_prev_warm_mask_cpu][:warm_budget]
-            if retained_warm_ids_cpu.numel() > 0:
-                new_warm_ids_cpu = warm_candidate_ids_cpu[~ranked_prev_warm_mask_cpu]
-                remaining_budget = warm_budget - int(retained_warm_ids_cpu.numel())
-                warm_ids_cpu = torch.cat((retained_warm_ids_cpu, new_warm_ids_cpu[:remaining_budget])) if remaining_budget > 0 else retained_warm_ids_cpu
-        if warm_ids_cpu.numel() < warm_budget:
-            warm_fill_excluded_cpu = excluded_mask_cpu.clone()
-            if warm_candidate_ids_cpu.numel() > 0:
-                warm_fill_excluded_cpu[warm_candidate_ids_cpu] = True
-            if warm_ids_cpu.numel() > 0:
-                warm_fill_excluded_cpu[warm_ids_cpu] = True
-            warm_fill_ids_cpu = self._rank_tokens_by_frequency(
-                warm_fill_excluded_cpu,
-                limit=warm_budget - int(warm_ids_cpu.numel()),
-            )
-            if warm_fill_ids_cpu.numel() > 0:
-                warm_ids_cpu = torch.cat((warm_ids_cpu, warm_fill_ids_cpu)) if warm_ids_cpu.numel() > 0 else warm_fill_ids_cpu
-                warm_candidate_ids_cpu = (
-                    torch.cat((warm_candidate_ids_cpu, warm_fill_ids_cpu))
-                    if warm_candidate_ids_cpu.numel() > 0 else warm_fill_ids_cpu
-                )
-        planned_step_meta["cloud_hidden_query_ms"] = float(self._last_hidden_query_ms)
-        planned_step_meta["cloud_selection_ms"] = (time.perf_counter() - warm_selection_t0) * 1000.0
-
-        if warm_candidate_ids_cpu.numel() > 0:
-            excluded_mask_cpu[warm_candidate_ids_cpu] = True
-        cold_ids_cpu = self._empty_long_cpu()
-        random_fill_ids_cpu = self._empty_long_cpu()
-        if cold_budget > 0:
-            if self.random_cloud_fill:
-                seed_value = self.random_cloud_fill_seed + (self.runtime_step * 1_000_003)
-                if "step" in planned_step_meta:
-                    seed_value += int(planned_step_meta["step"]) * 97_409
-                else:
-                    sequence_id = int(planned_step_meta.get("sequence_id", -1))
-                    if sequence_id >= 0:
-                        seed_value += sequence_id * 97_409
-                random_fill_ids_cpu = self._sample_random_token_ids(
-                    excluded_mask_cpu,
-                    cold_budget,
-                    seed=seed_value,
-                )
-                cold_ids_cpu = random_fill_ids_cpu
-            else:
-                cold_candidate_pool = max(int(cold_budget) * 4, int(cold_budget))
-                cold_candidate_ids_cpu = self._rank_tokens_by_frequency(excluded_mask_cpu, cold_candidate_pool)
-                if cold_candidate_ids_cpu.numel() > 0:
-                    ranked_prev_cold_mask_cpu = prev_cloud_mask_cpu.index_select(0, cold_candidate_ids_cpu)
-                    retained_cold_ids_cpu = cold_candidate_ids_cpu[ranked_prev_cold_mask_cpu][:cold_budget]
-                    if retained_cold_ids_cpu.numel() > 0:
-                        new_cold_ids_cpu = cold_candidate_ids_cpu[~ranked_prev_cold_mask_cpu]
-                        remaining_budget = cold_budget - int(retained_cold_ids_cpu.numel())
-                        cold_ids_cpu = torch.cat((retained_cold_ids_cpu, new_cold_ids_cpu[:remaining_budget])) if remaining_budget > 0 else retained_cold_ids_cpu
-                    else:
-                        cold_ids_cpu = cold_candidate_ids_cpu[:cold_budget]
-                if cold_ids_cpu.numel() < cold_budget:
-                    cold_fill_excluded_cpu = excluded_mask_cpu.clone()
-                    if cold_ids_cpu.numel() > 0:
-                        cold_fill_excluded_cpu[cold_ids_cpu] = True
-                    cold_fill_ids_cpu = self._rank_tokens_by_frequency(
-                        cold_fill_excluded_cpu,
-                        cold_budget - int(cold_ids_cpu.numel()),
-                    )
-                    if cold_fill_ids_cpu.numel() > 0:
-                        cold_ids_cpu = torch.cat((cold_ids_cpu, cold_fill_ids_cpu)) if cold_ids_cpu.numel() > 0 else cold_fill_ids_cpu
-
-        runtime_cold_ids_cpu = cold_ids_cpu
-        if selected_hard_negative_ids_cpu.numel() > 0:
-            runtime_cold_ids_cpu = (
-                torch.cat((selected_hard_negative_ids_cpu, cold_ids_cpu))
-                if cold_ids_cpu.numel() > 0 else selected_hard_negative_ids_cpu
-            )
-        planned_step_meta["warm_ids_cpu"] = warm_ids_cpu
-        planned_step_meta["cold_ids_cpu"] = runtime_cold_ids_cpu
-        planned_step_meta["warm_candidate_ids_cpu"] = warm_candidate_ids_cpu
-        planned_step_meta["warm_candidate_count"] = int(warm_candidate_ids_cpu.numel())
-        planned_step_meta["random_fill_count"] = int(random_fill_ids_cpu.numel())
-        planned_step_meta["random_fill_ids_cpu"] = random_fill_ids_cpu
-        planned_step_meta["cloud_plan_ms"] = (time.perf_counter() - plan_t0) * 1000.0
-        return planned_step_meta
 
     @contextmanager
     def materialize_dense_params(self):
@@ -1900,6 +1447,16 @@ class DynamicVocabRuntime:
         warm_ids_cpu = step_meta.get("warm_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         cold_ids_cpu = step_meta.get("cold_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
         random_fill_ids_cpu = step_meta.get("random_fill_ids_cpu", self._empty_long_cpu()).detach().to(device="cpu", dtype=torch.long)
+
+        # SAFETY ASSERTION (Phase 0 of cloud/cold removal):
+        # In the supported manifest-driven fixed-U path the dataloader never emits cloud ids.
+        # Non-empty values here would indicate stale code or incorrect step_meta construction.
+        if warm_ids_cpu.numel() > 0 or cold_ids_cpu.numel() > 0:
+            raise AssertionError(
+                f"Non-empty cloud ids reached _prepare_fixed_step: warm={warm_ids_cpu.numel()}, cold={cold_ids_cpu.numel()}. "
+                "This path should be dead after cloud removal."
+            )
+
         union_input_tables = grad_accum_steps > 1
         preserve_resident_grads = (
             grad_accum_steps > 1 and
@@ -2429,6 +1986,8 @@ class DynamicVocabRuntime:
             **self.fixed_optimizer_state,
         }
 
+        # Note: cloud/warm/cold/hard_negative fields removed (dead experimental code).
+        # lm_head_active now equals the regular active/grad_accum set (lm_head_u_max == fixed_u_max, no clouds).
         return DynamicVocabStep(
             active_ids_cpu=active_ids_cpu,
             active_vocab=step_active_vocab,
@@ -2438,22 +1997,8 @@ class DynamicVocabRuntime:
             unique_count=int(grad_accum_ids_cpu.numel()) if grad_accum_steps > 1 else lm_head_active_ids_cpu.numel(),
             live_count=lm_head_active_ids_cpu.numel(),
             step_u_count=active_ids_cpu.numel(),
-            u_capacity=self.lm_head_u_max,
-            stage_count=(
-                stage_ids_cpu.numel() +
-                cloud_stage_ids_cpu.numel() +
-                (grad_accum_stage_ids_cpu.numel() if grad_accum_steps > 1 and not preserve_resident_grads else 0)
-            ),
-            cloud_residual_capacity=int(step_meta.get("cloud_residual_capacity", 0)),
-            hard_negative_budget_target=int(step_meta.get("hard_negative_budget_target", 0)),
-            hard_negative_candidate_count=int(step_meta.get("hard_negative_candidate_count", 0)),
-            warm_budget_target=int(step_meta.get("warm_budget_target", 0)),
-            cold_budget_target=int(step_meta.get("cold_budget_target", 0)),
-            warm_candidate_count=int(step_meta.get("warm_candidate_count", 0)),
-            random_fill_count=int(random_fill_ids_cpu.numel()),
-            cloud_plan_ms=float(step_meta.get("cloud_plan_ms", 0.0)),
-            cloud_hidden_query_ms=float(step_meta.get("cloud_hidden_query_ms", 0.0)),
-            cloud_selection_ms=float(step_meta.get("cloud_selection_ms", 0.0)),
+            u_capacity=self.fixed_u_max,
+            stage_count=stage_ids_cpu.numel() + (grad_accum_stage_ids_cpu.numel() if grad_accum_steps > 1 and not preserve_resident_grads else 0),
             active_slot_ids_cpu=active_slot_ids_cpu,
             active_mask_cpu=active_mask_cpu,
             slot_to_global_cpu=slot_to_global_cpu,
@@ -2462,28 +2007,8 @@ class DynamicVocabRuntime:
             writeback_ids_cpu=writeback_ids_cpu,
             writeback_slot_ids_cpu=writeback_slot_ids_cpu,
             grad_accum_ids_cpu=grad_accum_ids_cpu,
-            lm_head_active_ids_cpu=(
-                torch.cat((grad_accum_ids_cpu, cloud_ids_cpu))
-                if grad_accum_steps > 1 and cloud_ids_cpu.numel() > 0 else
-                grad_accum_ids_cpu
-                if grad_accum_steps > 1 else
-                lm_head_active_ids_cpu
-            ),
-            lm_head_active_slot_ids_cpu=(
-                torch.arange(grad_accum_ids_cpu.numel() + cloud_ids_cpu.numel(), dtype=torch.long)
-                if grad_accum_steps > 1 else
-                lm_head_active_slot_ids_cpu
-            ),
-            hard_negative_ids_cpu=step_meta.get("hard_negative_ids_cpu"),
-            warm_ids_cpu=warm_ids_cpu,
-            warm_slot_ids_cpu=warm_slot_ids_cpu,
-            cold_ids_cpu=cold_ids_cpu,
-            cold_slot_ids_cpu=cold_slot_ids_cpu,
-            random_fill_ids_cpu=random_fill_ids_cpu,
-            cloud_stage_ids_cpu=cloud_stage_ids_cpu,
-            cloud_stage_slot_ids_cpu=cloud_stage_slot_ids_cpu,
-            cloud_writeback_ids_cpu=cloud_writeback_ids_cpu,
-            cloud_writeback_slot_ids_cpu=cloud_writeback_slot_ids_cpu,
+            lm_head_active_ids_cpu=grad_accum_ids_cpu if grad_accum_steps > 1 else lm_head_active_ids_cpu,
+            lm_head_active_slot_ids_cpu=grad_accum_stage_slot_ids_cpu if grad_accum_steps > 1 else lm_head_active_slot_ids_cpu,
             grad_accum_steps=grad_accum_steps,
             grad_accum_micro_step=grad_accum_micro_step,
             is_grad_accum_boundary=is_grad_accum_boundary,
@@ -2514,6 +2039,14 @@ class DynamicVocabRuntime:
         cold_row_decay: float = 0.0,
         cold_bias_tokens_per_step: Optional[int] = None,
     ) -> DynamicVocabStep:
+        # Phase 0 guard: cold bias / row decay are dead experimental features.
+        # They are never passed from the current training loop (base_train.py calls with defaults only).
+        if cold_bias_scale != 0.0 or cold_row_decay != 0.0 or (cold_bias_tokens_per_step is not None and cold_bias_tokens_per_step > 0):
+            raise RuntimeError(
+                "Cold bias / cold_row_decay parameters are deprecated dead code and are being removed. "
+                "Do not pass non-zero values."
+            )
+
         if isinstance(active_ids_cpu, dict):
             prefetched_stage = None
             prefetch_wait_ms = 0.0
@@ -3156,13 +2689,7 @@ class DynamicVocabRuntime:
             d2h_bytes=d2h_bytes,
             optimizer_ms=apply_ms,
             fixed_u_mode=self.fixed_u_mode,
-            warm_ids_cpu=grad_accum_warm_ids_cpu,
-            cold_ids_cpu=grad_accum_cold_ids_cpu,
-            random_fill_ids_cpu=self._grad_accum_random_fill_ids_cpu,
-            random_fill_count=(
-                int(self._grad_accum_random_fill_ids_cpu.numel())
-                if self._grad_accum_random_fill_ids_cpu is not None else 0
-            ),
+            # cloud/warm/cold/random_fill fields removed (dead code)
             cold_bias_clamped_count=self._grad_accum_window_cold_bias_clamped_count,
             cold_bias_abs_max=self._grad_accum_window_cold_bias_abs_max,
         )

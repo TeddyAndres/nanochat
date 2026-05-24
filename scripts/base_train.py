@@ -1227,31 +1227,8 @@ while True:
             sparse_str = f" | U_live: {live_u:,} | U_union: {sparse_metrics.unique_count:,} | stage: {sparse_metrics.stage_count:,}"
         else:
             sparse_str = f" | U: {live_u:,} | stage: {sparse_metrics.stage_count:,}"
-        hard_negative_count = 0 if sparse_metrics.hard_negative_ids_cpu is None else int(sparse_metrics.hard_negative_ids_cpu.numel())
-        warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
-        cold_total_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
-        cold_count = max(cold_total_count - hard_negative_count, 0)
-        random_fill_count = int(sparse_metrics.random_fill_count)
-        if hard_negative_count > 0 or warm_count > 0 or cold_count > 0:
-            sparse_str += (
-                f" | hard_neg: {hard_negative_count:,}/{sparse_metrics.hard_negative_budget_target:,}"
-                f" | warm: {warm_count:,}/{sparse_metrics.warm_budget_target:,}"
-                f" | cold: {cold_count:,}/{sparse_metrics.cold_budget_target:,}"
-            )
-            if random_fill_count > 0:
-                sparse_str += f" | random: {random_fill_count:,}"
-        if sparse_metrics.cold_bias_abs_max > 0.0 or sparse_metrics.cold_bias_clamped_count > 0:
-            sparse_str += f" | cold_absmax: {sparse_metrics.cold_bias_abs_max:.2f}"
-            if sparse_metrics.cold_bias_clamped_count > 0:
-                sparse_str += f" | cold_clamped: {sparse_metrics.cold_bias_clamped_count:,}"
-        if args.sparse_debug_timing and sparse_metrics.cloud_plan_ms > 0.0:
-            sparse_str += (
-                f" | cloud_ms plan: {sparse_metrics.cloud_plan_ms:.2f}"
-                f" select: {sparse_metrics.cloud_selection_ms:.2f}"
-                f" hidden: {sparse_metrics.cloud_hidden_query_ms:.2f}"
-                f" | residual: {sparse_metrics.cloud_residual_capacity:,}"
-                f" candidates: {sparse_metrics.warm_candidate_count:,}"
-            )
+        # Cloud / warm / cold / hard-negative reporting removed (dead experimental code).
+        # These features were pruned as they did not improve results over the simple manifest path.
         if args.sparse_debug_timing and grad_accum_steps == 1:
             sparse_str += (
                 f" | step_ms prep: {sparse_prepare_ms:.2f}"
@@ -1342,10 +1319,6 @@ while True:
             "train/step_peak_memory_mib": step_peak_memory / 1024 / 1024,
         }
         if sparse_metrics is not None:
-            hard_negative_count = 0 if sparse_metrics.hard_negative_ids_cpu is None else int(sparse_metrics.hard_negative_ids_cpu.numel())
-            warm_count = 0 if sparse_metrics.warm_ids_cpu is None else int(sparse_metrics.warm_ids_cpu.numel())
-            cold_total_count = 0 if sparse_metrics.cold_ids_cpu is None else int(sparse_metrics.cold_ids_cpu.numel())
-            cold_count = max(cold_total_count - hard_negative_count, 0)
             log_data.update({
                 "train/u": sparse_metrics.unique_count,
                 "train/u_step": sparse_metrics.step_u_count if sparse_metrics.step_u_count > 0 else sparse_metrics.unique_count,
@@ -1353,21 +1326,7 @@ while True:
                 "train/u_capacity": sparse_metrics.u_capacity,
                 "train/u_stage": sparse_metrics.stage_count,
                 "train/u_writeback": sparse_metrics.writeback_count,
-                "train/u_hard_negative": hard_negative_count,
-                "train/u_warm": warm_count,
-                "train/u_cold": cold_count,
-                "train/u_residual": sparse_metrics.cloud_residual_capacity,
-                "train/u_hard_negative_target": sparse_metrics.hard_negative_budget_target,
-                "train/u_hard_negative_candidates": sparse_metrics.hard_negative_candidate_count,
-                "train/u_warm_target": sparse_metrics.warm_budget_target,
-                "train/u_cold_target": sparse_metrics.cold_budget_target,
-                "train/u_warm_candidates": sparse_metrics.warm_candidate_count,
-                "train/u_random_fill": sparse_metrics.random_fill_count,
-                "train/cloud_plan_ms": sparse_metrics.cloud_plan_ms,
-                "train/cloud_hidden_query_ms": sparse_metrics.cloud_hidden_query_ms,
-                "train/cloud_selection_ms": sparse_metrics.cloud_selection_ms,
-                "train/cold_bias_clamped": sparse_metrics.cold_bias_clamped_count,
-                "train/cold_bias_absmax": sparse_metrics.cold_bias_abs_max,
+                # Cloud/warm/cold/hard-negative + bias metrics removed (dead experimental code).
                 "train/step_prepare_ms": sparse_prepare_ms,
                 "train/step_fwdbwd_ms": sparse_fwdbwd_ms,
                 "train/step_apply_call_ms": sparse_apply_call_ms,
