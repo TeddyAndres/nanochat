@@ -41,24 +41,40 @@ def round_capacity_up(value: int | None, multiple: int) -> int | None:
 
 @dataclass
 class PersistentSlotPrefetchState:
-    """Precomputed state for the persistent stable slot / overlap-reuse logic
-    for one grad-accum window.
+    """Legacy / future carrier for precomputed persistent slot state.
 
-    This is produced in a background thread (via the prefetch executor) so that
-    the hot path in _prepare_fixed_step only performs data exchange of already-
-    prepared structures instead of doing heavy CPU map computation (index_select,
-    arriving/leaving decisions, full(vocab_size) allocations, etc.).
-
-    This directly implements the design principle that only transfer of prepared
-    data should happen on the critical path before the compiled model forward.
+    Phase 2+ primarily uses PersistentSlotTransition (below) as the rich
+    result object exchanged between the (background) compute and the main-thread
+    apply. This dataclass is retained for the prefetch future slot and can be
+    unified later if desired.
     """
     # Ready-to-use local-position -> stable GPU slot tensor for the window's
-    # grad_accum_ids (the value that used to be written to
-    # _grad_accum_wte_local_to_slot_cpu on the hot path).
+    # grad_accum_ids.
     local_to_slot_cpu: Optional[torch.Tensor] = None
 
-    # Future extensions (populated as we migrate more logic out of the hot path):
-    # arriving_input_ids_cpu, leaving_*, updated_map_snapshots, etc.
+
+@dataclass
+class PersistentSlotTransition:
+    """Pure result of a persistent slot window transition computation.
+
+    Produced by _compute_persistent_slot_state_cpu (or its for_meta wrapper)
+    which is now side-effect free. Applied atomically on the main thread by
+    _apply_persistent_slot_transition.
+
+    This eliminates the race that previously forced the heavy logic onto the
+    foreground path when grad_accum_steps > 1 + fixed overlap reuse.
+    """
+    deferred_writeback_ids_cpu: torch.Tensor
+    deferred_writeback_slot_ids_cpu: torch.Tensor
+    deferred_lm_head_writeback_ids_cpu: torch.Tensor
+    deferred_lm_head_writeback_slot_ids_cpu: torch.Tensor
+    input_stage_ids_cpu: torch.Tensor
+    input_stage_slot_ids_cpu: torch.Tensor
+    # Pre-computed values that should be copied into
+    # _grad_accum_wte_local_to_slot_cpu[:n] for the window.
+    grad_accum_local_to_slot_cpu: torch.Tensor
+    used_persistent_input_slots: bool = False
+    prep_persistent_slot_ms: float = 0.0
 
 
 @dataclass
@@ -456,7 +472,28 @@ class DynamicVocabRuntime:
     def _grad_accum_slot_positions_unique(self, count: int) -> torch.Tensor:
         if count <= 0:
             return self._empty_long_cpu()
-        return self._grad_accum_slot_positions_cpu[:count].clone()
+        return self._grad_accum_slot_positions_cpu[:count]
+
+    def _assert_main_thread_for_slot_mutation(self, context: str = "") -> None:
+        """Debug guard (Phase 2+): cheap no-op unless NANOCHAT_SPARSE_DEBUG=1.
+
+        Asserts that we are not mutating the live fixed-slot maps from a
+        background thread (the original source of the "missing live fixed-U rows"
+        race when persistent slot prefetch was previously enabled).
+        """
+        if os.environ.get("NANOCHAT_SPARSE_DEBUG", "0") not in ("1", "true", "True"):
+            return
+        # Best-effort: if we are inside a ThreadPoolExecutor worker, the current
+        # thread name usually contains "ThreadPoolExecutor".
+        import threading
+        name = threading.current_thread().name
+        if "ThreadPoolExecutor" in name or "Thread-" in name:
+            raise RuntimeError(
+                f"Persistent slot map mutation attempted from background thread "
+                f"({name}). Context: {context}. This would have caused the race. "
+                "All mutations must go through the main-thread apply path."
+            )
+        # No action needed on main thread — guard passes silently when debug is off or we're on main.
 
     def _same_grad_accum_window_ids(self, grad_accum_ids_cpu: torch.Tensor) -> bool:
         if not self._grad_accum_live or self._grad_accum_ids_cpu is None:
@@ -643,6 +680,7 @@ class DynamicVocabRuntime:
     def _invalidate_fixed_live_state(self):
         if not self.fixed_u_mode:
             return
+        self._assert_main_thread_for_slot_mutation("_invalidate_fixed_live_state")
         self._fixed_live_state = False
         if self.fixed_slot_to_global_cpu is not None:
             self.fixed_slot_to_global_cpu.fill_(-1)
@@ -1358,129 +1396,141 @@ class DynamicVocabRuntime:
         union_input_tables: bool,
         stage_ids_cpu: torch.Tensor,
         stage_slot_ids_cpu: torch.Tensor,
-    ) -> dict:
-        """Low-level version. See _compute_persistent_slot_state_for_meta for the
-        version that is safe to call from the prefetch executor.
-        """
-        """Compute the persistent stable slot state for a grad-accum window.
+    ) -> PersistentSlotTransition:
+        """Pure (side-effect-free) version.
 
-        This is the heavy CPU work (index_select, arriving/leaving decisions,
-        map updates, local_to_slot population, lm_head detection) that used to
-        run synchronously on the hot path in _prepare_fixed_step.
+        Computes arriving/leaving decisions, the required local_to_slot slice,
+        and lm_head deferred writeback list for a grad-accum window transition.
+        All heavy index work can now safely run in the prefetch executor.
 
-        Goal (Phase 1+): run this in a background thread via the prefetch
-        executor so the hot path only exchanges already-prepared data.
+        The caller (on the main thread) must subsequently call
+        _apply_persistent_slot_transition(result) to commit the map changes.
         """
-        result: dict = {}
         _t0 = time.perf_counter()
 
-        # The original heavy block (input side + local map + lm_head detection)
-        if self._fixed_live_state and not self.disable_fixed_overlap_reuse:
-            assert self.fixed_input_slot_to_global_cpu is not None
-            # --- Persistent stable input-table slot assignment ---
-            _existing_input_slots = self._fixed_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
-            _arriving_input_mask = _existing_input_slots < 0
-            _surviving_input_slots = _existing_input_slots[~_arriving_input_mask]
+        # Defaults (empty tensors)
+        empty = self._empty_long_cpu()
+        transition = PersistentSlotTransition(
+            deferred_writeback_ids_cpu=empty,
+            deferred_writeback_slot_ids_cpu=empty,
+            deferred_lm_head_writeback_ids_cpu=empty,
+            deferred_lm_head_writeback_slot_ids_cpu=empty,
+            input_stage_ids_cpu=empty,
+            input_stage_slot_ids_cpu=empty,
+            grad_accum_local_to_slot_cpu=empty,
+            used_persistent_input_slots=False,
+            prep_persistent_slot_ms=0.0,
+        )
 
-            _all_input_occupied = self.fixed_input_slot_to_global_cpu >= 0
-            if _surviving_input_slots.numel() > 0:
-                self._fixed_input_slot_survived_buf_cpu.zero_()
-                self._fixed_input_slot_survived_buf_cpu.scatter_(0, _surviving_input_slots, True)
-                _leaving_input_mask = _all_input_occupied & ~self._fixed_input_slot_survived_buf_cpu
+        if not (self._fixed_live_state and not self.disable_fixed_overlap_reuse):
+            transition.prep_persistent_slot_ms = (time.perf_counter() - _t0) * 1000.0
+            return transition
+
+        assert self.fixed_input_slot_to_global_cpu is not None
+
+        # --- Pure decision logic (no mutations) ---
+        _existing_input_slots = self._fixed_input_global_to_slot_cpu.index_select(0, grad_accum_ids_cpu)
+        _arriving_input_mask = _existing_input_slots < 0
+        _surviving_input_slots = _existing_input_slots[~_arriving_input_mask]
+
+        _all_input_occupied = self.fixed_input_slot_to_global_cpu >= 0
+        if _surviving_input_slots.numel() > 0:
+            self._fixed_input_slot_survived_buf_cpu.zero_()
+            self._fixed_input_slot_survived_buf_cpu.scatter_(0, _surviving_input_slots, True)
+            _leaving_input_mask = _all_input_occupied & ~self._fixed_input_slot_survived_buf_cpu
+        else:
+            _leaving_input_mask = _all_input_occupied
+
+        _leaving_input_slot_ids = torch.nonzero(_leaving_input_mask, as_tuple=False).flatten()
+        _leaving_input_ids = (
+            self.fixed_input_slot_to_global_cpu[_leaving_input_slot_ids]
+            if _leaving_input_slot_ids.numel() > 0 else empty
+        )
+
+        _arriving_input_ids = grad_accum_ids_cpu[_arriving_input_mask]
+        _n_arriving = _arriving_input_ids.numel()
+        _n_leaving = _leaving_input_slot_ids.numel()
+
+        if _n_arriving > 0:
+            if _n_arriving <= _n_leaving:
+                _arriving_input_slot_ids = _leaving_input_slot_ids[:_n_arriving]
+                _freed_input_slot_ids = _leaving_input_slot_ids[_n_arriving:]
             else:
-                _leaving_input_mask = _all_input_occupied
-
-            _leaving_input_slot_ids = torch.nonzero(_leaving_input_mask, as_tuple=False).flatten()
-            _leaving_input_ids = (
-                self.fixed_input_slot_to_global_cpu[_leaving_input_slot_ids]
-                if _leaving_input_slot_ids.numel() > 0 else self._empty_long_cpu()
-            )
-
-            _arriving_input_ids = grad_accum_ids_cpu[_arriving_input_mask]
-            _n_arriving = _arriving_input_ids.numel()
-            _n_leaving = _leaving_input_slot_ids.numel()
-
-            if _n_arriving > 0:
-                if _n_arriving <= _n_leaving:
-                    _arriving_input_slot_ids = _leaving_input_slot_ids[:_n_arriving]
-                    _freed_input_slot_ids = _leaving_input_slot_ids[_n_arriving:]
-                else:
-                    _extra_slots = torch.nonzero(~_all_input_occupied, as_tuple=False).flatten()[:_n_arriving - _n_leaving]
-                    _arriving_input_slot_ids = (
-                        torch.cat((_leaving_input_slot_ids, _extra_slots)) if _n_leaving > 0 else _extra_slots
-                    )
-                    _freed_input_slot_ids = self._empty_long_cpu()
-            else:
-                _arriving_input_slot_ids = self._empty_long_cpu()
-                _freed_input_slot_ids = _leaving_input_slot_ids
-
-            if _leaving_input_ids.numel() > 0:
-                self._fixed_input_global_to_slot_cpu[_leaving_input_ids] = -1
-            if _freed_input_slot_ids.numel() > 0:
-                self.fixed_input_slot_to_global_cpu[_freed_input_slot_ids] = -1
-            if _arriving_input_ids.numel() > 0:
-                self._fixed_input_global_to_slot_cpu[_arriving_input_ids] = _arriving_input_slot_ids
-                self.fixed_input_slot_to_global_cpu[_arriving_input_slot_ids] = _arriving_input_ids
-
-            deferred_writeback_ids_cpu = _leaving_input_ids
-            deferred_writeback_slot_ids_cpu = _leaving_input_slot_ids[:_leaving_input_ids.numel()]
-            input_stage_ids_cpu = _arriving_input_ids
-            input_stage_slot_ids_cpu = _arriving_input_slot_ids
-            result["_used_persistent_input_slots"] = True
-
-            # local_to_slot for union remap
-            n = grad_accum_ids_cpu.numel()
-            assert self._grad_accum_wte_local_to_slot_cpu is not None
-            self._grad_accum_wte_local_to_slot_cpu[:n] = self._fixed_input_global_to_slot_cpu.index_select(
-                0, grad_accum_ids_cpu
-            )
-            if n < self.grad_accum_u_max:
-                self._grad_accum_wte_local_to_slot_cpu[n:].fill_(-1)
-            self._grad_accum_union_slot_remap_active = True
-
-            # lm_head deferred writeback detection
-            prev_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
-            deferred_lm_head_writeback_ids_cpu = self._empty_long_cpu()
-            deferred_lm_head_writeback_slot_ids_cpu = self._empty_long_cpu()
-            if prev_lm_head_slot_ids_cpu.numel() > 0:
-                prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
-                prev_lm_head_global_to_row_cpu = self._fill_prev_lm_head_global_to_row_cpu(
-                    prev_lm_head_ids_cpu, prev_lm_head_slot_ids_cpu
+                _extra_slots = torch.nonzero(~_all_input_occupied, as_tuple=False).flatten()[:_n_arriving - _n_leaving]
+                _arriving_input_slot_ids = (
+                    torch.cat((_leaving_input_slot_ids, _extra_slots)) if _n_leaving > 0 else _extra_slots
                 )
-                kept_prev_lm_head_rows_cpu = prev_lm_head_global_to_row_cpu.index_select(0, grad_accum_ids_cpu)
-                kept_prev_lm_head_mask_cpu = torch.zeros(prev_lm_head_slot_ids_cpu.numel(), dtype=torch.bool)
-                valid_prev_lm_head_mask_cpu = kept_prev_lm_head_rows_cpu >= 0
-                if valid_prev_lm_head_mask_cpu.any():
-                    kept_prev_lm_head_mask_cpu[kept_prev_lm_head_rows_cpu[valid_prev_lm_head_mask_cpu]] = True
-                deferred_lm_head_writeback_ids_cpu = prev_lm_head_ids_cpu[~kept_prev_lm_head_mask_cpu]
-                deferred_lm_head_writeback_slot_ids_cpu = prev_lm_head_slot_ids_cpu[~kept_prev_lm_head_mask_cpu]
+                _freed_input_slot_ids = empty
+        else:
+            _arriving_input_slot_ids = empty
+            _freed_input_slot_ids = _leaving_input_slot_ids
 
-            result.update({
-                "deferred_writeback_ids_cpu": deferred_writeback_ids_cpu,
-                "deferred_writeback_slot_ids_cpu": deferred_writeback_slot_ids_cpu,
-                "deferred_lm_head_writeback_ids_cpu": deferred_lm_head_writeback_ids_cpu,
-                "deferred_lm_head_writeback_slot_ids_cpu": deferred_lm_head_writeback_slot_ids_cpu,
-                "input_stage_ids_cpu": input_stage_ids_cpu,
-                "input_stage_slot_ids_cpu": input_stage_slot_ids_cpu,
-                "_used_persistent_input_slots": True,
-                "prep_persistent_slot_ms": (time.perf_counter() - _t0) * 1000.0,
-            })
+        # Build the *would-be* final global_to_slot values for the new window ids
+        # (this is what used to be read after the mutations)
+        n = grad_accum_ids_cpu.numel()
+        local_to_slot = torch.empty(n, dtype=torch.long)
 
-        return result
+        # Survivors keep their previous slots
+        if _surviving_input_slots.numel() > 0:
+            survivor_mask = ~_arriving_input_mask
+            local_to_slot[survivor_mask] = _surviving_input_slots
 
-    def _compute_persistent_slot_state_for_meta(self, step_meta: dict) -> dict:
+        # Arrivers get the slots we decided for them
+        if _n_arriving > 0:
+            arriver_mask = _arriving_input_mask
+            local_to_slot[arriver_mask] = _arriving_input_slot_ids
+
+        # The compute is now pure — no map mutations here.
+        # The caller applies via _apply_persistent_slot_transition.
+
+        deferred_writeback_ids_cpu = _leaving_input_ids
+        deferred_writeback_slot_ids_cpu = _leaving_input_slot_ids[:_leaving_input_ids.numel()] if _leaving_input_ids.numel() > 0 else empty
+        input_stage_ids_cpu = _arriving_input_ids
+        input_stage_slot_ids_cpu = _arriving_input_slot_ids
+
+        # lm_head deferred writeback detection (pure)
+        prev_lm_head_slot_ids_cpu = torch.nonzero(self.fixed_lm_head_slot_to_global_cpu >= 0, as_tuple=False).flatten()
+        deferred_lm_head_writeback_ids_cpu = empty
+        deferred_lm_head_writeback_slot_ids_cpu = empty
+        if prev_lm_head_slot_ids_cpu.numel() > 0:
+            prev_lm_head_ids_cpu = self.fixed_lm_head_slot_to_global_cpu.index_select(0, prev_lm_head_slot_ids_cpu)
+            prev_lm_head_global_to_row_cpu = self._fill_prev_lm_head_global_to_row_cpu(
+                prev_lm_head_ids_cpu, prev_lm_head_slot_ids_cpu
+            )
+            kept_prev_lm_head_rows_cpu = prev_lm_head_global_to_row_cpu.index_select(0, grad_accum_ids_cpu)
+            kept_prev_lm_head_mask_cpu = torch.zeros(prev_lm_head_slot_ids_cpu.numel(), dtype=torch.bool)
+            valid_prev_lm_head_mask_cpu = kept_prev_lm_head_rows_cpu >= 0
+            if valid_prev_lm_head_mask_cpu.any():
+                kept_prev_lm_head_mask_cpu[kept_prev_lm_head_rows_cpu[valid_prev_lm_head_mask_cpu]] = True
+            deferred_lm_head_writeback_ids_cpu = prev_lm_head_ids_cpu[~kept_prev_lm_head_mask_cpu]
+            deferred_lm_head_writeback_slot_ids_cpu = prev_lm_head_slot_ids_cpu[~kept_prev_lm_head_mask_cpu]
+
+        transition = PersistentSlotTransition(
+            deferred_writeback_ids_cpu=deferred_writeback_ids_cpu,
+            deferred_writeback_slot_ids_cpu=deferred_writeback_slot_ids_cpu,
+            deferred_lm_head_writeback_ids_cpu=deferred_lm_head_writeback_ids_cpu,
+            deferred_lm_head_writeback_slot_ids_cpu=deferred_lm_head_writeback_slot_ids_cpu,
+            input_stage_ids_cpu=input_stage_ids_cpu,
+            input_stage_slot_ids_cpu=input_stage_slot_ids_cpu,
+            grad_accum_local_to_slot_cpu=local_to_slot,
+            used_persistent_input_slots=True,
+            prep_persistent_slot_ms=(time.perf_counter() - _t0) * 1000.0,
+        )
+        return transition
+
+    def _compute_persistent_slot_state_for_meta(self, step_meta: dict) -> PersistentSlotTransition:
         """Wrapper suitable for submission to the prefetch executor.
 
         Extracts the required fields from the same step_meta dict that
         the row prefetch already receives. This is the entry point we will
         call from prefetch_step for the *next* window.
         """
-        grad_accum_ids_cpu = self._as_cpu_long(step_meta.get("grad_accum_ids_cpu", step_meta["active_ids_cpu"]))
+        grad_accum_ids_cpu = self._as_cpu_long(step_meta.get("grad_accum_ids_cpu", step_meta.get("active_ids_cpu")))
         preserve_resident_grads = bool(step_meta.get("preserve_resident_grads", False))
         union_input_tables = bool(step_meta.get("union_input_tables", False))
         stage_ids_cpu = self._as_cpu_long(step_meta.get("stage_ids_cpu", grad_accum_ids_cpu))
         stage_slot_ids_cpu = self._as_cpu_long(
-            step_meta.get("stage_slot_ids_cpu", self._grad_accum_slot_positions_unique(grad_accum_ids_cpu.numel()))
+            step_meta.get("stage_slot_ids_cpu", self._grad_accum_slot_positions_unique(grad_accum_ids_cpu.numel() if grad_accum_ids_cpu is not None else 0))
         )
 
         return self._compute_persistent_slot_state_cpu(
@@ -1490,6 +1540,41 @@ class DynamicVocabRuntime:
             stage_ids_cpu=stage_ids_cpu,
             stage_slot_ids_cpu=stage_slot_ids_cpu,
         )
+
+    def _apply_persistent_slot_transition(self, transition: "PersistentSlotTransition") -> None:
+        """Atomic main-thread apply of a PersistentSlotTransition.
+
+        Performs exactly the mutations that used to live inside the compute
+        function. Must only ever be called from the main thread (the debug
+        guard will catch violations when NANOCHAT_SPARSE_DEBUG=1).
+        """
+        if not transition.used_persistent_input_slots:
+            return
+
+        self._assert_main_thread_for_slot_mutation("_apply_persistent_slot_transition")
+
+        # --- Apply input table slot assignments (arriving / leaving) ---
+        if transition.deferred_writeback_ids_cpu.numel() > 0:
+            self._fixed_input_global_to_slot_cpu[transition.deferred_writeback_ids_cpu] = -1
+        if transition.deferred_writeback_slot_ids_cpu.numel() > 0:
+            self.fixed_input_slot_to_global_cpu[transition.deferred_writeback_slot_ids_cpu] = -1
+        if transition.input_stage_ids_cpu.numel() > 0:
+            self._fixed_input_global_to_slot_cpu[transition.input_stage_ids_cpu] = transition.input_stage_slot_ids_cpu
+            self.fixed_input_slot_to_global_cpu[transition.input_stage_slot_ids_cpu] = transition.input_stage_ids_cpu
+
+        # local_to_slot for the current window's union remap
+        n = transition.grad_accum_local_to_slot_cpu.numel()
+        assert self._grad_accum_wte_local_to_slot_cpu is not None
+        if n > 0:
+            self._grad_accum_wte_local_to_slot_cpu[:n] = transition.grad_accum_local_to_slot_cpu
+        if n < self.grad_accum_u_max:
+            self._grad_accum_wte_local_to_slot_cpu[n:].fill_(-1)
+        self._grad_accum_union_slot_remap_active = True
+
+        # Note: lm_head map mutations for the new window (and the GPU reuse copies)
+        # are handled in the caller (_prepare_fixed_step) after this apply, exactly
+        # as they were before. The compute only ever computed the *deferred writeback*
+        # list for lm_head.
 
     def prefetch_step(self, active_ids_cpu) -> None:
         if not (self.use_cuda and self.fixed_u_mode and isinstance(active_ids_cpu, dict)):
@@ -1504,12 +1589,14 @@ class DynamicVocabRuntime:
         self._pending_stage_prefetch_key = id(active_ids_cpu)
         self._pending_stage_prefetch_future = self._stage_prefetch_executor.submit(self._prefetch_fixed_step_cpu_rows, requests)
 
-        # Keep persistent-slot computation on the foreground path for now.
-        # The current helper mutates the live fixed-slot maps, so running it on the
-        # prefetch executor can race with apply_accumulated_gradients at optimizer
-        # boundaries and leave the current grad-accum union map out of sync.
-        self._pending_persistent_slot_future = None
-        self._pending_persistent_slot_key = None
+        # Phase 3 (enabled): Persistent slot computation is now safe to run in the background.
+        # The compute path is pure (PersistentSlotTransition). Mutations are performed
+        # only in the main-thread _apply_persistent_slot_transition (which contains the
+        # NANOCHAT_SPARSE_DEBUG guard). This was the enabling change for the whole plan.
+        self._pending_persistent_slot_key = id(active_ids_cpu)
+        self._pending_persistent_slot_future = self._stage_prefetch_executor.submit(
+            self._compute_persistent_slot_state_for_meta, active_ids_cpu
+        )
 
     def _get_cpu_receive_buffer(
         self,
@@ -1602,7 +1689,7 @@ class DynamicVocabRuntime:
         prefetched_stage: Optional[dict[str, dict]] = None,
         prefetched_wait_ms: float = 0.0,
         prefetched_hit: int = 0,
-        prefetched_persistent_slot_state: Optional[dict] = None,  # dict from _compute_persistent_slot_state_for_meta (or future dataclass)
+        prefetched_persistent_slot_state: Optional[object] = None,  # PersistentSlotTransition (preferred) or legacy dict
         prefetched_persistent_slot_wait_ms: float = 0.0,
         prefetched_persistent_slot_hit: int = 0,
     ) -> DynamicVocabStep:
@@ -1708,7 +1795,7 @@ class DynamicVocabRuntime:
         # while the GPU is doing previous microsteps).
         if grad_accum_steps > 1 and not preserve_resident_grads and grad_accum_ids_cpu.numel() > 0 and self._fixed_live_state and not self.disable_fixed_overlap_reuse:
             if prefetched_persistent_slot_hit and prefetched_persistent_slot_state is not None:
-                state = prefetched_persistent_slot_state if isinstance(prefetched_persistent_slot_state, dict) else {}
+                state = prefetched_persistent_slot_state
                 prep_persistent_slot_ms = prefetched_persistent_slot_wait_ms
             else:
                 # Fallback (first window, prefetch miss, or during transition)
@@ -1719,15 +1806,32 @@ class DynamicVocabRuntime:
                     stage_ids_cpu=stage_ids_cpu,
                     stage_slot_ids_cpu=stage_slot_ids_cpu,
                 )
-                prep_persistent_slot_ms = state.get("prep_persistent_slot_ms", 0.0)
+                prep_persistent_slot_ms = getattr(state, "prep_persistent_slot_ms", 0.0)
 
-            deferred_writeback_ids_cpu = state.get("deferred_writeback_ids_cpu", deferred_writeback_ids_cpu)
-            deferred_writeback_slot_ids_cpu = state.get("deferred_writeback_slot_ids_cpu", deferred_writeback_slot_ids_cpu)
-            deferred_lm_head_writeback_ids_cpu = state.get("deferred_lm_head_writeback_ids_cpu", deferred_lm_head_writeback_ids_cpu)
-            deferred_lm_head_writeback_slot_ids_cpu = state.get("deferred_lm_head_writeback_slot_ids_cpu", deferred_lm_head_writeback_slot_ids_cpu)
-            input_stage_ids_cpu = state.get("input_stage_ids_cpu", input_stage_ids_cpu)
-            input_stage_slot_ids_cpu = state.get("input_stage_slot_ids_cpu", input_stage_slot_ids_cpu)
-            _used_persistent_input_slots = state.get("_used_persistent_input_slots", _used_persistent_input_slots)
+            # Normalize to dataclass (supports legacy dicts during transition)
+            if isinstance(state, dict):
+                state = PersistentSlotTransition(
+                    deferred_writeback_ids_cpu=state.get("deferred_writeback_ids_cpu", deferred_writeback_ids_cpu),
+                    deferred_writeback_slot_ids_cpu=state.get("deferred_writeback_slot_ids_cpu", deferred_writeback_slot_ids_cpu),
+                    deferred_lm_head_writeback_ids_cpu=state.get("deferred_lm_head_writeback_ids_cpu", deferred_lm_head_writeback_ids_cpu),
+                    deferred_lm_head_writeback_slot_ids_cpu=state.get("deferred_lm_head_writeback_slot_ids_cpu", deferred_lm_head_writeback_slot_ids_cpu),
+                    input_stage_ids_cpu=state.get("input_stage_ids_cpu", input_stage_ids_cpu),
+                    input_stage_slot_ids_cpu=state.get("input_stage_slot_ids_cpu", input_stage_slot_ids_cpu),
+                    grad_accum_local_to_slot_cpu=state.get("_grad_accum_local_to_slot_cpu", self._empty_long_cpu()),
+                    used_persistent_input_slots=state.get("_used_persistent_input_slots", False),
+                    prep_persistent_slot_ms=prep_persistent_slot_ms,
+                )
+
+            # Commit the (previously computed) map changes on the main thread only.
+            self._apply_persistent_slot_transition(state)
+
+            deferred_writeback_ids_cpu = state.deferred_writeback_ids_cpu
+            deferred_writeback_slot_ids_cpu = state.deferred_writeback_slot_ids_cpu
+            deferred_lm_head_writeback_ids_cpu = state.deferred_lm_head_writeback_ids_cpu
+            deferred_lm_head_writeback_slot_ids_cpu = state.deferred_lm_head_writeback_slot_ids_cpu
+            input_stage_ids_cpu = state.input_stage_ids_cpu
+            input_stage_slot_ids_cpu = state.input_stage_slot_ids_cpu
+            _used_persistent_input_slots = state.used_persistent_input_slots
         prep_cpu_reuse_map_ms = (time.perf_counter() - _t0_cpu_map) * 1000.0
         prep_gpu_reuse_input_ms = 0.0
         _t0_gpu_lm_head = time.perf_counter()
@@ -1873,6 +1977,7 @@ class DynamicVocabRuntime:
             self.fixed_slot_to_global_cpu.copy_(slot_to_global_cpu)
         assert self.fixed_input_slot_to_global_cpu is not None
         if not _used_persistent_input_slots and not (grad_accum_steps > 1 and not self.disable_fixed_overlap_reuse and preserve_resident_grads):
+            self._assert_main_thread_for_slot_mutation("_prepare_fixed_step non-persistent init")
             # Non-persistent path (first step, disabled, or grad_accum_steps==1):
             # reset forward map to contiguous slot assignment. Slots are sequential (slot i = position i),
             # so no union_inputs remapping is needed — clear the cache.

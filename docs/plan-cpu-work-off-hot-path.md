@@ -3,7 +3,7 @@
 **Branch**: `feature/upstream-sparse-runtime`  
 **Primary file**: `nanochat/dynamic_vocab.py`  
 **Date**: 2026-05 (reviewed & strengthened 2026-05 post-Phase 1)  
-**Status**: Phase 1 complete on branch; Phases 2–5 ready for execution (validation strategy significantly strengthened)  
+**Status**: Phases 2+3 core implemented (pure compute + apply split + guard + tests + prefetch re-enabled). Phase 1 baseline + new validation gates in place. Remaining: full CUDA prefetch test, longer loss-curve runs, Phase 4/5 polish.  
 **Author context**: Captured from deep exploration + background subagent analysis + previously documented race condition. Updated with additional test recommendations from implementation review.
 
 ---
