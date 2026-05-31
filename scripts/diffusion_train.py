@@ -62,12 +62,12 @@ from nanochat.tokenizer import get_tokenizer
 def main():
     parser = argparse.ArgumentParser(description="LLaDA-style diffusion pretraining (dense)")
     parser.add_argument("--llada-mode", action="store_true", help="Enable LLaDA masked diffusion objective")
-    parser.add_argument("--depth", type=int, default=4, help="Model depth (number of layers)")
+    parser.add_argument("--depth", type=int, default=6, help="Model depth (number of layers)")
     parser.add_argument("--num-iterations", type=int, default=100, help="Number of training steps")
-    parser.add_argument("--device-batch-size", type=int, default=4, help="Per-device batch size. Overridden by --sparse-manifest if provided.")
-    parser.add_argument("--max-seq-len", type=int, default=128, help="Sequence length. Overridden by --sparse-manifest if provided.")
-    parser.add_argument("--vocab-size", type=int, default=8192, help="Vocab size. Overridden by --sparse-manifest (use 65536 for the 65k manifests).")
-    parser.add_argument("--mask-id", type=int, default=None, help="Token id to use as [MASK] for diffusion (required when using real 65k manifests).")
+    parser.add_argument("--device-batch-size", type=int, default=16, help="Per-device batch size. Overridden by --sparse-manifest if provided.")
+    parser.add_argument("--max-seq-len", type=int, default=2048, help="Sequence length. Overridden by --sparse-manifest if provided.")
+    parser.add_argument("--vocab-size", type=int, default=65536, help="Vocab size. Overridden by --sparse-manifest (use 65536 for the 65k manifests).")
+    parser.add_argument("--mask-id", type=int, default=44241, help="Token id to use as [MASK] for diffusion (required when using real 65k manifests).")
 
     # Token cache arguments (passed through to the manifest dataloader)
     parser.add_argument(
@@ -259,65 +259,100 @@ def main():
             raise
 
     for step in range(args.num_iterations):
-        # Get clean token batch (either from real manifest loader or synthetic for quick tests)
+        # =====================================================================
+        # Data acquisition + active set computation
+        # =====================================================================
         if using_real_loader and train_iter is not None:
             try:
                 batch = next(train_iter)
-                # Manifest loader typically yields: inputs, targets, step_meta, state_dict
-                if isinstance(batch, (list, tuple)):
-                    # Prefer 'inputs' (the clean packed sequences) for LLaDA x0
-                    if len(batch) >= 1:
-                        clean = batch[0]
-                        input_ids = clean.to(device) if hasattr(clean, "to") else torch.as_tensor(clean, device=device)
+                # The real manifest dataloader yields:
+                #   (inputs, targets, step_meta, state_dict)
+                # 'inputs' and 'targets' are **already remapped** to local indices
+                # using the manifest's active set for this exact microstep.
+                if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+                    inputs, targets, step_meta = batch[0], batch[1], batch[2]
+                    noisy_batch = inputs.to(device) if hasattr(inputs, "to") else torch.as_tensor(inputs, device=device)
+
+                    # For the LLaDA loss we need the original GLOBAL clean token IDs
+                    slot_to_global = step_meta.get("slot_to_global_cpu")
+                    if slot_to_global is not None:
+                        slot_to_global = slot_to_global.to(device)
+                        clean_global = slot_to_global[targets.to(device) if hasattr(targets, "to") else torch.as_tensor(targets, device=device)]
                     else:
-                        raise RuntimeError("Unexpected batch format from manifest loader")
+                        clean_global = targets.to(device) if hasattr(targets, "to") else torch.as_tensor(targets, device=device)
                 else:
-                    input_ids = torch.as_tensor(batch, device=device)
+                    noisy_batch = torch.as_tensor(batch[0] if isinstance(batch, (list,tuple)) else batch, device=device)
+                    clean_global = noisy_batch.clone()
             except StopIteration:
                 print0("Loader exhausted — stopping early.")
                 break
+            except Exception as e:
+                print0(f"Error unpacking real manifest batch: {e}")
+                raise
+
+            # === Correct active set for the sparse runtime in manifest mode ===
+            # Use the manifest's declared global active IDs + our MASK token.
+            manifest_active_global = step_meta.get("active_ids_cpu")
+            if manifest_active_global is not None:
+                mask_tensor = torch.tensor([mask_id], dtype=torch.long, device=manifest_active_global.device)
+                required_tokens = torch.unique(torch.cat([manifest_active_global, mask_tensor]))
+            else:
+                required_tokens = diffusion.get_diffusion_active_tokens(clean_global, mask_id)
+
         else:
-            # Synthetic data (for quick non-manifest experiments)
-            input_ids = torch.randint(0, args.vocab_size, (args.device_batch_size, args.max_seq_len), device=device)
+            # Synthetic / non-manifest path
+            noisy_batch = torch.randint(0, args.vocab_size, (args.device_batch_size, args.max_seq_len), device=device)
+            clean_global = noisy_batch.clone()
+            required_tokens = diffusion.get_diffusion_active_tokens(clean_global, mask_id)
 
         # === Exact LLaDA forward (noising) process ===
-        noisy_batch, masked_indices, p_mask = forward_process(input_ids, mask_id=mask_id)
+        noisy_for_loss, masked_indices, p_mask = forward_process(clean_global, mask_id=mask_id)
 
-        # Tokens that must be in the active set for this diffusion step.
-        # We deliberately use the diffusion-specific helper so that MASK is
-        # always included (even if it didn't appear in the clean batch).
-        # This is the core of the "MASK is a code-level always-hot token" strategy.
-        required_tokens = diffusion.get_diffusion_active_tokens(input_ids, mask_id)
+        model_input = noisy_batch   # may be remapped below for synthetic + sparse
 
-        # === Sparse-aware model call (when enabled) ===
+        # === Sparse-aware model call + required remapping ===
         if dynamic_vocab is not None:
-            # prepare_step expects the set of active global token ids for this microstep
             sparse_step_ctx = dynamic_vocab.prepare_step(required_tokens)
 
-            # Call the model with the runtime-provided active_vocab and causal=False
+            # In the synthetic/dynamic path we must remap the batch to local indices
+            # because we generated raw global IDs.
+            if not using_real_loader:
+                active_global = sparse_step_ctx.active_ids_cpu.to(device)
+                global_to_local = torch.full((args.vocab_size,), -1, dtype=torch.long, device=device)
+                global_to_local[active_global] = torch.arange(len(active_global), device=device)
+                model_input = global_to_local[noisy_batch]
+
             logits = model(
-                noisy_batch,
+                model_input,
                 causal=False,
                 active_vocab=sparse_step_ctx.active_vocab,
             )
-
-            # After optimizer step we will tell the runtime to do writeback / accounting
             do_sparse_step = True
+
+            # Remap targets for loss (works for both manifest and synthetic paths)
+            active_global = getattr(sparse_step_ctx, 'active_ids_cpu', None)
+            if active_global is not None:
+                active_global = active_global.to(device)
+                global_to_local = torch.full((args.vocab_size,), -1, dtype=torch.long, device=device)
+                global_to_local[active_global] = torch.arange(len(active_global), device=device)
+                local_targets = global_to_local[clean_global]
+            else:
+                local_targets = clean_global
         else:
-            # Dense path (original behavior)
-            logits = model(noisy_batch, causal=False)
+            logits = model(model_input, causal=False)
             sparse_step_ctx = None
             do_sparse_step = False
+            local_targets = clean_global
+            local_targets = clean_global
 
         # === Exact LLaDA weighted masked loss ===
-        loss = compute_llada_loss(logits, input_ids, masked_indices, p_mask)
+        loss = compute_llada_loss(logits, local_targets, masked_indices, p_mask)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
         if do_sparse_step and sparse_step_ctx is not None:
-            # Let the runtime perform the necessary writeback / optimizer state updates for the active rows
             dynamic_vocab.step(sparse_step_ctx)
 
         if step % 10 == 0 or step == args.num_iterations - 1:
