@@ -2,9 +2,9 @@
 
 **Branch**: `feature/upstream-sparse-runtime`  
 **Primary file**: `nanochat/dynamic_vocab.py`  
-**Date**: 2026-05  
-**Status**: Detailed plan recorded (ready for execution or further refinement)  
-**Author context**: Captured from deep exploration + background subagent analysis + previously documented race condition.
+**Date**: 2026-05 (reviewed & strengthened 2026-05 post-Phase 1)  
+**Status**: Phase 1 complete on branch; Phases 2–5 ready for execution (validation strategy significantly strengthened)  
+**Author context**: Captured from deep exploration + background subagent analysis + previously documented race condition. Updated with additional test recommendations from implementation review.
 
 ---
 
@@ -128,11 +128,16 @@ This is the core of the documented race and the biggest remaining CPU cost on wi
 - **Option B**: Return only the decisions (arriving/leaving/assigned slots). The apply phase replays the decisions against the live maps.
 - **Option C**: Use read-only snapshots of the maps at the start of window computation (cheaper than full copies for the big vocab-sized maps).
 
-Update `PersistentSlotPrefetchState` dataclass to hold the new result type.
+Update `PersistentSlotPrefetchState` dataclass (or introduce a dedicated `PersistentSlotTransition` / `SlotStateResult` dataclass) to serve as the actual typed carrier for the rich result object returned by the compute function. All call sites (prefetch consumption, fallback, `_prepare_fixed_step`) must be updated to use it.
 
-Add strong comments and (optionally) a debug-mode runtime check that detects mutations from background threads.
+**Mandatory hardening (Phase 2 deliverable)**:
+- Add strong comments documenting the mutation contract and thread-safety expectations around every live map.
+- Add a debug-mode runtime check (enabled by `NANOCHAT_SPARSE_DEBUG=1` or an equivalent internal flag, cheap when disabled) that asserts the mutating compute path is only ever entered from the main thread (or while no `apply_accumulated_gradients` / resident-grads readers are active). This directly prevents re-introduction of the original race.
 
-**Deliverable**: A version of the persistent slot logic that is safe to run from `_stage_prefetch_executor`.
+**Isolated unit tests (Phase 2 deliverable)**:
+- Add focused unit tests (in `tests/test_dynamic_vocab_grad_accum.py` or a new `test_persistent_slot_compute.py`) that exercise `_compute_persistent_slot_state_cpu` (and the `_for_meta` wrapper) in isolation. These tests supply controlled prior map state + a new `grad_accum_ids_cpu` set and assert the exact returned dict (or result object) contents plus any side effects on the input maps (before the refactor) or on the result object (after). This makes the compute-vs-apply split testable without running full windows.
+
+**Deliverable**: A version of the persistent slot logic that is safe to run from `_stage_prefetch_executor`, accompanied by the typed result object, the debug guard, and the isolated unit tests.
 
 **Risk**: Medium-High. This is the most invasive single change. Rollback is expected to be used if needed.
 
@@ -162,12 +167,14 @@ Once Phase 2 is complete:
 
 ### Phase 5: Measurement, Hardening, Documentation, and Cleanup
 
-- Full before/after timing comparison on realistic manifest runs (hundreds to thousands of steps).
-- Ensure all existing tests pass, especially `tests/test_dynamic_vocab_grad_accum.py` (run with `PYTHONPATH=.`).
-- Add or update runtime assertions / debug modes that would have caught the original race.
-- Update code comments, the workspace `MEMORY.md` entry, and `docs/sparse-manifest-run.md` if user-visible behavior or flags change.
+- Full before/after timing comparison on realistic manifest runs (hundreds to thousands of steps), using the reproducible harness from the Verification Strategy (the new `dev/sparse_cpu_offload_bench.py` or equivalent).
+- Ensure **all** tests pass, especially the extended `tests/test_dynamic_vocab_grad_accum.py` (and any new `test_*_prefetch.py` variant) run with `PYTHONPATH=.`. The prefetch-exercising variant must be part of the pre-Phase-3 gate.
+- Add or update runtime assertions / debug modes that would have caught the original race (the mandatory background-mutation guard from Phase 2 is the primary artifact here).
+- Create / land the isolated unit tests for the persistent slot compute logic (Phase 2 deliverable) and the CUDA + `prefetch_step` coverage test (Phase 3 gate).
+- Update code comments (especially around `prefetch_step`, `_compute_persistent_slot_state_*`, and the live maps), the workspace `MEMORY.md` entry (or its committed equivalents in the source), and `docs/sparse-manifest-run.md` if user-visible behavior or flags change.
 - Clean up any temporary scaffolding or duplicated logic introduced during the phases.
 - Consider adding a "CPU offload level" or feature flag for future experiments.
+- Ensure the `PersistentSlotPrefetchState` (or its successor result dataclass) is fully documented and used consistently.
 
 ---
 
@@ -175,11 +182,13 @@ Once Phase 2 is complete:
 
 | File | Key Locations | Role |
 |------|---------------|------|
-| `nanochat/dynamic_vocab.py` | `_prepare_fixed_step` (1504–1927), `prepare_step` (1928), `prefetch_step` (1399), `_compute_persistent_slot_state_cpu` (1260) + `_for_meta` wrapper, `apply_accumulated_gradients` (2179), `_start_grad_accum_window` (753), staging helpers, `__init__` | The entire hot path and prefetch machinery |
-| `scripts/base_train.py` | Lines 1013 (prepare), 1093 (prefetch), 1115 (accumulate), 1180 (apply), timing accumulation | Training loop ordering and measurement |
-| `nanochat/dataloader.py` | `tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest` (~327), `apply_manifest_transition`, step_meta construction (~762) | Source of `step_meta` tensors |
+| `nanochat/dynamic_vocab.py` | `_prepare_fixed_step`, `prepare_step`, `prefetch_step`, `_compute_persistent_slot_state_cpu` + `_for_meta` wrapper, `apply_accumulated_gradients`, `_start_grad_accum_window`, staging helpers, `__init__` | The entire hot path and prefetch machinery (note: line numbers in this table are historical; use `grep` for current locations) |
+| `scripts/base_train.py` | prepare/prefetch/accumulate/apply call sites + timing accumulation around lines 1013–1180 | Training loop ordering and measurement |
+| `nanochat/dataloader.py` | `tokenizing_distributed_data_loader_with_state_bos_bestfit_manifest`, `apply_manifest_transition`, step_meta construction | Source of `step_meta` tensors (already performs useful union remapping work) |
+| `tests/test_dynamic_vocab_grad_accum.py` | Full file (especially `_build_runtime`, `_step_meta`, `_run_window`, and the final equivalence assertions on weights / optimizer state / counters) | Primary correctness oracle for slot assignment, overlap reuse, writebacks, and grad-accum window transitions. Must pass after every change; will be extended for prefetch coverage. |
+| `dev/sparse_cpu_offload_bench.py` (to be added in Phase 5) | New small script | Reproducible before/after timing harness for the `sparse_prep_*_ms` family (see Verification Strategy) |
 | `docs/plan-cpu-work-off-hot-path.md` | This file | The plan itself |
-| `.grok/memory/teddy-831f2fbd/MEMORY.md` | Sparse Manifest / Fixed-U Runtime section | Durable record of the race condition |
+| `.grok/memory/teddy-831f2fbd/MEMORY.md` | Sparse Manifest / Fixed-U Runtime section | Durable record of the race condition (local to author; code comments in `prefetch_step` and `_compute_*` serve as the committed equivalent) |
 
 ---
 
@@ -187,14 +196,50 @@ Once Phase 2 is complete:
 
 Because intermediate runnable states are not required:
 
-- **Primary signal**: The existing `--sparse-debug-timing` + per-category `sparse_prep_*_ms` breakdowns (including the new `prep_persistent_slot_ms` and `prep_active_vocab_build_ms` timers).
-- **Secondary signal**: `sparse_boundary_overhead_ms` (time between end of prepare and start of compiled model call).
-- **Correctness**:
-  - `PYTHONPATH=. pytest tests/test_dynamic_vocab_grad_accum.py -q` after every significant change.
-  - Short (1–few optimizer step) manifest runs comparing loss / core metrics against a known-good baseline on the same manifest.
-  - Manual or assertion-based inspection of slot maps at window boundaries during development.
-- **Longer validation**: At the end of major phases, run hundreds of steps and compare loss curves + final metrics.
-- **Race detection**: Keep or enhance the test that would have caught the original "missing live fixed-U rows" failure.
+- **Primary signal**: The existing `--sparse-debug-timing` + per-category `sparse_prep_*_ms` breakdowns (including `prep_persistent_slot_ms`, `prep_cpu_reuse_map_ms`, `prep_active_vocab_build_ms`, and `sparse_boundary_overhead_ms`).
+- **Secondary signal**: `sparse_boundary_overhead_ms` (time between end of `prepare_step` and start of the compiled `model()` call) and overall `sparse_prepare_ms`.
+
+### Correctness (run after every significant change)
+- `PYTHONPATH=. pytest tests/test_dynamic_vocab_grad_accum.py -q` (the core equivalence test against `disable_overlap_reuse`).
+- Short (1–few optimizer step) manifest runs comparing loss / core metrics against a known-good baseline on the *same* manifest.
+- Manual or assertion-based inspection of slot maps (`fixed_input_slot_to_global_cpu`, `_grad_accum_wte_local_to_slot_cpu`, etc.) at window boundaries during development.
+
+### Longer validation (end of major phases)
+- Hundreds to thousands of steps on realistic manifests; compare full loss curves + final metrics (weights, optimizer state, hot activation counts, etc.) against a no-prefetch / foreground-only baseline.
+
+### Race detection & mutation hazard (mandatory)
+- Keep/enhance the existing "Sparse grad accumulation map is missing live fixed-U rows" assertions (in both `_prepare_fixed_step` and `apply_accumulated_gradients`).
+- The **mandatory** debug-mode thread/mutation guard added in Phase 2 (see Phase 2 section) must be present and pass in debug builds.
+- A stress-oriented test (or extension of the grad-accum test under `NANOCHAT_SPARSE_DEBUG=1`) that exercises rapid window transitions + concurrent-looking apply calls (even if serialized) to ensure the guard would have fired on the original bug.
+
+### Additional tests required before Phase 3 (the "prefetch re-enable" gate)
+
+These close the coverage gaps that existed after Phase 1:
+
+1. **Isolated compute-function unit tests (Phase 2 deliverable)**  
+   Add direct tests for `_compute_persistent_slot_state_cpu` and `_compute_persistent_slot_state_for_meta`.  
+   - Supply a controlled prior state of the fixed-slot maps + a realistic `grad_accum_ids_cpu` tensor.  
+   - Assert the exact contents of the returned result object (deferred writebacks, stage ids/slots, `local_to_slot` slice, timing, flags).  
+   - After the refactor, the tests must pass against both the pure-compute path *and* the foreground apply path.  
+   - These tests become the primary regression suite for any future changes to arriving/leaving logic.
+
+2. **CUDA + prefetch_step coverage test (must exist and pass before re-enabling submission in Phase 3)**  
+   Extend `test_dynamic_vocab_grad_accum.py` (or add a sibling `test_dynamic_vocab_grad_accum_prefetch.py`, marked slow/CUDA) that:
+   - Instantiates the runtime on CUDA when available (falls back to CPU-only behavior gracefully).
+   - Mimics the real training loop: after each window (or at the appropriate micro-step boundary), calls `dynamic_vocab.prefetch_step(next_meta)`.
+   - Runs multiple overlapping grad-accum windows with realistic arrival/leaving patterns.
+   - Still asserts full numerical equivalence (weights, optimizer state, counters) against the `disable_overlap_reuse` baseline.
+   - Explicitly exercises both *hit* (prefetched result consumed) and *miss* (fallback synchronous compute) paths for the persistent slot future.
+   - Verifies that `apply_accumulated_gradients` and resident-grads microsteps see consistent maps in both hit and miss cases.
+
+3. **Reproducible timing / measurement harness (Phase 5 deliverable)**  
+   Add a small script (e.g. `dev/sparse_cpu_offload_bench.py`) that:
+   - Runs a tiny but fixed manifest (1–5 optimizer steps, small vocab) under `--sparse-debug-timing --sparse-debug-sync-after-backward`.
+   - Prints (and optionally writes JSON) a stable summary of the key counters: `prep_persistent_slot_ms` (per window and average), `sparse_boundary_overhead_ms`, `prep_cpu_reuse_map_ms`, etc.
+   - Can be invoked with a `--baseline` or `--compare` mode for easy before/after diffs.
+   - This script (or its output) is the canonical artifact for Phase 0 baseline capture and Phase 5 final measurement claims.
+
+These three additions ensure that (a) the heavy logic is unit-tested, (b) the newly-enabled async path is actually exercised by CI/tests, and (c) performance wins are measured repeatably rather than via one-off log inspection.
 
 ---
 
@@ -209,17 +254,19 @@ Because intermediate runnable states are not required:
 
 ## 8. References & Prior Work
 
-- Workspace memory entry on the persistent slot race (highly recommended reading before touching `prefetch_step` or `_compute_persistent_slot_state_*`).
-- Existing `PersistentSlotPrefetchState` dataclass and prefetch scaffolding (already partially implemented).
-- Rich timing instrumentation added in recent commits on this branch.
+- Workspace memory entry on the persistent slot race (highly recommended reading before touching `prefetch_step` or `_compute_persistent_slot_state_*`; the committed comments in those functions are the durable source of truth for contributors).
+- Existing `PersistentSlotPrefetchState` scaffolding and the `_compute_*_for_meta` / prefetched state wiring (Phase 1 partial implementation).
+- Rich timing instrumentation + Phase 1 per-micro reductions (see recent commits on this branch and `tests/test_dynamic_vocab_grad_accum.py`).
 - `docs/sparse-manifest-run.md` (user-facing instructions for the path being optimized).
+- The three additional test artifacts mandated in Section 6 (isolated compute tests, CUDA prefetch coverage test, reproducible `sparse_cpu_offload_bench.py`) are considered first-class deliverables of Phases 2/3/5.
 
 ---
 
-**Next step decision point** (for the implementer):
+**Next step decision point** (for the implementer, post-Phase 1):
 
-- Start with **Phase 0** (instrumentation + baseline capture)?
-- Jump straight to **Phase 1** (cheap per-micro wins)?
-- Begin detailed design + implementation of **Phase 2** (side-effect-free persistent slot refactor) first, since it unblocks the largest remaining gain?
+- The instrumentation baseline (Phase 0) and cheap per-micro wins (Phase 1) are largely complete on this branch. The next major step is detailed design + implementation of **Phase 2** (side-effect-free persistent slot refactor). This is the gate for everything else.
+- When implementing Phase 2, the isolated unit tests for the compute function and the mandatory debug-mode mutation guard must be delivered together with the refactor.
+- Before merging the Phase 3 change that re-enables `_pending_persistent_slot_future` submission, the CUDA + `prefetch_step`-exercising coverage test (Section 6) must exist and pass.
+- Use the (to-be-added) `dev/sparse_cpu_offload_bench.py` for all before/after timing claims in Phases 3 and 5.
 
-This plan is deliberately phased so that valuable progress can be made (and measured) even if later, higher-risk phases are rolled back.
+This plan is deliberately phased so that valuable progress can be made (and measured) even if later, higher-risk phases are rolled back. The strengthened test gates above exist precisely to make the high-risk phases safe to land.
