@@ -11,9 +11,27 @@ Key properties (matching LLaDA exactly):
 - Loss is cross-entropy on masked positions, re-weighted by 1/p_mask
   This gives a proper variational upper bound on NLL.
 
-This module is deliberately small and has no dependency on the sparse
-runtime. The sparse path (active_vocab, U computation, etc.) will be
-wired in diffusion_train.py exactly like base_train.py does today.
+=== Important contract for the dynamic/sparse vocabulary runtime ===
+
+When using this module together with DynamicVocabRuntime (sparse mode):
+
+The set of tokens that must be active for a batch is:
+    unique(clean tokens in the batch) UNION {mask_id}
+
+The MASK token **must** be present in every active set during diffusion
+training (and during sampling). If it is missing, the embedding or lm_head
+row for MASK will not be loaded, and the forward will be incorrect or crash.
+
+Recommended pattern in sparse-aware training code:
+
+    clean_ids = ...          # from dataloader
+    mask_id = diffusion.get_mask_id_for_run(...)
+    required = diffusion.get_tokens_for_active_vocab(clean_ids, mask_id)
+    # then pass `required` (union any other always-hot tokens) when building U
+    # for DynamicVocabRuntime / active_vocab dict.
+
+This module itself stays completely independent of the sparse runtime.
+The wiring happens in the training script (see scripts/diffusion_train.py).
 """
 
 from __future__ import annotations
@@ -94,3 +112,28 @@ def compute_llada_loss(
 def sample_timesteps(batch_size: int, device: torch.device) -> torch.Tensor:
     """Convenience helper if you ever need raw t values (not currently required)."""
     return torch.rand(batch_size, device=device)
+
+
+def get_tokens_for_active_vocab(
+    input_ids: torch.Tensor,
+    mask_id: int,
+) -> torch.Tensor:
+    """Returns the set of token ids that must be present in the active vocab U
+    for a diffusion (LLaDA-style) training or sampling step.
+
+    This is the union of:
+      - all unique clean tokens appearing in `input_ids`
+      - the `mask_id`
+
+    This is the recommended helper for sparse training code when computing
+    the active set for DynamicVocabRuntime.
+
+    The caller is still responsible for also including any other always-hot
+    tokens (e.g. BOS, EOS, or other special tokens required by the model).
+    """
+    flat = input_ids.reshape(-1)
+    unique_clean = torch.unique(flat)
+    # Ensure mask_id is included even if it didn't appear in this batch
+    mask_tensor = torch.tensor([mask_id], device=flat.device, dtype=flat.dtype)
+    combined = torch.cat([unique_clean, mask_tensor])
+    return torch.unique(combined)

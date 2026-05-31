@@ -17,6 +17,7 @@ import argparse
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
+import nanochat.diffusion as diffusion
 from nanochat.diffusion import forward_process, compute_llada_loss, DEFAULT_MASK_ID
 from nanochat.common import print0
 
@@ -38,10 +39,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print0(f"Running LLaDA-style dense pretrain on {device} using .venv-5090")
 
-    # For toy runs we must use a MASK id that fits inside our tiny vocab.
-    # In real runs we will use a properly reserved token (or the LLaDA default if it fits).
-    toy_mask_id = args.vocab_size - 1
-    print0(f"Using toy MASK_ID = {toy_mask_id} (fits in vocab_size={args.vocab_size})")
+    # Choose a mask id that fits in the current vocab.
+    # In a real run this would be a properly reserved token in the tokenizer.
+    mask_id = args.vocab_size - 1
+    print0(f"Using MASK_ID = {mask_id} (fits in vocab_size={args.vocab_size})")
 
     # Create a tiny GPT config (same style as base_train)
     config = GPTConfig(
@@ -65,7 +66,15 @@ def main():
         input_ids = torch.randint(0, args.vocab_size, (args.device_batch_size, args.max_seq_len), device=device)
 
         # === Exact LLaDA forward (noising) process ===
-        noisy_batch, masked_indices, p_mask = forward_process(input_ids, mask_id=toy_mask_id)
+        noisy_batch, masked_indices, p_mask = forward_process(input_ids, mask_id=mask_id)
+
+        # Demonstration: how sparse code should compute required tokens for U
+        required_for_sparse = diffusion.get_tokens_for_active_vocab(input_ids, mask_id)
+        # In a real sparse run you would union this with any other always-hot tokens
+        # and feed it into DynamicVocabRuntime / active_vocab construction.
+
+        if step == 0:
+            print0(f"  [sparse-compat] tokens that would be required for active_vocab: {required_for_sparse.tolist()}")
 
         # === Real model forward with causal=False (bidirectional) ===
         # This is the key line that exercises the new diffusion path we just added.
