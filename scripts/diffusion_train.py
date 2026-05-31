@@ -1,80 +1,91 @@
 #!/usr/bin/env python3
 """
-Minimal LLaDA-style diffusion training entrypoint for nanochat.
+LLaDA-style diffusion pretraining entrypoint for nanochat (dense only for now).
 
-This is the very first skeleton on the feature/dynamic-vocab-diffusion branch.
-It demonstrates the core LLaDA forward process + weighted masked loss
-(using the new nanochat.diffusion module) without yet modifying the
-autoregressive paths in gpt.py or base_train.py.
+This demonstrates the full LLaDA masked diffusion objective using a real
+bidirectional GPT (causal=False) + the exact forward_process + weighted
+masked loss from the LLaDA paper.
 
-Usage (with the REQUIRED .venv-5090):
+Usage (MANDATORY: use .venv-5090):
     source /home/teddy/Desktop/dev/repo/nanochat/.venv-5090/bin/activate
-    python -m scripts.diffusion_train --llada-mode --depth 4 --num-iterations 50 ...
+    python -m scripts.diffusion_train --llada-mode --depth 4 --num-iterations 100 ...
 
-Later we will:
-- Wire the real model forward (after adding bidirectional support)
-- Add --sparse-mode + manifest support (exact same contract as base_train)
-- Add the SFT path (prompt kept clean)
-- Implement the low-confidence remasking sampler
-
-For now this file exists so the branch has a clean first commit that only
-adds new files and proves the LLaDA loss math can be imported and executed.
+All Python execution on this machine for this project must go through .venv-5090.
 """
 
 import argparse
 import torch
 
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.diffusion import forward_process, compute_llada_loss, DEFAULT_MASK_ID
+from nanochat.common import print0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLaDA-style diffusion pretraining skeleton")
-    parser.add_argument("--llada-mode", action="store_true", help="Enable LLaDA masked diffusion objective (skeleton)")
-    parser.add_argument("--depth", type=int, default=4, help="Tiny model depth for skeleton testing")
-    parser.add_argument("--num-iterations", type=int, default=20, help="How many dummy steps to run")
+    parser = argparse.ArgumentParser(description="LLaDA-style diffusion pretraining (dense)")
+    parser.add_argument("--llada-mode", action="store_true", help="Enable LLaDA masked diffusion objective")
+    parser.add_argument("--depth", type=int, default=4, help="Model depth (number of layers)")
+    parser.add_argument("--num-iterations", type=int, default=100, help="Number of training steps")
     parser.add_argument("--device-batch-size", type=int, default=4)
     parser.add_argument("--max-seq-len", type=int, default=128)
+    parser.add_argument("--vocab-size", type=int, default=1024, help="Tiny vocab for fast skeleton runs")
     args = parser.parse_args()
 
     if not args.llada_mode:
-        print("This skeleton currently only supports --llada-mode. Exiting.")
+        print("This entrypoint currently requires --llada-mode. Exiting.")
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running LLaDA skeleton on {device}")
-    print(f"Using MASK_ID = {DEFAULT_MASK_ID}")
+    print0(f"Running LLaDA-style dense pretrain on {device} using .venv-5090")
 
-    # Dummy "model" that just produces random logits over a tiny vocab for testing the loss path.
-    # Real version will call the actual bidirectional GPT once we add the causal=False path.
-    vocab_size = 1024  # tiny for skeleton
-    dummy_linear = torch.nn.Linear(64, vocab_size, bias=False).to(device)
+    # For toy runs we must use a MASK id that fits inside our tiny vocab.
+    # In real runs we will use a properly reserved token (or the LLaDA default if it fits).
+    toy_mask_id = args.vocab_size - 1
+    print0(f"Using toy MASK_ID = {toy_mask_id} (fits in vocab_size={args.vocab_size})")
+
+    # Create a tiny GPT config (same style as base_train)
+    config = GPTConfig(
+        sequence_len=args.max_seq_len,
+        vocab_size=args.vocab_size,
+        n_layer=args.depth,
+        n_head=4,
+        n_kv_head=4,
+        n_embd=128,
+        window_pattern="L",   # full context everywhere for diffusion
+    )
+
+    model = GPT(config).to(device)
+    model.eval()  # no dropout etc. for this skeleton
+
+    # Optimizer for the tiny model (just to make it a real training loop)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     for step in range(args.num_iterations):
-        # Simulate a clean batch of token ids (in real code this comes from the dataloader)
-        input_ids = torch.randint(0, vocab_size, (args.device_batch_size, args.max_seq_len), device=device)
+        # Simulate clean token batch (real version will come from dataloader + manifest)
+        input_ids = torch.randint(0, args.vocab_size, (args.device_batch_size, args.max_seq_len), device=device)
 
-        # === LLaDA forward process (exact) ===
-        noisy_batch, masked_indices, p_mask = forward_process(input_ids)
+        # === Exact LLaDA forward (noising) process ===
+        noisy_batch, masked_indices, p_mask = forward_process(input_ids, mask_id=toy_mask_id)
 
-        # === Dummy forward (will be replaced by real model(x_t) later) ===
-        # For now we just embed the noisy tokens with a tiny dummy projection
-        # so we can exercise the loss math end-to-end.
-        dummy_hidden = torch.randn(args.device_batch_size, args.max_seq_len, 64, device=device)
-        logits = dummy_linear(dummy_hidden)  # (b, l, V)
+        # === Real model forward with causal=False (bidirectional) ===
+        # This is the key line that exercises the new diffusion path we just added.
+        logits = model(noisy_batch, causal=False)  # (B, T, V) — note: no targets, just features + lm_head
 
-        # === LLaDA loss (exact) ===
+        # === Exact LLaDA weighted masked loss ===
         loss = compute_llada_loss(logits, input_ids, masked_indices, p_mask)
 
-        if step % 5 == 0 or step == args.num_iterations - 1:
-            num_masked = masked_indices.sum().item()
-            avg_p = p_mask[masked_indices].mean().item() if num_masked > 0 else 0.0
-            print(f"step {step:03d} | loss {loss.item():.4f} | masked {num_masked} | avg_p_mask {avg_p:.3f}")
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
-    print("\nLLaDA skeleton finished successfully.")
-    print("Next steps (see approved plan):")
-    print("  1. Add bidirectional (causal=False) support in gpt.py")
-    print("  2. Wire the real model forward + sparse active_vocab path")
-    print("  3. Implement low-confidence remasking sampler in nanochat/diffusion.py")
+        if step % 10 == 0 or step == args.num_iterations - 1:
+            num_masked = int(masked_indices.sum().item())
+            avg_p = float(p_mask[masked_indices].mean().item()) if num_masked > 0 else 0.0
+            print0(f"step {step:04d} | loss {loss.item():.4f} | masked {num_masked:5d} | avg_p {avg_p:.3f}")
+
+    print0("\nLLaDA dense skeleton run completed successfully.")
+    print0("We just ran real bidirectional (causal=False) GPT + exact LLaDA loss.")
+    print0("Next (per plan): wire --sparse-mode + real dataloader, then low-conf remasking sampler.")
 
 
 if __name__ == "__main__":

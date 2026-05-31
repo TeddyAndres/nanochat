@@ -79,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = min(32, self.n_embd)
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, causal: bool = True):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -102,8 +102,8 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: respect the causal flag (True for AR, False for diffusion/LLaDA)
+            y = flash_attn.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -111,7 +111,7 @@ class CausalSelfAttention(nn.Module):
                 q, k_cache, v_cache,
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
+                causal=causal,
                 window_size=window_size,
             )
             # Advance position after last layer processes
@@ -143,8 +143,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, causal: bool = True):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, causal=causal)
         x = x + self.mlp(norm(x))
         return x
 
@@ -409,7 +409,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward_features(self, idx, kv_cache=None, active_vocab=None):
+    def forward_features(self, idx, kv_cache=None, active_vocab=None, causal: bool = True):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -437,7 +437,7 @@ class GPT(nn.Module):
                     ve = F.embedding(idx, active_vocab["value_embeds"][str(i)]).to(x.dtype)
             else:
                 ve = None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, causal=causal)
         x = norm(x)
         return x
 
@@ -533,8 +533,9 @@ class GPT(nn.Module):
         return_logits=False,
         return_token_losses=False,
         return_sparse_analysis=False,
+        causal: bool = True,
     ):
-        x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab)
+        x = self.forward_features(idx, kv_cache=kv_cache, active_vocab=active_vocab, causal=causal)
         logits = self.compute_logits(
             x,
             active_vocab=active_vocab,
