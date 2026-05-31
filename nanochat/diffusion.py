@@ -13,25 +13,35 @@ Key properties (matching LLaDA exactly):
 
 === Important contract for the dynamic/sparse vocabulary runtime ===
 
-When using this module together with DynamicVocabRuntime (sparse mode):
+**MASK is a diffusion-level always-hot token.**
 
-The set of tokens that must be active for a batch is:
-    unique(clean tokens in the batch) UNION {mask_id}
+When using LLaDA-style diffusion together with DynamicVocabRuntime (sparse mode):
 
-The MASK token **must** be present in every active set during diffusion
-training (and during sampling). If it is missing, the embedding or lm_head
-row for MASK will not be loaded, and the forward will be incorrect or crash.
+- The set of tokens that must be active for a step is:
+      unique(clean tokens)  ∪  {mask_id}
 
-Recommended pattern in sparse-aware training code:
+- The MASK token must be **unconditionally** included in every active set
+  passed to `DynamicVocabRuntime.prepare_step(...)`, even if it did not
+  appear in the current clean batch.
 
-    clean_ids = ...          # from dataloader
-    mask_id = diffusion.get_mask_id_for_run(...)
-    required = diffusion.get_tokens_for_active_vocab(clean_ids, mask_id)
-    # then pass `required` (union any other always-hot tokens) when building U
-    # for DynamicVocabRuntime / active_vocab dict.
+- We deliberately do **not** bloat manifests with MASK. It is injected at
+  the training script level (see `get_diffusion_active_tokens` below).
+
+Recommended pattern:
+
+    clean_ids = ...                    # from dataloader / manifest loader
+    mask_id = args.mask_id             # required for real runs
+    required = diffusion.get_diffusion_active_tokens(clean_ids, mask_id)
+    # optionally union any other permanent hot tokens here
+    ctx = dynamic_vocab.prepare_step(required)
+    ...
+    dynamic_vocab.step(ctx)
+
+This keeps manifests clean (they only describe the original data) while
+guaranteeing MASK is always resident when needed for noising / prediction.
 
 This module itself stays completely independent of the sparse runtime.
-The wiring happens in the training script (see scripts/diffusion_train.py).
+The wiring + enforcement lives in the training script.
 """
 
 from __future__ import annotations
@@ -137,3 +147,24 @@ def get_tokens_for_active_vocab(
     mask_tensor = torch.tensor([mask_id], device=flat.device, dtype=flat.dtype)
     combined = torch.cat([unique_clean, mask_tensor])
     return torch.unique(combined)
+
+
+def get_diffusion_active_tokens(
+    clean_ids: torch.Tensor,
+    mask_id: int,
+) -> torch.Tensor:
+    """Convenience wrapper specifically for LLaDA/diffusion + sparse runtime.
+
+    Returns the exact set of token ids that must be active for one diffusion
+    training/sampling step:
+
+        unique(clean tokens)  ∪  {mask_id}
+
+    This set should be passed directly to
+    `DynamicVocabRuntime.prepare_step(...)` (or unioned with any other
+    permanent hot tokens).
+
+    Using this function makes the "MASK is a diffusion-level always-hot token"
+    contract explicit in the training code.
+    """
+    return get_tokens_for_active_vocab(clean_ids, mask_id)

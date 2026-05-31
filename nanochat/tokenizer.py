@@ -324,19 +324,33 @@ class RustBPETokenizer(ChatTokenizerMixin):
         self.bos_token_id = self.encode_special(bos_token)
 
     @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
+    def train_from_iterator(cls, text_iterator, vocab_size, extra_special_tokens=None):
+        """
+        Train a RustBPE tokenizer.
+
+        Args:
+            text_iterator: iterator over text strings
+            vocab_size: total desired vocabulary size (including all special tokens)
+            extra_special_tokens: optional list of additional special token strings
+                (e.g. ["<|mask|>"]) that will be appended after the core SPECIAL_TOKENS.
+                These do not participate in BPE training; they are added at the end.
+        """
+        extra_special_tokens = extra_special_tokens or []
+        all_special = SPECIAL_TOKENS + extra_special_tokens
+
         # 1) train using rustbpe
         tokenizer = rustbpe.Tokenizer()
         # the special tokens are inserted later in __init__, we don't train them here
-        vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
+        vocab_size_no_special = vocab_size - len(all_special)
         assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
         tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
+
         # 2) construct the associated tiktoken encoding for inference
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
         mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
         tokens_offset = len(mergeable_ranks)
-        special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
+        special_tokens = {name: tokens_offset + i for i, name in enumerate(all_special)}
         enc = tiktoken.Encoding(
             name="rustbpe",
             pat_str=pattern,
