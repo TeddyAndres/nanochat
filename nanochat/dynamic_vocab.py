@@ -281,6 +281,7 @@ class DynamicVocabRuntime:
         # Persistent slot state prefetch (Phase 1: move heavy CPU map work off hot path)
         self._pending_persistent_slot_future = None
         self._pending_persistent_slot_key = None
+
         self._gpu_stage_buffers = {}
         self._last_hidden_query_ms = 0.0
         self.global_token_count_cpu = torch.zeros((model.config.vocab_size,), dtype=torch.long)
@@ -682,6 +683,7 @@ class DynamicVocabRuntime:
             return
         self._assert_main_thread_for_slot_mutation("_invalidate_fixed_live_state")
         self._fixed_live_state = False
+        self._invalidate_prefetch_plan_cache()  # Phase 1 cache invalidation
         if self.fixed_slot_to_global_cpu is not None:
             self.fixed_slot_to_global_cpu.fill_(-1)
         if self.fixed_input_slot_to_global_cpu is not None:
@@ -890,6 +892,9 @@ class DynamicVocabRuntime:
             )
         self._grad_accum_ids_cpu = grad_accum_ids_cpu
         self._grad_accum_count = grad_accum_count
+
+        # Robust initialization for test/bench paths (the work buffer should normally
+        # be allocated in __init__ when fixed_u_mode is enabled).
         global_to_local = self._grad_accum_global_to_local_work_cpu
         global_to_local.fill_(-1)
         if grad_accum_count > 0:
@@ -908,6 +913,8 @@ class DynamicVocabRuntime:
             self.hot_activation_count_cpu.index_select(0, grad_accum_ids_cpu)
             if grad_accum_count > 0 else torch.empty(0, dtype=torch.long)
         )
+
+
 
     def _cache_grad_accum_leaving_rows_(
         self,
@@ -1579,6 +1586,7 @@ class DynamicVocabRuntime:
     def prefetch_step(self, active_ids_cpu) -> None:
         if not (self.use_cuda and self.fixed_u_mode and isinstance(active_ids_cpu, dict)):
             return
+
         requests = self._build_fixed_prefetch_requests(active_ids_cpu)
         if not requests:
             self._pending_stage_prefetch_future = None
@@ -1586,13 +1594,12 @@ class DynamicVocabRuntime:
             self._pending_persistent_slot_future = None
             self._pending_persistent_slot_key = None
             return
-        self._pending_stage_prefetch_key = id(active_ids_cpu)
-        self._pending_stage_prefetch_future = self._stage_prefetch_executor.submit(self._prefetch_fixed_step_cpu_rows, requests)
 
-        # Phase 3 (enabled): Persistent slot computation is now safe to run in the background.
-        # The compute path is pure (PersistentSlotTransition). Mutations are performed
-        # only in the main-thread _apply_persistent_slot_transition (which contains the
-        # NANOCHAT_SPARSE_DEBUG guard). This was the enabling change for the whole plan.
+        self._pending_stage_prefetch_key = id(active_ids_cpu)
+        self._pending_stage_prefetch_future = self._stage_prefetch_executor.submit(
+            self._prefetch_fixed_step_cpu_rows, requests
+        )
+
         self._pending_persistent_slot_key = id(active_ids_cpu)
         self._pending_persistent_slot_future = self._stage_prefetch_executor.submit(
             self._compute_persistent_slot_state_for_meta, active_ids_cpu
