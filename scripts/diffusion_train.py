@@ -10,14 +10,21 @@ Usage (MANDATORY: use .venv-5090 on this machine):
     source /home/teddy/Desktop/dev/repo/nanochat/.venv-5090/bin/activate
 
 Example for d6 experimentation with the exact 65k manifest dimensions (2048 seq, 16 batch, 1 accum):
+
+    # Recommended test command using token ID 44241 (64 dashes) as temporary MASK.
+    # 44241 is a very rare/synthetic token in the current 65k tokenizer and is safe
+    # to repurpose for short diffusion experiments without retraining the tokenizer.
+    #
+    # --token-cache-dir is optional. If omitted, it uses the same default as base_train.py
+    # (sibling folder next to the dataset, e.g. nanochat_train_token_cache_v3).
     python -m scripts.diffusion_train \
         --llada-mode \
         --depth 6 \
         --num-iterations 5 \          # cut down aggressively from 200k
         --sparse-mode \
         --sparse-manifest manifests/65k_2kseq_16batch_1accum_200ksteps.json \
-        --mask-id <YOUR_65K_TOKENIZER_MASK_ID> \
-        --token-cache-dir <path to your pre-tokenized cache for this manifest>
+        --mask-id 44241
+        # (omit --token-cache-dir to use the same auto-default as base_train.py)
 
 The script will automatically force the manifest's exact dimensions:
   device_batch_size=16, max_seq_len=2048, vocab_size=65536
@@ -26,9 +33,9 @@ All Python execution on this machine for this project must go through .venv-5090
 
 MASK token contract (important):
   - MASK is **not** stored in manifests.
-  - It is treated as a diffusion-level always-hot token.
-  - You **must** supply --mask-id with the real reserved id from your 65k tokenizer
-    when running with the large manifest + sparse mode.
+  - It is treated as a diffusion-level always-hot token (always forced into the active set).
+  - For this 65k manifest, use --mask-id 44241 during testing (the 64-dash token).
+    For production you should retrain the tokenizer with a proper reserved <|mask|> token.
 """
 
 import argparse
@@ -63,7 +70,12 @@ def main():
     parser.add_argument("--mask-id", type=int, default=None, help="Token id to use as [MASK] for diffusion (required when using real 65k manifests).")
 
     # Token cache arguments (passed through to the manifest dataloader)
-    parser.add_argument("--token-cache-dir", type=str, default="", help="Directory containing pre-tokenized cache for the manifest")
+    parser.add_argument(
+        "--token-cache-dir",
+        type=str,
+        default="",
+        help="token cache directory (empty = sibling folder next to the dataset, same default as base_train.py)",
+    )
     parser.add_argument("--token-cache-shard-batches", type=int, default=256)
     parser.add_argument("--token-cache-workers", type=int, default=1)
 
@@ -122,6 +134,10 @@ def main():
     # MASK is treated as a diffusion-specific "always-hot" token.
     # It is never baked into manifests. It is always unioned at runtime.
     #
+    # For testing with the current 65k tokenizer + manifest, we are using
+    # token ID 44241 (a 64-dash sequence) as a temporary MASK. This is a
+    # very rare/synthetic token and safe to repurpose for short experiments.
+    #
     # For any real 65k-vocab manifest run you *must* supply --mask-id with
     # the actual reserved token id from your tokenizer.
     if args.mask_id is None:
@@ -143,6 +159,7 @@ def main():
 
     # Critical validation: the mask token must actually exist in the vocabulary.
     # This catches the common mistake of using LLaDA's default 126336 on a 65k vocab.
+    # Current testing choice for this 65k setup: 44241 (the 64-dash token).
     if mask_id >= args.vocab_size or mask_id < 0:
         raise ValueError(
             f"--mask-id {mask_id} is invalid for vocab_size={args.vocab_size}.\n"
@@ -236,7 +253,9 @@ def main():
             print0("  Real manifest dataloader + prefetcher ready. Using pre-tokenized 65k data.")
         except Exception as e:
             print0(f"  ERROR: Failed to initialize real manifest dataloader: {e}")
-            print0("  You must have the corresponding token cache populated for this manifest.")
+            effective_cache = args.token_cache_dir or "(auto sibling next to dataset)"
+            print0(f"  token_cache_dir used: {effective_cache}")
+            print0("  Make sure the token cache for this manifest exists (same as used by base_train.py).")
             raise
 
     for step in range(args.num_iterations):
